@@ -16,16 +16,15 @@ from .config import IaCConfig
 manifest = ModuleManifest(
     id="lyndrix.plugin.iac_orchestrator",
     name="IaC Orchestrator",
-    version="0.2.7",
+    version="0.2.8",
     description="Standalone GitOps controller for executing Terraform and Ansible pipelines.",
     author="Lyndrix",
     icon="rocket_launch", 
     type="PLUGIN",
-    min_core_version="0.0.1",
+    min_core_version="0.0.5",
     auto_enable_on_install=False,
     repo_url="https://github.com/marvin1309/lyndrix-iac-orchestrator",
     ui_route="/iac",
-    dependencies=[{"id": "lyndrix.service.git", "version_constraint": ">=0.1.1"}],
     permissions={
         "subscribe": ["vault:ready_for_data", "iac:webhook_verified", "git:status_update", "db:connected"], 
         "emit": ["iac:pipeline_started", "iac:webhook_verified", "git:sync", "git:commit_push", "system:notify", "user:notify", "monitoring:inventory_sync"]
