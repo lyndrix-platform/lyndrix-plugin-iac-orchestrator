@@ -165,6 +165,8 @@ class DeploymentEngine:
         self.config = config
         self.base_git_dir = self.config.git_repos_dir
         self.pending_syncs = {}
+        self._pipeline_dispatch_lock = asyncio.Lock()
+        self._active_single_service_keys: set[str] = set()
         bus.subscribe("git:status_update")(self._on_git_status)
 
     def get_default_ansible_stages(self, pipeline_type: str = "connectivity"):
@@ -344,13 +346,45 @@ class DeploymentEngine:
                 payload.update({"pipeline_type": "single_service", "service_name": name, "service_branch": ref.replace("refs/heads/", "")})
 
         pipeline_type = payload.get("pipeline_type", "connectivity")
-        
-        # Prevent concurrent bulk rollouts, but allow parallel single_service tasks
-        if pipeline_type == "rollout":
-            active_rollouts = [j for j in self.db.get_jobs_by_status("RUNNING") if j.pipeline_type == "rollout"]
-            if active_rollouts:
-                log.warning("ENGINE: A full rollout is already in progress.")
-                return
+        single_key = None
+
+        # Prevent concurrent bulk rollouts and duplicate single_service runs for the same service.
+        async with self._pipeline_dispatch_lock:
+            if pipeline_type == "rollout":
+                active_rollouts = [j for j in self.db.get_jobs_by_status("RUNNING") if j.pipeline_type == "rollout"]
+                if active_rollouts:
+                    log.warning("ENGINE: A full rollout is already in progress.")
+                    return
+            if pipeline_type == "single_service":
+                service_name = str(payload.get("service_name") or "").strip().lower()
+                if service_name:
+                    payload["service_name"] = service_name
+                    single_key = f"single_service:{service_name}"
+                    if single_key in self._active_single_service_keys:
+                        log.warning(f"ENGINE: Duplicate single_service pipeline ignored for '{service_name}' (in-memory lock).")
+                        self.ctx.emit("system:notify", {
+                            "title": "Pipeline Ignored",
+                            "message": f"A deployment for {service_name} is already being started.",
+                            "type": "warning",
+                            "toast": True,
+                        })
+                        return
+
+                    active_service_jobs = [
+                        j for j in self.db.get_jobs_by_status("RUNNING")
+                        if j.pipeline_type == single_key
+                    ]
+                    if active_service_jobs:
+                        log.warning(f"ENGINE: Duplicate single_service pipeline ignored for '{service_name}'.")
+                        self.ctx.emit("system:notify", {
+                            "title": "Pipeline Ignored",
+                            "message": f"A deployment for {service_name} is already running.",
+                            "type": "warning",
+                            "toast": True,
+                        })
+                        return
+
+                    self._active_single_service_keys.add(single_key)
                 
         # Safely increment running job counter
         self.state["running_jobs"] = self.state.get("running_jobs", 0) + 1
@@ -376,10 +410,19 @@ class DeploymentEngine:
         context = {"payload": payload, "job_id": current_job_id}
         
         pipeline = [
-            SyncRepoStage("iac_controller"), SyncRepoStage("inventory_state"), 
-            SyncRepoStage("config_engine"), SyncRepoStage("aac_factory"), NativeGenerateStage(), 
-            CommitPushStage("inventory_state", "ci: automated state update")
+            SyncRepoStage("iac_controller"),
+            SyncRepoStage("inventory_state"),
+            SyncRepoStage("config_engine"),
+            SyncRepoStage("aac_factory"),
+            # Refresh inventory_state right before generation to minimize staleness windows.
+            SyncRepoStage("inventory_state"),
+            NativeGenerateStage(),
         ]
+
+        # For single_service runs we do not persist generated inventory back to inventory_state.
+        # This avoids unnecessary commit/push contention and keeps service deploys focused.
+        if pipeline_type != "single_service":
+            pipeline.append(CommitPushStage("inventory_state", "ci: automated state update"))
         
         if pipeline_type == "single_service":
             svc_name, svc_branch = payload.get("service_name"), payload.get("service_branch", "main")
@@ -441,6 +484,9 @@ class DeploymentEngine:
             self.state["running_jobs"] = max(0, self.state.get("running_jobs", 0) - 1)
             self.state["is_running"] = self.state["running_jobs"] > 0
             self.db.update_job(job_id=current_job_id, status=self.state["last_deployment"])
+            if single_key:
+                async with self._pipeline_dispatch_lock:
+                    self._active_single_service_keys.discard(single_key)
 
     async def resume_bulk_rollout(self, job_id: int, pending_services: list[str]):
         if not pending_services: return
@@ -498,39 +544,62 @@ class DeploymentEngine:
             self.ctx.emit("system:notify", {"title": "Repository Sync", "message": "Some repositories failed to sync. Check logs.", "type": "negative", "toast": True})
 
     async def _on_git_status(self, payload: dict):
-        repo_id = payload.get("repo_id")
-        if repo_id in self.pending_syncs:
-            for fut in self.pending_syncs[repo_id]:
+        request_id = payload.get("request_id")
+        if request_id:
+            pending = self.pending_syncs.get(request_id)
+            if pending:
+                _, fut = pending
                 if not fut.done():
                     fut.set_result(payload)
-            self.pending_syncs[repo_id].clear()
+            self.pending_syncs.pop(request_id, None)
+            return
+
+        # Ignore legacy status events without request_id to prevent ambiguous correlation
+        # when multiple git handlers emit updates for the same repo.
+        status = payload.get("status")
+        repo_id = payload.get("repo_id")
+        if repo_id and status:
+            log.debug(
+                f"Ignoring uncorrelated git status for repo '{repo_id}' without request_id: {status}"
+            )
 
     async def execute_git_sync(self, role_slug: str) -> bool:
         raw_config = self.ctx.get_secret(f"repo_{role_slug}_config")
         if not raw_config: return False
         config = json.loads(raw_config)
         if not config.get("url"): return True
-        
+
+        request_id = f"sync:{role_slug}:{uuid.uuid4().hex[:12]}"
         future = asyncio.get_event_loop().create_future()
-        if role_slug not in self.pending_syncs: self.pending_syncs[role_slug] = []
-        self.pending_syncs[role_slug].append(future)
-        
-        self.ctx.emit("git:sync", {"repo_id": role_slug, "url": config.get("url"), "auth_type": "ssh" if "git@" in config.get("url") else "token", "secret_value": self.ctx.get_secret(config.get("token_key", "")) if config.get("token_key") else ""})
-        try: return (await asyncio.wait_for(future, timeout=120.0)).get("status") == "synced"
+        self.pending_syncs[request_id] = (role_slug, future)
+
+        self.ctx.emit("git:sync", {
+            "request_id": request_id,
+            "repo_id": role_slug,
+            "url": config.get("url"),
+            "auth_type": "ssh" if "git@" in config.get("url") else "token",
+            "secret_value": self.ctx.get_secret(config.get("token_key", "")) if config.get("token_key") else ""
+        })
+        try: return (await asyncio.wait_for(future, timeout=240.0)).get("status") == "synced"
         except asyncio.TimeoutError: return False
-        finally: 
-            if future in self.pending_syncs.get(role_slug, []): self.pending_syncs[role_slug].remove(future)
+        finally:
+            self.pending_syncs.pop(request_id, None)
 
     async def execute_git_commit_push(self, role_slug: str, message: str) -> str:
+        request_id = f"commit:{role_slug}:{uuid.uuid4().hex[:12]}"
         future = asyncio.get_event_loop().create_future()
-        if role_slug not in self.pending_syncs: self.pending_syncs[role_slug] = []
-        self.pending_syncs[role_slug].append(future)
-        
-        self.ctx.emit("git:commit_push", {"repo_id": role_slug, "message": message, "is_local": False})
-        try: return (await asyncio.wait_for(future, timeout=120.0)).get("status", "failed")
+        self.pending_syncs[request_id] = (role_slug, future)
+
+        self.ctx.emit("git:commit_push", {
+            "request_id": request_id,
+            "repo_id": role_slug,
+            "message": message,
+            "is_local": False
+        })
+        try: return (await asyncio.wait_for(future, timeout=240.0)).get("status", "failed")
         except asyncio.TimeoutError: return "timeout"
-        finally: 
-            if future in self.pending_syncs.get(role_slug, []): self.pending_syncs[role_slug].remove(future)
+        finally:
+            self.pending_syncs.pop(request_id, None)
 
     async def _execute_native_generation(self):
         plugin_root = Path(__file__).parent.resolve()
