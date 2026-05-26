@@ -47,6 +47,38 @@ The IaC Orchestrator is a sophisticated GitOps automation engine designed for en
 - **Role-Based Access**: Settings modal for permission management
 - **Network Isolation**: Dedicated security directory for sensitive configurations
 
+## Project Structure
+
+As of **v0.3.0** the plugin follows the [Lyndrix Core plugin development standard](https://github.com/lyndrix-platform/lyndrix-core/blob/main/docs/plugins.md):
+
+```
+.
+├── entrypoint.py          # Manifest + lifecycle hooks ONLY (pure wiring layer)
+├── requirements.txt       # Runtime dependencies
+├── requirements-dev.txt   # Dev toolchain (pytest, mypy, ruff, black)
+├── CHANGELOG.md
+├── README.md
+├── examples/              # Sample operator-provided config files
+├── app/                   # All plugin logic lives here
+│   ├── model/             # SQLAlchemy ORM models and DB session helpers
+│   │   ├── models.py
+│   │   └── database.py
+│   ├── controller/        # Business logic and services
+│   │   ├── service.py     # IaCService — single shared service object
+│   │   ├── engine.py      # DeploymentEngine (pipeline execution)
+│   │   ├── config.py      # IaCConfig (env var / vault config)
+│   │   ├── api.py         # FastAPI router for /api/iac/*
+│   │   └── utils.py       # Shared utilities (StageResult, JobFileLogBridge)
+│   └── ui/                # NiceGUI pages and widgets
+│       ├── dashboard.py   # Main /iac dashboard page
+│       ├── settings.py    # Settings injection UI
+│       └── widget.py      # Mini status widget for the core dashboard
+├── iac_core/              # Native artifact generation sub-process
+├── stages/                # Reusable pipeline stage definitions
+└── tests/                 # Unit and smoke tests
+    └── test_service.py
+```
+
 ---
 
 ## Installation
@@ -66,7 +98,7 @@ The IaC Orchestrator is a sophisticated GitOps automation engine designed for en
 ```bash
 # Clone the plugin repository alongside lyndrix-core
 cd /path/to/lyndrix-dev
-git clone https://github.com/marvin1309/lyndrix-iac-orchestrator.git
+git clone https://github.com/lyndrix-platform/lyndrix-plugin-iac-orchestrator.git
 
 # The docker-compose.dev.yml automatically mounts this as /app/plugins/iac_orchestrator
 docker compose -f lyndrix-core/docker/docker-compose.dev.yml up -d

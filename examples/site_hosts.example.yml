@@ -1,0 +1,37 @@
+# Example: IaC Orchestrator Site/Host Definition
+#
+# Place files like this under:
+#   <iac_controller_repo>/environments/sites/<site-name>/<stage>/hosts.yml
+#
+# The orchestrator parses these files to build the Assignments UI tab
+# and to determine which hosts and services to deploy to during a rollout.
+
+hosts:
+  prod-node-01:
+    ansible_host: 192.168.1.10
+    hostname: prod-node-01
+    profiles:
+      - base_docker_host
+    services:
+      - name: my-web-app
+        state: present
+        deploy_type: docker-compose
+        git_repo: https://gitlab.example.com/apps/my-web-app.git
+        git_version: main
+
+  prod-node-02:
+    ansible_host: 192.168.1.11
+    hostname: prod-node-02
+    profiles:
+      - base_docker_host
+    services:
+      - name: api-gateway
+        state: present
+        deploy_type: docker-compose
+        git_repo: https://gitlab.example.com/apps/api-gateway.git
+        git_version: main
+      - name: monitoring-agent
+        state: present
+        deploy_type: docker-compose
+        git_repo: https://gitlab.example.com/infra/monitoring-agent.git
+        git_version: main

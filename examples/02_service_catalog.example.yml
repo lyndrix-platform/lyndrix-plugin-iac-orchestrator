@@ -1,0 +1,30 @@
+# Example: IaC Orchestrator Service Catalog
+#
+# Place this file at:
+#   <iac_controller_repo>/environments/global/02_service_catalog.yml
+#
+# The orchestrator reads this file to populate the Service Catalog UI tab
+# and to resolve service names during single-service pipeline triggers.
+
+service_catalog:
+  services:
+    - name: my-web-app
+      repository_name: my-web-app
+      branch: main
+      target_environment: prod-node-01
+      deploy_type: Docker Compose
+      description: "Main customer-facing web application"
+
+    - name: api-gateway
+      repository_name: api-gateway
+      branch: main
+      target_environment: prod-node-02
+      deploy_type: Docker Compose
+      description: "Internal API gateway service"
+
+    - name: monitoring-agent
+      repository_name: monitoring-agent
+      branch: main
+      target_environment: all
+      deploy_type: Docker Compose
+      description: "Node monitoring and metrics collector"
