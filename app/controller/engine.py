@@ -601,6 +601,7 @@ class DeploymentEngine:
             self.pending_syncs.pop(request_id, None)
 
     async def _execute_native_generation(self):
+        # Traverse up 3 levels: engine.py → controller/ → app/ → plugin_root/
         plugin_root = Path(__file__).parent.parent.parent.resolve()
         generator_script = plugin_root / "iac_core" / "app" / "generator.py"
         generator_root = plugin_root / "iac_core" / "app"
