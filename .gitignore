@@ -57,3 +57,9 @@ app/plugins
 vendor/*
 vendor
 /vendor/
+# --- Dev toolchain ---
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage

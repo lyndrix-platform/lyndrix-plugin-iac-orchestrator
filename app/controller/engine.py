@@ -1,0 +1,836 @@
+import asyncio
+import json
+import sys
+import os
+import importlib
+import logging
+import shutil
+import uuid
+import yaml
+from hashlib import sha256
+from pathlib import Path
+
+from deepdiff import DeepDiff
+import re
+
+from ...stages.base import BaseStage
+from .utils import StageResult, JobFileLogBridge
+from ...stages.git import (
+    SyncRepoStage,
+    CommitPushStage,
+    CloneServiceRepoStage,
+    SyncAllServicesStage
+)
+from ...stages.ansible import (
+    AnsiblePlaybookStage,
+    AsyncBulkRolloutStage
+)
+
+log = logging.getLogger("IaC:Engine")
+
+# --- LOCAL STAGE DEFINITIONS ---
+class NativeGenerateStage:
+    def __init__(self):
+        self.name = "Native Artifact Generation"
+    async def run(self, engine, context: dict) -> StageResult:
+        try:
+            await engine._execute_native_generation()
+            await engine.emit_monitoring_inventory_sync()
+            return StageResult(True, "Native artifacts generated.")
+        except Exception as e:
+            return StageResult(False, f"Native generation failed: {e}")
+
+class DynamicRuleExecutionStage:
+    def __init__(self, pipeline_type: str):
+        self.name = f"Dynamic Rules: {pipeline_type}"
+        self.pipeline_type = pipeline_type
+    async def run(self, engine, context: dict) -> StageResult:
+        return StageResult(True, f"Dynamic rules evaluated for {self.pipeline_type}")
+
+class DetectDriftStage(BaseStage):
+    def __init__(self):
+        super().__init__("Detect State Drift")
+
+    def _load_current_state_from_git(self, engine):
+        """Parses all YAML files to build the current desired state."""
+        # This is a simplified example. A real implementation would be more robust,
+        # parsing profiles, sites, hosts, and services into one large dict.
+        assignments = {}
+        base_dir = engine.config.git_repos_dir / "iac_controller" / "environments"
+        sites_dir = base_dir / "sites"
+        if not sites_dir.exists(): return {}
+        
+        for yaml_file in sites_dir.rglob("*.yml"):
+            try:
+                with open(yaml_file, 'r') as f:
+                    data = yaml.safe_load(f) or {}
+                    # Just using hostnames as keys for this example
+                    hosts = {**data.get("hosts", {}), **data.get("hardware_hosts", {})}
+                    for host_name, host_data in hosts.items():
+                        if host_name not in assignments: assignments[host_name] = {}
+                        assignments[host_name].update(host_data)
+            except Exception:
+                continue
+        return assignments
+
+    def _get_host_services(self, state_dict: dict, host_name: str) -> set:
+        """Helper to extract a simple set of service names for a given host."""
+        svcs = set()
+        for s in state_dict.get(host_name, {}).get("services", []):
+            if isinstance(s, dict) and s.get("name"): svcs.add(s["name"])
+        return svcs
+
+    async def run(self, engine, context: dict) -> StageResult:
+        log.info("Comparing current desired state against last known good state...")
+        
+        current_desired_state = self._load_current_state_from_git(engine)
+        if not current_desired_state:
+            return StageResult(False, "Could not parse current desired state from Git.")
+
+        # Save state to context so PersistStateStage can save it to the DB later
+        context["current_desired_state"] = current_desired_state
+
+        last_known_good_record = engine.db.get_state("last_known_good")
+        last_known_good_state = last_known_good_record.get("data") if last_known_good_record else {}
+
+        diff = DeepDiff(last_known_good_state, current_desired_state, ignore_order=True)
+
+        if not diff:
+            log.info("✅ No drift detected. Infrastructure is up to date.")
+            context["stop_pipeline"] = True # Flag to stop the pipeline gracefully
+            return StageResult(True, "No drift detected.")
+        
+        services_to_deploy = set()
+        services_to_remove = set()
+
+        # Intelligently parse the drift to find exactly WHICH services changed
+        for change_type, changes in diff.items():
+            paths = changes.keys() if isinstance(changes, dict) else changes
+            for path in paths:
+                m = re.match(r"root\['([^']+)'\](.*)", str(path))
+                if not m: continue
+                
+                host_name, remainder = m.group(1), m.group(2)
+                old_svcs = self._get_host_services(last_known_good_state, host_name)
+                new_svcs = self._get_host_services(current_desired_state, host_name)
+
+                if "['services']" in remainder:
+                    # Only the services list changed on this host! 
+                    # Find exactly which ones were added or removed
+                    services_to_deploy.update(new_svcs - old_svcs)
+                    services_to_remove.update(old_svcs - new_svcs)
+                else:
+                    # A core host property changed (like IP), we must redeploy all of its services
+                    services_to_deploy.update(new_svcs)
+        
+        context["services_to_deploy"] = list(services_to_deploy)
+        context["services_to_remove"] = list(services_to_remove)
+
+        log.warning(f"DRIFT DETECTED: Deploying {len(services_to_deploy)} services, Cleaning up {len(services_to_remove)} services.")
+        context["is_drift_run"] = True
+        return StageResult(True, "Drift detected, proceeding with rollout.")
+
+class CleanupOrphanedServicesStage(BaseStage):
+    def __init__(self):
+        super().__init__("Cleanup Orphaned Services")
+        
+    async def run(self, engine, context: dict) -> StageResult:
+        to_remove = context.get("services_to_remove", [])
+        if not to_remove:
+            return StageResult(True, "No services require cleanup.")
+            
+        log.info(f"Placeholder: Would run cleanup playbook for removed services: {', '.join(to_remove)}")
+        # FUTURE: await engine.execute_ansible_docker(playbook_subpath="playbooks/cleanup.yml", extra_vars={"services_to_kill": ",".join(to_remove)}, ...)
+        return StageResult(True, "Placeholder cleanup completed.")
+
+class PersistStateStage(BaseStage):
+    def __init__(self):
+        super().__init__("Persist State to DB")
+    async def run(self, engine, context: dict) -> StageResult:
+        log.info("Persisting new 'last_known_good' state to database...")
+        new_state = context.get("current_desired_state")
+        if new_state:
+            # Use a placeholder 'latest' for commit hash for now
+            engine.db.update_state("last_known_good", new_state, "latest")
+        return StageResult(True, "State persisted.")
+
+# --- THE ENGINE ---
+
+class DeploymentEngine:
+    def __init__(self, ctx, state, db, config):
+        self.ctx = ctx
+        self.state = state
+        self.db = db
+        self.config = config
+        self.base_git_dir = self.config.git_repos_dir
+        self.pending_syncs = {}
+        self._pipeline_dispatch_lock = asyncio.Lock()
+        self._active_single_service_keys: set[str] = set()
+        ctx.subscribe("git:status_update")(self._on_git_status)
+
+    def get_default_ansible_stages(self, pipeline_type: str = "connectivity"):
+        if pipeline_type == "rollout":
+            return [AsyncBulkRolloutStage(inventory_path="global/ansible/inventory.yml", limit="all")]
+        return [
+            AnsiblePlaybookStage(
+                name_override="CONNECTIVITY TEST", 
+                playbook_path="playbooks/cd_playbooks/cd_test_inventory.yml", 
+                inventory_path="global/ansible/inventory.yml", 
+                limit="docker-hydra"
+            )
+        ]
+
+    def _load_generated_inventory(self) -> dict:
+        inventory_path = self.base_git_dir / "inventory_state" / "global" / "ansible" / "inventory.yml"
+        if not inventory_path.exists():
+            return {}
+        with open(inventory_path, "r", encoding="utf-8") as handle:
+            return yaml.safe_load(handle) or {}
+
+    def _load_service_docker_names(self) -> dict:
+        """Build a slug→docker_name mapping by reading service.yml files in services_dir."""
+        mapping: dict[str, str] = {}
+
+        def _normalize_slug(raw: str) -> str:
+            return "".join(ch for ch in str(raw or "").lower() if ch.isalnum())
+
+        def _slug_aliases(raw: str) -> set[str]:
+            # Accept common slug variants (hyphen/underscore/case) from generated inventory.
+            base = str(raw or "").strip()
+            if not base:
+                return set()
+            aliases = {
+                base,
+                base.lower(),
+                base.replace("-", "_"),
+                base.replace("_", "-"),
+                base.lower().replace("-", "_"),
+                base.lower().replace("_", "-"),
+            }
+            return {a for a in aliases if a}
+
+        candidate_dirs: list[Path] = []
+        for path_candidate in [
+            self.config.services_dir,
+            Path(getattr(self.config, "host_services_dir", "")),
+            Path("/app/.dev/storage/services"),
+            Path("/workspace/.dev/storage/services"),
+            Path.cwd() / ".dev" / "storage" / "services",
+        ]:
+            if path_candidate and path_candidate.exists() and path_candidate.is_dir():
+                candidate_dirs.append(path_candidate)
+
+        # Deduplicate while preserving order so the configured path wins.
+        seen_dirs: set[str] = set()
+        unique_dirs: list[Path] = []
+        for d in candidate_dirs:
+            key = str(d.resolve())
+            if key in seen_dirs:
+                continue
+            seen_dirs.add(key)
+            unique_dirs.append(d)
+
+        for services_dir in unique_dirs:
+            for svc_yml in services_dir.rglob("service.yml"):
+                try:
+                    with open(svc_yml, "r", encoding="utf-8") as fh:
+                        data = yaml.safe_load(fh) or {}
+                    docker_name = (data.get("service") or {}).get("name")
+                    slug = svc_yml.parent.name
+                    if docker_name and slug:
+                        for alias in _slug_aliases(slug):
+                            mapping[alias] = docker_name
+                        mapping[_normalize_slug(slug)] = docker_name
+                except Exception:
+                    continue
+
+        if mapping:
+            log.info(f"MONITORING: loaded {len(mapping)} service slug aliases for container-name mapping")
+        return mapping
+
+    def _build_monitoring_inventory_payload(self, inventory: dict) -> dict:
+        all_hosts = (inventory.get("all") or {}).get("hosts") or {}
+        children = (inventory.get("all") or {}).get("children") or {}
+        host_groups: dict[str, list[str]] = {}
+        for group_name, group_data in children.items():
+            for host_name in (group_data.get("hosts") or {}).keys():
+                host_groups.setdefault(host_name, []).append(group_name)
+
+        docker_name_map = self._load_service_docker_names()
+
+        def _resolve_docker_name(slug: str) -> str:
+            direct = docker_name_map.get(slug)
+            if direct:
+                return direct
+            normalized = "".join(ch for ch in str(slug or "").lower() if ch.isalnum())
+            return docker_name_map.get(normalized) or slug
+
+        hosts = []
+        services = []
+        for host_name, host_data in all_hosts.items():
+            groups = sorted(host_groups.get(host_name, []))
+            stage = next((group[len("stage_"):] for group in groups if group.startswith("stage_")), None)
+            site = next((group[len("site_"):] for group in groups if group.startswith("site_")), None)
+            hosts.append(
+                {
+                    "host_name": host_name,
+                    "hostname": host_data.get("hostname") or host_name,
+                    "address": host_data.get("ansible_host"),
+                    "ansible_host": host_data.get("ansible_host"),
+                    "groups": groups,
+                    "ansible_groups": groups,
+                    "baseline_roles": host_data.get("baseline_roles") or [],
+                    "profiles": host_data.get("profiles") or [],
+                    "terraform": host_data.get("terraform") or {},
+                    "site": site,
+                    "stage": stage,
+                }
+            )
+
+            for service in host_data.get("services") or []:
+                if not isinstance(service, dict) or not service.get("name"):
+                    continue
+                slug = str(service.get("name"))
+                docker_name = _resolve_docker_name(slug)
+                services.append(
+                    {
+                        "host_name": host_name,
+                        "hostname": host_data.get("hostname") or host_name,
+                        "address": host_data.get("ansible_host"),
+                        "service_name": docker_name,
+                        "service_slug": slug,
+                        "name": docker_name,
+                        "state": service.get("state"),
+                        "desired_state": service.get("state"),
+                        "deploy_type": service.get("deploy_type"),
+                        "git_repo": service.get("git_repo"),
+                        "git_version": service.get("git_version"),
+                        "config": service.get("config") or {},
+                        "groups": groups,
+                        "ansible_groups": groups,
+                        "site": site,
+                        "stage": stage,
+                    }
+                )
+
+        source_revision = sha256(
+            json.dumps({"hosts": hosts, "services": services}, sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest()
+        return {
+            "owner_source": "orchestrator_service",
+            "source_revision": source_revision,
+            "hosts": hosts,
+            "services": services,
+        }
+
+    async def emit_monitoring_inventory_sync(self):
+        try:
+            inventory = self._load_generated_inventory()
+            if not inventory:
+                return
+            payload = self._build_monitoring_inventory_payload(inventory)
+            if not payload["hosts"] and not payload["services"]:
+                return
+            self.ctx.emit("monitoring:inventory_sync", payload)
+            log.info(
+                f"MONITORING: Emitted generated inventory sync with {len(payload['hosts'])} hosts and {len(payload['services'])} services."
+            )
+        except Exception as exc:
+            log.error(f"MONITORING: Failed to emit inventory sync: {exc}")
+
+    async def run_pipeline(self, payload: dict):
+        if not payload.get("pipeline_type") and payload.get("object_kind") == "push":
+            name, ref = payload.get("project", {}).get("name"), payload.get("ref", "")
+            if name and ref.startswith("refs/heads/"):
+                payload.update({"pipeline_type": "single_service", "service_name": name, "service_branch": ref.replace("refs/heads/", "")})
+
+        pipeline_type = payload.get("pipeline_type", "connectivity")
+        single_key = None
+
+        # Prevent concurrent bulk rollouts and duplicate single_service runs for the same service.
+        async with self._pipeline_dispatch_lock:
+            if pipeline_type == "rollout":
+                active_rollouts = [j for j in self.db.get_jobs_by_status("RUNNING") if j.pipeline_type == "rollout"]
+                if active_rollouts:
+                    log.warning("ENGINE: A full rollout is already in progress.")
+                    return
+            if pipeline_type == "single_service":
+                service_name = str(payload.get("service_name") or "").strip().lower()
+                if service_name:
+                    payload["service_name"] = service_name
+                    single_key = f"single_service:{service_name}"
+                    if single_key in self._active_single_service_keys:
+                        log.warning(f"ENGINE: Duplicate single_service pipeline ignored for '{service_name}' (in-memory lock).")
+                        self.ctx.emit("system:notify", {
+                            "title": "Pipeline Ignored",
+                            "message": f"A deployment for {service_name} is already being started.",
+                            "type": "warning",
+                            "toast": True,
+                        })
+                        return
+
+                    active_service_jobs = [
+                        j for j in self.db.get_jobs_by_status("RUNNING")
+                        if j.pipeline_type == single_key
+                    ]
+                    if active_service_jobs:
+                        log.warning(f"ENGINE: Duplicate single_service pipeline ignored for '{service_name}'.")
+                        self.ctx.emit("system:notify", {
+                            "title": "Pipeline Ignored",
+                            "message": f"A deployment for {service_name} is already running.",
+                            "type": "warning",
+                            "toast": True,
+                        })
+                        return
+
+                    self._active_single_service_keys.add(single_key)
+                
+        # Safely increment running job counter
+        self.state["running_jobs"] = self.state.get("running_jobs", 0) + 1
+        self.state["is_running"] = self.state["running_jobs"] > 0
+
+        # Better tagging for filtering
+        db_type = pipeline_type
+        if pipeline_type == "single_service":
+            db_type = f"single_service:{payload.get('service_name')}"
+            
+        current_job_id = self.db.create_job(db_type)
+        
+        # FILE LOGGING SETUP
+        bridge = JobFileLogBridge(self.config.get_log_path(current_job_id))
+        logging.getLogger("IaC:Engine").addHandler(bridge)
+        
+        log.info("[SYSTEM] Pipeline Started")
+        log.info(f"[SYSTEM] Job #{current_job_id} registered in database.")
+        
+        # Event-Driven Notification: Register a silent active task in the bell menu
+        self.ctx.emit("system:notify", {"id": f"job_{current_job_id}", "title": f"Pipeline #{current_job_id}", "message": f"Running: {pipeline_type}", "type": "ongoing", "toast": False})
+
+        context = {"payload": payload, "job_id": current_job_id}
+        
+        pipeline = [
+            SyncRepoStage("iac_controller"),
+            SyncRepoStage("inventory_state"),
+            SyncRepoStage("config_engine"),
+            SyncRepoStage("aac_factory"),
+            # Refresh inventory_state right before generation to minimize staleness windows.
+            SyncRepoStage("inventory_state"),
+            NativeGenerateStage(),
+        ]
+
+        # For single_service runs we do not persist generated inventory back to inventory_state.
+        # This avoids unnecessary commit/push contention and keeps service deploys focused.
+        if pipeline_type != "single_service":
+            pipeline.append(CommitPushStage("inventory_state", "ci: automated state update"))
+        
+        if pipeline_type == "single_service":
+            svc_name, svc_branch = payload.get("service_name"), payload.get("service_branch", "main")
+            target_group = "stage_dev" if svc_branch == "dev" or str(svc_branch).endswith("-dev") else ("stage_test" if svc_branch == "test" else f"service_{str(svc_name).replace('-', '_')}")
+            pipeline.extend([
+                CloneServiceRepoStage(svc_name, svc_branch, payload), 
+                AnsiblePlaybookStage(
+                    name_override=f"Single Service: {svc_name} ({svc_branch})", 
+                    playbook_path="playbooks/cd_playbooks/cd_rollout_single_service.yml", 
+                    inventory_path="global/ansible/inventory.yml", 
+                    limit=target_group, 
+                    extra_vars={"SERVICE_BRANCH": svc_branch, "target_service": svc_name, "target_group": target_group, "LOCAL_SERVICES_DIR": str(self.config.services_dir)}
+                )
+            ])
+        elif pipeline_type == "rollout":
+            pipeline.extend([
+                DetectDriftStage(),
+                SyncAllServicesStage(), 
+                AsyncBulkRolloutStage(inventory_path="global/ansible/inventory.yml", limit=payload.get("limit", "all")),
+                CleanupOrphanedServicesStage(),
+                DynamicRuleExecutionStage(pipeline_type),
+                PersistStateStage()
+            ])
+        else:
+            pipeline.append(DynamicRuleExecutionStage(pipeline_type))
+
+        try:
+            total_stages = len(pipeline)
+            for idx, stage in enumerate(pipeline):
+                # PRE-ANSIBLE MACRO PROGRESS UPDATE (0% to 50%)
+                pct = int((idx / total_stages) * 50)
+                self.db.update_progress(current_job_id, progress=pct, current_step=f"Stage: {stage.name}")
+                
+                log.info(f"--- STAGE: {stage.name} ---")
+                res = await stage.run(self, context)
+                if not res.success:
+                    raise RuntimeError(f"Stage '{stage.name}' failed: {res.message}")
+                
+                if context.get("stop_pipeline"):
+                    log.info("[SYSTEM] Pipeline stopped gracefully by a stage.")
+                    break
+            
+            log.info("[SYSTEM] Pipeline completed successfully.")
+            self.state["last_deployment"] = "SUCCESS"
+            self.db.update_progress(current_job_id, progress=100, current_step="Completed Successfully")
+            
+            # Clear the ongoing notification from the bell menu and send a standalone success toast
+            self.ctx.emit("system:notify", {"id": f"job_{current_job_id}", "action": "clear"})
+            self.ctx.emit("system:notify", {"title": f"Pipeline #{current_job_id}", "message": "Completed successfully.", "type": "positive", "toast": True})
+        except Exception as e:
+            log.error(f"!!! [FATAL] {str(e)}")
+            self.state["last_deployment"] = "FAILED"
+            self.db.update_progress(current_job_id, progress=None, current_step="Failed")
+            
+            # Update the existing ongoing notification in-place to an Error state
+            self.ctx.emit("system:notify", {"id": f"job_{current_job_id}", "title": f"Pipeline #{current_job_id} Failed", "message": str(e), "type": "negative", "toast": True})
+        finally:
+            logging.getLogger("IaC:Engine").removeHandler(bridge)
+            self.state["running_jobs"] = max(0, self.state.get("running_jobs", 0) - 1)
+            self.state["is_running"] = self.state["running_jobs"] > 0
+            self.db.update_job(job_id=current_job_id, status=self.state["last_deployment"])
+            if single_key:
+                async with self._pipeline_dispatch_lock:
+                    self._active_single_service_keys.discard(single_key)
+
+    async def resume_bulk_rollout(self, job_id: int, pending_services: list[str]):
+        if not pending_services: return
+        
+        self.state["running_jobs"] = self.state.get("running_jobs", 0) + 1
+        self.state["is_running"] = self.state["running_jobs"] > 0
+        
+        self.db.update_progress(job_id, progress=50, current_step="Resuming Bulk Rollout...")
+        bridge = JobFileLogBridge(self.config.get_log_path(job_id))
+        logging.getLogger("IaC:Engine").addHandler(bridge)
+        log.info(f"[SYSTEM] Resuming {len(pending_services)} pending services from job #{job_id}")
+        
+        self.ctx.emit("system:notify", {"id": f"job_{job_id}", "title": f"Pipeline #{job_id}", "message": "Resuming Bulk Rollout...", "type": "ongoing", "toast": False})
+        
+        context = {"payload": {}, "job_id": job_id}
+        stage = AsyncBulkRolloutStage(inventory_path="global/ansible/inventory.yml", limit="all", target_services=pending_services)
+
+        try:
+            res = await stage.run(self, context)
+            log.info("[SYSTEM] Resumed Pipeline completed.")
+            self.state["last_deployment"] = "SUCCESS" if res.success else "FAILED"
+            if res.success: 
+                self.db.update_progress(job_id, progress=100, current_step="Resume Completed")
+                self.ctx.emit("system:notify", {"id": f"job_{job_id}", "action": "clear"})
+                self.ctx.emit("system:notify", {"title": f"Pipeline #{job_id}", "message": "Resume completed successfully.", "type": "positive", "toast": True})
+            else:
+                self.ctx.emit("system:notify", {"id": f"job_{job_id}", "title": f"Pipeline #{job_id} Resume Failed", "message": "Stage failed.", "type": "negative", "toast": True})
+        except Exception as e:
+            log.error(f"!!! [FATAL] {str(e)}")
+            self.state["last_deployment"] = "FAILED"
+            self.db.update_progress(job_id, progress=None, current_step="Resume Failed")
+            self.ctx.emit("system:notify", {"id": f"job_{job_id}", "title": f"Pipeline #{job_id} Resume Failed", "message": str(e), "type": "negative", "toast": True})
+        finally:
+            logging.getLogger("IaC:Engine").removeHandler(bridge)
+            self.state["running_jobs"] = max(0, self.state.get("running_jobs", 0) - 1)
+            self.state["is_running"] = self.state["running_jobs"] > 0
+            self.db.update_job(job_id=job_id, status=self.state["last_deployment"])
+
+    async def sync_core_repos(self):
+        """Periodic/Startup task to keep core repositories up to date."""
+        log.info("[SYSTEM] Initiating background sync for core repositories...")
+        self.ctx.emit("system:notify", {"id": "sys_repo_sync", "title": "Repository Sync", "message": "Synchronizing core repositories...", "type": "ongoing", "toast": False})
+        
+        all_success = True
+        for repo in ["iac_controller", "inventory_state", "config_engine", "aac_factory"]:
+            success = await self.execute_git_sync(repo)
+            if not success:
+                log.warning(f"Failed to sync {repo} during background operation.")
+                all_success = False
+                
+        self.ctx.emit("system:notify", {"id": "sys_repo_sync", "action": "clear"})
+        if all_success:
+            self.ctx.emit("system:notify", {"title": "Repository Sync", "message": "Core repositories synchronized successfully.", "type": "positive", "toast": True})
+        else:
+            self.ctx.emit("system:notify", {"title": "Repository Sync", "message": "Some repositories failed to sync. Check logs.", "type": "negative", "toast": True})
+
+    async def _on_git_status(self, payload: dict):
+        request_id = payload.get("request_id")
+        if request_id:
+            pending = self.pending_syncs.get(request_id)
+            if pending:
+                _, fut = pending
+                if not fut.done():
+                    fut.set_result(payload)
+            self.pending_syncs.pop(request_id, None)
+            return
+
+        # Ignore legacy status events without request_id to prevent ambiguous correlation
+        # when multiple git handlers emit updates for the same repo.
+        status = payload.get("status")
+        repo_id = payload.get("repo_id")
+        if repo_id and status:
+            log.debug(
+                f"Ignoring uncorrelated git status for repo '{repo_id}' without request_id: {status}"
+            )
+
+    async def execute_git_sync(self, role_slug: str) -> bool:
+        raw_config = self.ctx.get_secret(f"repo_{role_slug}_config")
+        if not raw_config: return False
+        config = json.loads(raw_config)
+        if not config.get("url"): return True
+
+        request_id = f"sync:{role_slug}:{uuid.uuid4().hex[:12]}"
+        future = asyncio.get_event_loop().create_future()
+        self.pending_syncs[request_id] = (role_slug, future)
+
+        self.ctx.emit("git:sync", {
+            "request_id": request_id,
+            "repo_id": role_slug,
+            "url": config.get("url"),
+            "auth_type": "ssh" if "git@" in config.get("url") else "token",
+            "secret_value": self.ctx.get_secret(config.get("token_key", "")) if config.get("token_key") else ""
+        })
+        try: return (await asyncio.wait_for(future, timeout=240.0)).get("status") == "synced"
+        except asyncio.TimeoutError: return False
+        finally:
+            self.pending_syncs.pop(request_id, None)
+
+    async def execute_git_commit_push(self, role_slug: str, message: str) -> str:
+        request_id = f"commit:{role_slug}:{uuid.uuid4().hex[:12]}"
+        future = asyncio.get_event_loop().create_future()
+        self.pending_syncs[request_id] = (role_slug, future)
+
+        self.ctx.emit("git:commit_push", {
+            "request_id": request_id,
+            "repo_id": role_slug,
+            "message": message,
+            "is_local": False
+        })
+        try: return (await asyncio.wait_for(future, timeout=240.0)).get("status", "failed")
+        except asyncio.TimeoutError: return "timeout"
+        finally:
+            self.pending_syncs.pop(request_id, None)
+
+    async def _execute_native_generation(self):
+        plugin_root = Path(__file__).parent.parent.parent.resolve()
+        generator_script = plugin_root / "iac_core" / "app" / "generator.py"
+        generator_root = plugin_root / "iac_core" / "app"
+        vendor_dir = plugin_root / "vendor"
+        # The main Lyndrix application root (e.g., /app in Docker)
+        app_root = plugin_root.parents[1]
+        
+        if not generator_script.exists():
+            raise FileNotFoundError(f"Generator script not found at {generator_script}")
+
+        # Inject the private vendor directory into the subprocess PYTHONPATH
+        env = os.environ.copy()
+        
+        # Build a new PYTHONPATH, prioritizing the plugin's vendored libraries
+        # and its own source root for relative imports.
+        new_path_parts = []
+        if vendor_dir.exists():
+            new_path_parts.append(str(vendor_dir))
+        if generator_root.exists():
+            new_path_parts.append(str(generator_root))
+        if app_root.exists():
+            new_path_parts.append(str(app_root))
+        if env.get("PYTHONPATH"):
+            new_path_parts.append(env["PYTHONPATH"])
+        env["PYTHONPATH"] = ":".join(new_path_parts)
+
+        cmd = [
+            sys.executable, str(generator_script),
+            "--inventory-dir", str(self.base_git_dir / "iac_controller"),
+            "--output-dir", str(self.base_git_dir / "inventory_state")
+        ]
+        
+        proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, env=env)
+        stdout, _ = await proc.communicate()
+        
+        if proc.returncode != 0:
+            raise RuntimeError(f"Native artifact generation failed:\n{stdout.decode('utf-8', errors='replace')}")
+
+    async def reconcile_orphaned_runners(self, job_id=None):
+        try:
+            # Fetch exactly which Job ID the runner belongs to using its internal Docker Labels
+            proc = await asyncio.create_subprocess_exec(
+                "docker", "ps", "-a", "--filter", "name=^aac-runner-", 
+                "--format", "{{.Names}}|{{.Label \"iac_job_id\"}}|{{.Label \"iac_task_name\"}}", 
+                stdout=asyncio.subprocess.PIPE
+            )
+            try:
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=12)
+            except asyncio.TimeoutError:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                log.warning("Reconciliation: docker ps timed out after 12s; skipping orphaned runner scan.")
+                return
+            lines = [c.strip() for c in stdout.decode().split('\n') if c.strip()]
+            if not lines: return
+
+            log.info(f"Reconciliation: Found {len(lines)} orphaned runners. Reattaching...")
+            self.state["is_running"] = True
+            
+            for line in lines:
+                parts = line.split('|')
+                c_name = parts[0]
+                try:
+                    recovered_job_id = int(parts[1]) if len(parts) > 1 and parts[1] else (job_id or 0)
+                except ValueError:
+                    recovered_job_id = job_id or 0
+                    
+                task_name = parts[2] if len(parts) > 2 and parts[2] else c_name.replace("aac-runner-", "")
+                
+                if "active_tasks" not in self.state: self.state["active_tasks"] = {}
+                if task_name not in self.state["active_tasks"]:
+                    self.state["active_tasks"][task_name] = {
+                        "status": "running_ansible", 
+                        "logs": [],
+                        "job_id": recovered_job_id
+                    }
+                
+                self.state["running_jobs"] = self.state.get("running_jobs", 0) + 1
+                self.ctx.create_task(
+                    self._reconcile_and_finalize(c_name, task_name, recovered_job_id),
+                    name=f"iac:reconcile:{recovered_job_id}:{task_name}"
+                )
+        except Exception as e: log.error(f"Failed to reconcile: {e}")
+
+    async def _reconcile_and_finalize(self, c_name: str, task_name: str, job_id: int):
+        """Wrapper to safely close out a recovered job in the database after the runner finishes."""
+        success, _ = await self._watch_detached_runner(c_name, task_name, job_id)
+        
+        if job_id != 0:
+            job = next((j for j in self.db.get_jobs_by_status("RUNNING") if j.id == job_id), None)
+            if job:
+                final_status = "SUCCESS" if success else "FAILED"
+                self.state["last_deployment"] = final_status
+                self.db.update_progress(job_id, progress=100 if success else None, current_step="Reconciled & Completed" if success else "Reconciled & Failed")
+                self.db.update_job(job_id, final_status)
+                self.ctx.emit("system:notify", {"id": f"job_{job_id}", "action": "clear"})
+                self.ctx.emit("system:notify", {"title": f"Pipeline #{job_id}", "message": f"Recovered job finished.", "type": "positive" if success else "negative", "toast": True})
+                
+        self.state["running_jobs"] = max(0, self.state.get("running_jobs", 0) - 1)
+        self.state["is_running"] = self.state["running_jobs"] > 0
+
+    async def _watch_detached_runner(self, container_name: str, task_name: str, job_id: int):
+        successful_hosts, failed_hosts = 0, 0
+        log_file = self.config.get_log_path(job_id)
+        ansible_progress = 50.0  # Base progress for Ansible phase
+        
+        try:
+            log_proc = await asyncio.create_subprocess_exec("docker", "logs", "-f", container_name, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+            while True:
+                line = await log_proc.stdout.readline()
+                if not line: break
+                decoded = line.decode('utf-8', errors='replace').rstrip()
+                if decoded:
+                    # 1. WRITE TO DISK DIRECTLY (Solves the memory freeze)
+                    with open(log_file, "a", encoding="utf-8") as f:
+                        f.write(f"[{task_name}] {decoded}\n")
+
+                    # 2. MICRO-PROGRESS SNIFFER
+                    if "TASK [" in decoded:
+                        ansible_task = decoded.split("TASK [")[1].split("]")[0]
+                        ansible_progress = min(99.0, ansible_progress + 1.5)  # Increment slightly per task, capping at 99%
+                        self.db.update_progress(job_id, progress=int(ansible_progress), current_step=f"Ansible: {ansible_task}")
+
+                    # 3. LIGHTWEIGHT UI MEMORY (Keep only the last 50 lines for the active popup)
+                    if "active_tasks" in self.state and task_name in self.state["active_tasks"]:
+                        self.state["active_tasks"][task_name]["logs"].append(decoded)
+                        if len(self.state["active_tasks"][task_name]["logs"]) > 50:
+                            self.state["active_tasks"][task_name]["logs"].pop(0)
+
+                    if "ok=" in decoded and "failed=" in decoded and ":" in decoded:
+                        try:
+                            sp = decoded.split(":")[1]
+                            fc = int(sp.split("failed=")[1].split()[0])
+                            uc = int(sp.split("unreachable=")[1].split()[0])
+                            if fc > 0 or uc > 0: failed_hosts += 1
+                            else: successful_hosts += 1
+                        except Exception: pass
+
+            wait_proc = await asyncio.create_subprocess_exec("docker", "wait", container_name, stdout=asyncio.subprocess.PIPE)
+            stdout, _ = await wait_proc.communicate()
+            success = int(stdout.decode().strip()) == 0
+            
+            if "active_tasks" in self.state and task_name in self.state["active_tasks"]:
+                self.state["active_tasks"][task_name]["status"] = "success" if success else "failed"
+            await asyncio.create_subprocess_exec("docker", "rm", "-f", container_name)
+            return success, {"successful_hosts": successful_hosts, "failed_hosts": failed_hosts}
+            
+        except Exception as e:
+            if "active_tasks" in self.state and task_name in self.state["active_tasks"]:
+                self.state["active_tasks"][task_name]["status"] = "error"
+            return False, {"successful_hosts": 0, "failed_hosts": 0}
+
+    async def execute_ansible_docker(self, playbook_subpath: str, inventory_subpath: str, limit: str = None, extra_vars: dict = None, task_name: str = "global", job_id: int = 0):
+        key_path = None # Safe default so the 'finally' block doesn't crash on early exit
+        
+        if not shutil.which("docker"): return False, {"successful_hosts": 0, "failed_hosts": 0}
+
+        if "active_tasks" not in self.state: self.state["active_tasks"] = {}
+        self.state["active_tasks"][task_name] = {
+            "status": "pulling_image", 
+            "logs": [],
+            "job_id": job_id 
+        }
+
+        reg_url, reg_user, reg_token = self.ctx.get_secret("ansible_registry_url"), self.ctx.get_secret("ansible_registry_user"), self.ctx.get_secret("ansible_registry_token")
+        if reg_url and reg_user and reg_token:
+            proc = await asyncio.create_subprocess_exec("docker", "login", reg_url, "-u", reg_user, "--password-stdin", stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+            await proc.communicate(input=reg_token.encode('utf-8'))
+
+        ssh_key = self.ctx.get_secret("ansible_ssh_key")
+        if not ssh_key: return False, {"successful_hosts": 0, "failed_hosts": 0}
+
+        # Use services_dir for temporary key exchange because its volume mount is proven to be correctly mapped
+        key_filename = f"ansible_id_rsa_{uuid.uuid4().hex[:8]}"
+        key_dir = self.config.services_dir / ".iac_keys"
+        key_dir.mkdir(parents=True, exist_ok=True)
+        key_path = key_dir / key_filename
+        
+        with open(key_path, "w") as f: f.write(ssh_key.replace('\\n', '\n').strip() + '\n')
+        os.chmod(key_path, 0o600)
+
+        try:
+            # In a Docker-in-Docker setup, bind mounts require the physical host's path.
+            h_git = self.config.host_git_repos_dir
+            h_svc = self.config.host_services_dir
+            
+            safe_task_name = "".join(c if c.isalnum() or c in ".-_" else "-" for c in task_name).strip("-")
+            c_name = f"aac-runner-{safe_task_name}"
+            
+            await asyncio.create_subprocess_exec("docker", "rm", "-f", c_name, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+
+            cmd = [
+                "docker", "run", "-d", "--name", c_name, "--pull", "always",
+                "--label", f"iac_job_id={job_id}", "--label", f"iac_task_name={task_name}",
+                "-e", f"IAC_JOB_ID={job_id}",
+                "-v", f"{h_git}:/data/storage/git_repos", "-v", f"{h_svc}:/data/storage/services",
+                "-e", "ANSIBLE_HOST_KEY_CHECKING=False", "-e", "PYTHONUNBUFFERED=1", "-e", "ANSIBLE_NOCOLOR=1", "-e", "ANSIBLE_DEPRECATION_WARNINGS=0", "-e", "ANSIBLE_INTERPRETER_PYTHON=auto_silent",
+                "-e", "ANSIBLE_ROLES_PATH=/data/storage/git_repos/config_engine/roles", "-e", "PYTHONPATH=/data/storage/git_repos/aac_factory/scripts",
+                "--entrypoint", "",
+                self.config.ansible_docker_image,
+                "/bin/sh", "-c", 
+                "mkdir -p /root/.ssh && cp \"$1\" /root/.ssh/id_rsa && chmod 600 /root/.ssh/id_rsa && shift && exec \"$@\"", 
+                "--", f"/data/storage/services/.iac_keys/{key_filename}",
+                "ansible-playbook", "-i", f"/data/storage/git_repos/inventory_state/{inventory_subpath}", f"/data/storage/git_repos/config_engine/{playbook_subpath}",
+                "-u", "ansible-agent", "--diff" 
+            ]
+            if limit: cmd.extend(["--limit", limit])
+            if extra_vars:
+                for k, v in extra_vars.items(): cmd.extend(["-e", f"{k}={v}"])
+            if not self.config.auto_apply: cmd.append("--check")
+
+            log.info(f"Executing: {playbook_subpath} (Limit: {limit or 'None'})")
+            self.state["active_tasks"][task_name]["status"] = "running_ansible"
+
+            proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+            stdout, _ = await proc.communicate()
+            
+            if proc.returncode != 0:
+                error_msg = stdout.decode('utf-8', errors='replace').strip()
+                raise RuntimeError(f"Failed to spawn Docker runner container: {error_msg}")
+
+            return await self._watch_detached_runner(c_name, task_name, job_id)
+        except Exception as e:
+            log.error(f"Docker Execution Error: {e}")
+            if "active_tasks" in self.state and task_name in self.state["active_tasks"]:
+                self.state["active_tasks"][task_name]["status"] = "error"
+            return False, {"successful_hosts": 0, "failed_hosts": 0}
+        finally:
+            if key_path and os.path.exists(key_path):
+                try: os.remove(key_path)
+                except Exception: pass
