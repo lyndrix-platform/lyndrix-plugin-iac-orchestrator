@@ -1,8 +1,9 @@
 import hmac
 import yaml
 import time
+import re
 from fastapi import APIRouter, Request, Header, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 iac_api_router = APIRouter(prefix="/api/iac", tags=["IaC Orchestrator"])
 
@@ -294,6 +295,27 @@ async def get_service_catalog():
 class DeployRequest(BaseModel):
     branch: str = "main"
 
+
+class TestHostDeployRequest(BaseModel):
+    services: list[str] = Field(default_factory=list)
+
+
+_HOST_LIMIT_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def _load_generated_inventory_hosts() -> set[str]:
+    if not _engine:
+        return set()
+    inventory_path = _engine.config.git_repos_dir / "inventory_state" / "global" / "ansible" / "inventory.yml"
+    if not inventory_path.exists():
+        return set()
+    try:
+        with open(inventory_path, "r", encoding="utf-8") as handle:
+            inv = yaml.safe_load(handle) or {}
+    except Exception:
+        return set()
+    return set(((inv.get("all") or {}).get("hosts") or {}).keys())
+
 @iac_api_router.post("/deploy/service/{service_name}")
 async def trigger_service_deployment(service_name: str, payload: DeployRequest):
     """Triggers a targeted single-service deployment."""
@@ -301,6 +323,94 @@ async def trigger_service_deployment(service_name: str, payload: DeployRequest):
     event_payload = {"pipeline_type": "single_service", "service_name": service_name, "service_branch": payload.branch, "manual": True}
     _ctx.emit("iac:webhook_verified", event_payload)
     return {"status": "accepted", "message": f"Deployment queued for {service_name}"}
+
+
+@iac_api_router.post("/deploy/test-host/{host_name}")
+async def trigger_test_host_deployment(host_name: str, payload: TestHostDeployRequest):
+    """
+    Triggers a guarded rollout for exactly one host.
+
+    Safety constraints:
+    - host must be an exact hostname token (no Ansible patterns/wildcards),
+    - host must be listed in `PLUGIN_IAC_ORCHESTRATOR_TEST_DEPLOY_ALLOWED_HOSTS`
+      (or Vault key `iac_test_deploy_allowed_hosts`),
+    - host must exist in the generated inventory.
+    """
+    if not _ctx or not _engine:
+        raise HTTPException(status_code=500, detail="Orchestrator offline")
+
+    host = str(host_name or "").strip()
+    if not host or not _HOST_LIMIT_PATTERN.fullmatch(host):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid host_name: only exact host tokens [A-Za-z0-9._-] are allowed.",
+        )
+
+    allowed_hosts = _engine.config.test_deploy_allowed_hosts
+    if not allowed_hosts:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Test-host deploy is disabled. Configure "
+                "PLUGIN_IAC_ORCHESTRATOR_TEST_DEPLOY_ALLOWED_HOSTS or "
+                "Vault key iac_test_deploy_allowed_hosts."
+            ),
+        )
+    if host not in allowed_hosts:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Host '{host}' is not in test-deploy allowlist.",
+        )
+
+    known_hosts = _load_generated_inventory_hosts()
+    if host not in known_hosts:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Host '{host}' not found in generated inventory_state.",
+        )
+
+    services = [str(s).strip() for s in (payload.services or []) if str(s).strip()]
+    event_payload = {
+        "pipeline_type": "rollout",
+        "limit": host,
+        "manual": True,
+        "trigger": "manual_test_host",
+        "test_host": host,
+    }
+    if services:
+        event_payload["target_services"] = services
+
+    _ctx.emit("iac:webhook_verified", event_payload)
+    return {
+        "status": "accepted",
+        "message": f"Test deployment queued for host '{host}'.",
+        "limit": host,
+        "services": services,
+    }
+
+
+@iac_api_router.post("/webhook/gitlab/test-host/{host_name}")
+async def gitlab_test_host_webhook(
+    host_name: str,
+    payload: TestHostDeployRequest,
+    x_gitlab_token: str = Header(None),
+):
+    """
+    GitLab-token-protected webhook variant for test-host rollout triggering.
+    Useful when CI should only call a Lyndrix webhook endpoint.
+    """
+    if not _ctx:
+        raise HTTPException(status_code=500, detail="API Context not initialized")
+
+    expected_token = _ctx.get_secret("gitlab_webhook_token")
+    if not expected_token:
+        _ctx.log.error("SECURITY HALT: Webhook token missing in Vault.")
+        raise HTTPException(status_code=500, detail="Configuration Error")
+    if not x_gitlab_token or not hmac.compare_digest(x_gitlab_token, expected_token):
+        _ctx.log.warning("SECURITY REJECTION: Unauthorized webhook test-host trigger attempt.")
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    return await trigger_test_host_deployment(host_name, payload)
 
 @iac_api_router.get("/jobs")
 async def list_orchestrator_jobs(limit: int = 20):

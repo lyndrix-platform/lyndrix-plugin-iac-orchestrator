@@ -57,5 +57,18 @@ class IaCConfig:
         try: return int(self._get("PLUGIN_IAC_ORCHESTRATOR_SYNC_INTERVAL", "iac_sync_interval_minutes", "15"))
         except ValueError: return 15
 
+    @property
+    def test_deploy_allowed_hosts(self) -> set[str]:
+        raw = self._get(
+            "PLUGIN_IAC_ORCHESTRATOR_TEST_DEPLOY_ALLOWED_HOSTS",
+            "iac_test_deploy_allowed_hosts",
+            "",
+        ) or ""
+        return {
+            host.strip()
+            for host in str(raw).split(",")
+            if host and host.strip()
+        }
+
     def get_log_path(self, job_id: int) -> Path:
         return self.logs_dir / f"job_{job_id}.log"

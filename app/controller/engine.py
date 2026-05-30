@@ -437,10 +437,21 @@ class DeploymentEngine:
                 )
             ])
         elif pipeline_type == "rollout":
+            target_services = payload.get("target_services")
+            if target_services is not None:
+                log.info(
+                    "ENGINE: rollout constrained to %s services on limit '%s'.",
+                    len(target_services),
+                    payload.get("limit", "all"),
+                )
             pipeline.extend([
                 DetectDriftStage(),
                 SyncAllServicesStage(), 
-                AsyncBulkRolloutStage(inventory_path="global/ansible/inventory.yml", limit=payload.get("limit", "all")),
+                AsyncBulkRolloutStage(
+                    inventory_path="global/ansible/inventory.yml",
+                    limit=payload.get("limit", "all"),
+                    target_services=target_services,
+                ),
                 CleanupOrphanedServicesStage(),
                 DynamicRuleExecutionStage(pipeline_type),
                 PersistStateStage()

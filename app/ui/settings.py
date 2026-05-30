@@ -6,12 +6,19 @@ from ui.theme import UIStyles
 def render_settings_ui(ctx, service):
     """Renders the settings interface for the IaC Orchestrator."""
     state = service.state
-    current_config = {"auto_apply": state.get("auto_apply_enabled", False)}
+    current_config = {
+        "auto_apply": state.get("auto_apply_enabled", False),
+        "test_deploy_allowed_hosts": ctx.get_secret("iac_test_deploy_allowed_hosts") or "",
+    }
     token_display = {"value": "********************************"}
 
     def save_settings():
         state["auto_apply_enabled"] = current_config["auto_apply"]
         ctx.set_secret("iac_auto_apply", str(current_config["auto_apply"]))
+        ctx.set_secret(
+            "iac_test_deploy_allowed_hosts",
+            str(current_config["test_deploy_allowed_hosts"] or "").strip(),
+        )
         ui.notify("Settings saved successfully.", type="positive")
 
     def generate_token():
@@ -66,6 +73,15 @@ def render_settings_ui(ctx, service):
                     ui.label('Pipeline Configuration').classes('text-sm font-bold uppercase tracking-widest text-slate-300')
                 ui.switch('Enable Auto-Apply').bind_value(current_config, 'auto_apply').props('color=primary')
                 ui.label('Warning: Auto-Apply executes infrastructure changes immediately on webhook receipt.').classes('text-xs text-orange-500 italic')
+                ui.input(
+                    'Test Deploy Allowed Hosts (comma-separated)',
+                    placeholder='e.g. pve-test-01',
+                ).props('outlined dense').classes('w-full').bind_value(
+                    current_config, 'test_deploy_allowed_hosts'
+                )
+                ui.label(
+                    'Used by /api/iac/deploy/test-host/{host}; blocks rollout to non-allowlisted hosts.'
+                ).classes('text-xs text-slate-400')
                 with ui.row().classes('w-full justify-end mt-2'):
                     ui.button('Save Pipeline Settings', on_click=save_settings, icon='save', color='primary').props('unelevated rounded size=sm')
 

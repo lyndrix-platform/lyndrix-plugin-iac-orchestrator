@@ -32,11 +32,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Secrets stay out of generated state** — `ssh_key` / `root_password` / `password` / `token` are
   never serialised; the downstream Terraform root injects them from its own secret vars.
 - `iac_core/tests/test_terraform_gen.py` — unit coverage for the mapper and the destroy-safety guard.
+- **Guarded test-host deploy API** — new `POST /api/iac/deploy/test-host/{host_name}` trigger and
+  GitLab-token webhook variant `POST /api/iac/webhook/gitlab/test-host/{host_name}`. Both start a
+  rollout constrained to exactly one host (`limit=<host>`) and optionally a provided
+  `target_services` subset. They refuse wildcard/pattern limits and only allow hosts explicitly
+  listed in `PLUGIN_IAC_ORCHESTRATOR_TEST_DEPLOY_ALLOWED_HOSTS` (or Vault key
+  `iac_test_deploy_allowed_hosts`), then validate that the host exists in generated inventory.
+- **Pipeline settings UI** now includes `Test Deploy Allowed Hosts (comma-separated)` to manage the
+  same allowlist from the dashboard.
 
 ### Changed
 - `iac_core/app/generator.py` — Terraform generation is built per-stage in memory and written in a
   single guarded phase after a fully clean pass (gated on `error_count == 0`).
 - `iac_core/app/gen/terraform_gen.py` — now a backwards-compatible shim re-exporting the new package.
+- Rollout dispatch now accepts an optional `target_services` payload key and passes it into
+  `AsyncBulkRolloutStage`, allowing safe single-host smoke tests without forcing full catalog rollout.
 
 ## [0.3.0] - 2026-05-26
 
