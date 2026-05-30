@@ -9,7 +9,11 @@ from deepmerge import Merger
 from services.loader import load_configuration
 from services.renderer import render_templates
 from gen.ansible_gen import generate_ansible_state
-from gen.terraform_gen import generate_terraform_state
+from gen.terraform import (
+    build_terraform_state,
+    write_terraform_state,
+    TerraformSafetyError,
+)
 from validate.models import validate_configuration
 from core.logger import get_logger
 
@@ -97,6 +101,11 @@ def main() -> None:
         "group_vars": {} 
     }
     error_count = 0
+    # Terraform writes are DEFERRED: we build each environment's state in memory
+    # during the loop, then only persist them after a fully clean pass. This
+    # prevents a partial/failed run from committing a shrunken container map that
+    # a downstream `terraform apply` would interpret as "destroy the rest".
+    pending_terraform = []
 
     for site in sites:
         for stage in discover_stages(args.inventory_dir, site):
@@ -113,7 +122,9 @@ def main() -> None:
                 # 3. Generate isolated states for this specific stage
                 isolated_dir = args.output_dir / site / stage
                 generate_ansible_state(validated_data, isolated_dir)
-                generate_terraform_state(validated_data, isolated_dir)
+                # Build (pure, no I/O) now; write later once the whole run is clean.
+                tf_state = build_terraform_state(validated_data, log)
+                pending_terraform.append((isolated_dir, tf_state, f"{site}/{stage}"))
 
                 # 4. SAFE AGGREGATION for Global Inventory
                 group_vars = global_ansible_data["group_vars"]
@@ -176,7 +187,27 @@ def main() -> None:
                 log.exception(f"Failed processing {site}/{stage} due to an internal exception:")
                 error_count += 1
 
-    # 5. Final Global Generation
+    # 5. DEFERRED Terraform write phase.
+    # Only persist Terraform state when EVERY stage parsed/validated cleanly, so a
+    # half-processed run can never emit a destructive partial state. Each write is
+    # additionally protected by the destroy-safety guard.
+    if error_count == 0:
+        for isolated_dir, tf_state, ctx in pending_terraform:
+            try:
+                write_terraform_state(tf_state, isolated_dir, context=ctx, log=log)
+            except TerraformSafetyError as e:
+                log.error(f"Terraform safety guard blocked {ctx}: {e}")
+                error_count += 1
+            except Exception:
+                log.exception(f"Failed writing Terraform state for {ctx}:")
+                error_count += 1
+    else:
+        log.error(
+            f"Skipping ALL Terraform writes: generation had {error_count} error(s). "
+            f"Refusing to emit a possibly-destructive partial state."
+        )
+
+    # 6. Final Global Generation
     has_hosts = len(global_ansible_data["hosts"]) > 0
     has_hw = len(global_ansible_data["hardware_hosts"]) > 0
 
