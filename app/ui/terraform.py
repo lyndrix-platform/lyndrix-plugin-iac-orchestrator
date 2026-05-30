@@ -4,20 +4,24 @@ Terraform readiness panel.
 Display-only (for now) view of the *Provision* phase. The Ansible pipeline is
 live today; Terraform is the next step in the host lifecycle:
 
-    Terraform (provision the host)  →  Ansible (bring to spec)  →  Services (deploy)
+    Terraform (provision the host)  ->  Ansible (bring to spec)  ->  Services (deploy)
 
 This panel scans the same site/host YAML the Assignments tab uses and surfaces a
 ``terraform:`` block per host (provider, resource, workspace, state). Hosts
 without one are shown as "Ansible-only / unmanaged" so operators can see exactly
 what still needs an IaC provisioning definition. The Provision actions are
-intentionally disabled and clearly marked *coming soon* — the wiring point is a
+intentionally disabled and clearly marked *coming soon* -- the wiring point is a
 single ``ctx.emit("iac:webhook_verified", {"pipeline_type": "terraform_provision", ...})``
 once the engine stage lands, so nothing here needs to change when it does.
+
+All surfaces use the themed ``UIStyles`` cards (via ``components``) so light/dark
+mode is handled centrally.
 """
 from __future__ import annotations
 
 import yaml
 from nicegui import ui
+from ui.theme import UIStyles
 
 from . import components as c
 
@@ -25,9 +29,6 @@ from . import components as c
 def _scan_terraform_hosts(ctx, service) -> list:
     """
     Parse site host YAML and return one entry per host with terraform metadata.
-
-    Returns a list of dicts: {site, stage, host, ansible_host, managed (bool),
-    provider, resource, workspace, state}.
     """
     config = service.config
     base_dir = config.git_repos_dir / "iac_controller" / "environments"
@@ -86,9 +87,7 @@ def render_terraform_panel(ctx, service):
             )
             ui.button(icon="refresh", on_click=_panel.refresh).props("flat round color=zinc-500")
 
-        with ui.row().classes(
-            "w-full items-start gap-2 p-3 rounded-xl bg-violet-500/10 border border-violet-500/30"
-        ):
+        with ui.row().classes(UIStyles.WARNING_BANNER + " !bg-violet-500/10 !border-violet-500/30"):
             ui.icon("construction", size="18px").classes("text-violet-400 shrink-0 mt-0.5")
             with ui.column().classes("gap-0"):
                 ui.label("Terraform execution is coming next.").classes(
@@ -118,36 +117,29 @@ def render_terraform_panel(ctx, service):
 
         # Managed hosts
         if managed:
-            ui.label("Terraform-Managed Hosts").classes(
-                "text-sm font-bold text-slate-700 dark:text-zinc-200 mt-2"
-            )
+            ui.label("Terraform-Managed Hosts").classes(UIStyles.TITLE_H3 + " mt-2")
             with ui.grid(columns="repeat(auto-fill, minmax(320px, 1fr))").classes("w-full gap-4"):
                 for h in managed:
-                    _host_card(ctx, h, managed=True)
+                    _host_card(h, managed=True)
 
         # Unmanaged hosts
         if unmanaged:
-            ui.label("Awaiting Terraform Definition").classes(
-                "text-sm font-bold text-slate-700 dark:text-zinc-200 mt-4"
-            )
+            ui.label("Awaiting Terraform Definition").classes(UIStyles.TITLE_H3 + " mt-4")
             with ui.grid(columns="repeat(auto-fill, minmax(320px, 1fr))").classes("w-full gap-4"):
                 for h in unmanaged:
-                    _host_card(ctx, h, managed=False)
+                    _host_card(h, managed=False)
 
-    def _host_card(ctx, h, *, managed: bool):
+    def _host_card(h, *, managed: bool):
         color = "violet" if managed else "zinc"
-        text_c, grad, _, _ = c.accent(color)
-        with ui.card().classes(c._CARD + " p-0"):
-            ui.element("div").classes(f"h-1 w-full bg-gradient-to-r {grad}")
+        text_c = c.accent_text(color)
+        with ui.card().classes(c.CARD):
             with ui.column().classes("w-full p-4 gap-2"):
                 with ui.row().classes("w-full justify-between items-start no-wrap"):
                     with ui.column().classes("gap-0 min-w-0"):
                         ui.label(h["host"]).classes(
                             "text-md font-bold text-slate-800 dark:text-zinc-100 truncate"
                         ).tooltip(h["host"])
-                        ui.label(f"{h['site']} / {h['stage']}").classes(
-                            "text-[10px] uppercase tracking-widest text-slate-400 dark:text-zinc-500"
-                        )
+                        ui.label(f"{h['site']} / {h['stage']}").classes(UIStyles.LABEL_MINI)
                     ui.icon("dns" if managed else "cloud_off", size="20px").classes(text_c)
 
                 ui.separator().classes("opacity-20")

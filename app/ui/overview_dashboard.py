@@ -2,17 +2,19 @@
 Overview statistics dashboard for the IaC Orchestrator.
 
 Renders a modern, at-a-glance summary at the top of the Overview tab:
-  * KPI row (total deployments, success rate, avg duration, running)
-  * The host lifecycle pipeline (Provision → Configure → Deploy) with per-phase
+  * KPI row (total deployments, success rate, avg duration, last deployment)
+  * The host lifecycle pipeline (Provision -> Configure -> Deploy) with per-phase
     health, so Terraform shows up as soon as it produces jobs.
   * Status breakdown bars + a recent-deployments feed.
 
-It is intentionally read-only and refreshable, driven entirely by
-``DeploymentStats`` so it stays in sync with whatever phases pipeline_meta knows.
+Read-only and refreshable, driven entirely by ``DeploymentStats``. All surfaces
+use the themed ``UIStyles`` cards (via ``components``) so light/dark mode is
+handled centrally.
 """
 from __future__ import annotations
 
 from nicegui import ui
+from ui.theme import UIStyles
 
 from ..controller import stats as stats_mod
 from ..controller.pipeline_meta import get_phases
@@ -61,8 +63,7 @@ def render_overview_dashboard(ctx, service):
             )
 
         # ---- Lifecycle pipeline -------------------------------------------
-        with ui.card().classes(c._CARD + " p-0 w-full"):
-            ui.element("div").classes("h-1 w-full bg-gradient-to-r from-violet-400 via-sky-400 to-emerald-400")
+        with ui.card().classes(c.CARD + " w-full"):
             with ui.column().classes("w-full p-4 gap-3"):
                 c.section_header(
                     "Host Lifecycle", "Provision → Configure → Deploy", icon="account_tree",
@@ -84,41 +85,35 @@ def render_overview_dashboard(ctx, service):
             _recent_feed(s)
 
     def _phase_step(pdef, ps):
-        text_c, grad, chip_bg, chip_border = c.accent(pdef.color)
+        text_c = c.accent_text(pdef.color)
         total = ps.total if ps else 0
         rate = ps.success_rate if ps else 0.0
         with ui.column().classes(
             "flex-1 min-w-[150px] rounded-xl border border-slate-200 dark:border-zinc-800 "
-            "bg-slate-50/60 dark:bg-zinc-900/40 p-3 gap-2"
+            "bg-slate-50 dark:bg-zinc-800/40 p-3 gap-2"
         ):
             with ui.row().classes("w-full items-center justify-between no-wrap"):
                 with ui.row().classes("items-center gap-2 no-wrap"):
                     ui.icon(pdef.icon, size="18px").classes(text_c)
                     ui.label(pdef.label).classes("text-sm font-bold text-slate-700 dark:text-zinc-200")
                 ui.label(str(total)).classes(f"text-lg font-black {text_c}")
-            ui.label(pdef.description).classes("text-[11px] text-slate-500 dark:text-zinc-500 leading-snug")
+            ui.label(pdef.description).classes("text-[11px] text-slate-500 dark:text-zinc-400 leading-snug")
             if total:
                 c.progress_bar(rate, pdef.color)
-                with ui.row().classes("w-full justify-between text-[10px] text-slate-500 dark:text-zinc-500"):
+                with ui.row().classes("w-full justify-between text-[10px] text-slate-500 dark:text-zinc-400"):
                     ui.label(f"{ps.success} ok · {ps.failed} fail")
                     ui.label(f"{rate:.0f}%")
             else:
-                with ui.row().classes(
-                    f"items-center gap-1 px-2 py-0.5 rounded-full border {chip_border} {chip_bg} "
-                    "text-[10px] font-semibold w-fit"
-                ):
+                with ui.row().classes("items-center gap-1 w-fit"):
                     ui.icon("hourglass_empty", size="11px").classes(text_c)
-                    ui.label("No runs yet").classes(text_c)
+                    ui.label("No runs yet").classes(f"text-[10px] font-semibold {text_c}")
 
     def _status_breakdown(s):
-        with ui.card().classes(c._CARD + " p-0"):
-            ui.element("div").classes("h-1 w-full bg-gradient-to-r from-sky-400 to-cyan-400")
+        with ui.card().classes(c.CARD):
             with ui.column().classes("w-full p-4 gap-3"):
                 c.section_header("Status Breakdown", icon="donut_large")
                 if not s.total:
-                    ui.label("No deployments recorded yet.").classes(
-                        "text-sm text-slate-500 dark:text-zinc-400 italic"
-                    )
+                    ui.label("No deployments recorded yet.").classes(UIStyles.TEXT_MUTED + " italic")
                     return
                 palette = {
                     "SUCCESS": "emerald", "RUNNING": "amber",
@@ -126,7 +121,7 @@ def render_overview_dashboard(ctx, service):
                 }
                 for status, count in sorted(s.by_status.items(), key=lambda x: -x[1]):
                     color = palette.get(status, "indigo")
-                    text_c, _, _, _ = c.accent(color)
+                    text_c = c.accent_text(color)
                     pct = (count / s.total) * 100
                     with ui.column().classes("w-full gap-1"):
                         with ui.row().classes("w-full justify-between items-center"):
@@ -137,18 +132,17 @@ def render_overview_dashboard(ctx, service):
                         c.progress_bar(pct, color)
 
     def _recent_feed(s):
-        with ui.card().classes(c._CARD + " p-0"):
-            ui.element("div").classes("h-1 w-full bg-gradient-to-r from-emerald-400 to-teal-400")
+        with ui.card().classes(c.CARD):
             with ui.column().classes("w-full p-4 gap-2"):
                 c.section_header("Recent Deployments", icon="history")
                 if not s.recent:
                     ui.label("Nothing here yet — trigger a deployment to populate the feed.").classes(
-                        "text-sm text-slate-500 dark:text-zinc-400 italic"
+                        UIStyles.TEXT_MUTED + " italic"
                     )
                     return
                 with ui.column().classes("w-full gap-1 max-h-[260px] overflow-y-auto pr-1"):
                     for job in s.recent:
-                        text_c, _, _, _ = c.accent(job["color"])
+                        text_c = c.accent_text(job["color"])
                         with ui.row().classes(
                             "w-full items-center gap-3 py-1.5 px-2 rounded-lg no-wrap "
                             "hover:bg-slate-100 dark:hover:bg-zinc-800/60 transition-colors"
