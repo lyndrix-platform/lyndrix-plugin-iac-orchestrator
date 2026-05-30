@@ -64,5 +64,8 @@ PROVIDER_PUBLIC_FIELDS = (
 SECRET_FIELDS = ("password", "token", "ssh_key", "root_password", "secret")
 
 # Top-level keys of the generated terraform.tfvars.json.
-KEY_PROVIDERS = "providers"
+# NOTE: ``providers`` is a RESERVED Terraform variable name, so the provider
+# connection map is exposed as ``proxmox_nodes`` to remain natively consumable
+# as a tfvars variable by the downstream infra-engine.
+KEY_PROVIDERS = "proxmox_nodes"
 KEY_CONTAINERS = "containers"

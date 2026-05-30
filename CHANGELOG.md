@@ -22,7 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   maps every SSoT host with `terraform.is_managed: true` into a fully-defaulted LXC container object
   (roles/services carried through for the Ansible bridge) and every `hardware_host` with
   `terraform.is_used: true` into a provider connection entry. Output is the structured
-  `terraform/terraform.tfvars.json` (`{ "providers": {...}, "containers": {...} }`) per environment.
+  `terraform/terraform.tfvars.json` (`{ "proxmox_nodes": {...}, "containers": {...} }`) per environment.
 - **Destroy-safety guard** — the generator now refuses to emit a Terraform state that would tear
   down live infrastructure. A wipe (non-empty → empty) or a removal beyond
   `PLUGIN_IAC_ORCHESTRATOR_TF_MAX_DESTROY_RATIO` (default 50%) raises and aborts the write unless
