@@ -224,6 +224,42 @@ class JobDatabase:
             if session:
                 session.close()
                 
+    def get_jobs_for_stats(self, limit: int = 500) -> list:
+        """
+        Fetch a lightweight, raw-typed slice of recent jobs for statistics.
+
+        Unlike :meth:`get_recent_jobs` (which pre-formats timestamps for tables),
+        this returns native datetimes so callers can compute durations and trends.
+        """
+        session = self._get_session()
+        if not session:
+            return []
+
+        try:
+            jobs = session.query(
+                IaCJob.id,
+                IaCJob.pipeline_type,
+                IaCJob.status,
+                IaCJob.progress,
+                IaCJob.start_time,
+                IaCJob.end_time,
+            ).order_by(IaCJob.id.desc()).limit(limit).all()
+
+            return [
+                {
+                    "id": job.id,
+                    "pipeline_type": job.pipeline_type,
+                    "status": job.status,
+                    "progress": job.progress or 0,
+                    "start_time": job.start_time,
+                    "end_time": job.end_time,
+                }
+                for job in jobs
+            ]
+        finally:
+            if session:
+                session.close()
+
     def get_service_history(self, service_name: str, limit: int = 15) -> list:
         """Fetches recent jobs involving a specific service with strict filtering."""
         session = self._get_session()

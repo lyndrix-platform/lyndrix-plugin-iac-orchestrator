@@ -6,6 +6,9 @@ from nicegui import ui
 from ui.layout import main_layout 
 from ui.theme import UIStyles
 
+from .overview_dashboard import render_overview_dashboard
+from .terraform import render_terraform_panel
+
 DOCKER_ICON = 'svg:M6.1,10L0,10.1V13h6.1V10z M13.1,10H7v3h6.1V10z M20.1,10H14v3h6.1V10z M13.1,3H7v3h6.1V3z'
 
 async def render_dashboard(ctx, service):
@@ -165,6 +168,7 @@ async def render_dashboard(ctx, service):
 
         with ui.tabs().classes(UIStyles.TAB_BAR) as tabs:
             overview_tab = ui.tab('Overview', icon='dashboard')
+            provision_tab = ui.tab('Provision', icon='dns')
             catalog_tab = ui.tab('Service Catalog', icon='apps')
             assignment_tab = ui.tab('Assignments', icon='account_tree')
             history_tab = ui.tab('History & Logs', icon='history')
@@ -172,12 +176,22 @@ async def render_dashboard(ctx, service):
         with ui.tab_panels(tabs, value=overview_tab).classes('w-full bg-transparent p-0'):
             
             with ui.tab_panel(overview_tab).classes('gap-6 p-4'):
+                # Modern statistics dashboard (deployments, success rate, lifecycle phases)
+                refresh_overview = render_overview_dashboard(ctx, service)
+                # Keep KPIs/feed fresh as jobs progress and complete.
+                ui.timer(8.0, refresh_overview)
+
+                ui.separator().classes('opacity-10 my-2')
+
                 ui.label("Active Pipelines").classes(UIStyles.TITLE_H3).bind_visibility_from(state, 'is_running')
                 jobs_grid = ui.grid(columns='repeat(auto-fill, minmax(450px, 1fr))').classes('w-full gap-4')
                 
-                with ui.column().classes('w-full items-center py-32 opacity-30').bind_visibility_from(state, 'is_running', backward=lambda x: not x):
-                    ui.icon('cloud_done', size='5em')
-                    ui.label("Infrastructure is stable. No active jobs.").classes('text-xl font-bold')
+                with ui.column().classes('w-full items-center py-16 opacity-30').bind_visibility_from(state, 'is_running', backward=lambda x: not x):
+                    ui.icon('cloud_done', size='4em')
+                    ui.label("Infrastructure is stable. No active jobs.").classes('text-lg font-bold')
+
+            with ui.tab_panel(provision_tab).classes('gap-4 p-4'):
+                render_terraform_panel(ctx, service)
 
             with ui.tab_panel(catalog_tab).classes('gap-4 p-4'):
                 with ui.dialog() as svc_history_dialog, ui.card().classes(f'w-full max-w-4xl p-0 overflow-hidden {UIStyles.MODAL_CONTAINER} lyndrix-card'):
