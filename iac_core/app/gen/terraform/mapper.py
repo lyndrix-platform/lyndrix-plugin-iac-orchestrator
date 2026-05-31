@@ -95,10 +95,32 @@ def build_providers(config: Dict[str, Any], log: logging.Logger = _log) -> Dict[
     return providers
 
 
-def build_container(name: str, host: Dict[str, Any], log: logging.Logger = _log) -> Dict[str, Any]:
+def _node_container_defaults(node_name: str | None, hardware_hosts: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the ``container_defaults`` block for the named hypervisor, or ``{}``."""
+    if not node_name or not isinstance(hardware_hosts, dict):
+        return {}
+    node = hardware_hosts.get(node_name)
+    if not isinstance(node, dict):
+        return {}
+    defaults = node.get("container_defaults")
+    return dict(defaults) if isinstance(defaults, dict) else {}
+
+
+def build_container(
+    name: str,
+    host: Dict[str, Any],
+    hardware_hosts: Dict[str, Any] | None = None,
+    log: logging.Logger = _log,
+) -> Dict[str, Any]:
     """
     Build one fully-defaulted container object, or return ``{}`` if the host is
     missing a required field (caller skips it).
+
+    Defaults are applied in three layers (last wins):
+      1. Schema-level ``CONTAINER_DEFAULTS`` (hardcoded fallbacks).
+      2. Hypervisor-level ``container_defaults`` from the matching hardware_host
+         entry (e.g. bridge/vlan for the Proxmox node the container lands on).
+      3. Host-level terraform block fields (explicit per-host overrides).
     """
     tf = host.get("terraform")
     if not isinstance(tf, dict):
@@ -119,9 +141,15 @@ def build_container(name: str, host: Dict[str, Any], log: logging.Logger = _log)
         )
         return {}
 
+    # Layer 1: schema defaults.
     container: Dict[str, Any] = dict(CONTAINER_DEFAULTS)
     container["hostname"] = host.get("hostname") or name
 
+    # Layer 2: per-hypervisor defaults (bridge/vlan from the node the container is on).
+    node_defaults = _node_container_defaults(tf.get("node_name"), hardware_hosts or {})
+    container.update(node_defaults)
+
+    # Layer 3: explicit host-level overrides.
     for field in CONTAINER_PASSTHROUGH:
         if tf.get(field) is not None:
             container[field] = tf[field]
@@ -140,13 +168,14 @@ def build_container(name: str, host: Dict[str, Any], log: logging.Logger = _log)
 def build_containers(config: Dict[str, Any], log: logging.Logger = _log) -> Dict[str, Any]:
     """Map hosts with terraform.is_managed into the container map."""
     containers: Dict[str, Any] = {}
+    hardware_hosts = config.get("hardware_hosts") or {}
     for name, host in (config.get("hosts") or {}).items():
         if not isinstance(host, dict):
             continue
         tf = host.get("terraform")
         if not isinstance(tf, dict) or not _truthy(tf.get("is_managed")):
             continue
-        obj = build_container(name, host, log)
+        obj = build_container(name, host, hardware_hosts, log)
         if obj:
             containers[name] = obj
     return containers

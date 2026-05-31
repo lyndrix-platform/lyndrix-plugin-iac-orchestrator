@@ -50,6 +50,27 @@ def test_managed_host_becomes_full_container():
     assert "root_password" not in c and "ssh_key" not in c
 
 
+def test_node_container_defaults_inherited_and_overrideable():
+    """Containers inherit bridge/vlan from their hypervisor's container_defaults;
+    explicit host-level values override the node default."""
+    hw = {
+        "hydra": {
+            "terraform": {"is_used": True},
+            "container_defaults": {"bridge": "vmbr0", "vlan": 2130},
+        }
+    }
+    # Host without explicit vlan -> inherits from hydra
+    host_no_vlan = _managed_host()  # node_name=hydra, no vlan in tf block
+    state = build_terraform_state(_config(hosts={"h1": host_no_vlan}, hardware=hw))
+    assert state["containers"]["h1"]["vlan"] == 2130
+    assert state["containers"]["h1"]["bridge"] == "vmbr0"
+
+    # Host with explicit vlan -> overrides hydra default
+    host_override = _managed_host(vlan=2010)
+    state2 = build_terraform_state(_config(hosts={"h2": host_override}, hardware=hw))
+    assert state2["containers"]["h2"]["vlan"] == 2010
+
+
 def test_unmanaged_and_missing_fields_are_excluded():
     hosts = {
         "unmanaged": {"hostname": "x", "terraform": {"is_managed": False}},
