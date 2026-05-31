@@ -102,11 +102,13 @@ class TriggerHostRolloutStage(BaseStage):
     async def run(self, engine, context: dict) -> StageResult:
         if not self.host_name:
             return StageResult(False, "Missing host_name for host rollout hand-off.")
+        # Emit exactly what the Assignments 'Deploy Host' button emits: a host-scoped
+        # rollout that runs the per-host drift check and deploys only this host's
+        # services on this host. Reuses the proven flow rather than duplicating it.
         engine.ctx.emit("iac:webhook_verified", {
             "pipeline_type": "rollout",
             "limit": self.host_name,
-            "manual": False,
-            "force_all_services": True,
+            "manual": True,
             "source": "terraform_provision_chain",
         })
         return StageResult(True, f"Host rollout queued for '{self.host_name}' (existing Deploy Host flow).")
@@ -581,16 +583,8 @@ class DeploymentEngine:
                     len(target_services),
                     payload.get("limit", "all"),
                 )
-            # force_all_services bypasses drift detection so EVERY service in the
-            # catalog is (re)deployed to the limit — required for a freshly
-            # provisioned host where the drift baseline would otherwise skip it.
-            force_all = bool(payload.get("force_all_services"))
-            rollout_stages = []
-            if not force_all:
-                rollout_stages.append(DetectDriftStage())
-            else:
-                log.info("ENGINE: rollout forcing ALL services (drift detection bypassed) on limit '%s'.", payload.get("limit", "all"))
-            rollout_stages.extend([
+            pipeline.extend([
+                DetectDriftStage(),
                 SyncAllServicesStage(),
                 AsyncBulkRolloutStage(
                     inventory_path="global/ansible/inventory.yml",
@@ -601,7 +595,6 @@ class DeploymentEngine:
                 DynamicRuleExecutionStage(pipeline_type),
                 PersistStateStage()
             ])
-            pipeline.extend(rollout_stages)
         else:
             pipeline.append(DynamicRuleExecutionStage(pipeline_type))
 
