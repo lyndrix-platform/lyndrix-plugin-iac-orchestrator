@@ -50,9 +50,12 @@ class TerraformProvisionStage(BaseStage):
     async def run(self, engine, context: dict) -> StageResult:
         if not self.host_name:
             return StageResult(False, "Missing host_name for host_provision pipeline.")
+        payload = context.get("payload") or {}
+        force_apply = bool(payload.get("approve"))
         success, data = await engine.execute_terraform_provision(
             host_name=self.host_name,
             job_id=context.get("job_id", 0),
+            force_apply=force_apply,
         )
         # Tell downstream stages whether a fresh container was actually (re)created,
         # so a complete reinstall can invalidate stale per-host state before rollout.
@@ -60,6 +63,54 @@ class TerraformProvisionStage(BaseStage):
             context["container_created"] = bool(data.get("container_created"))
         msg = "Terraform provisioning completed." if success else "Terraform provisioning failed."
         return StageResult(success, msg, data=data)
+
+
+class InfraPlanStage(BaseStage):
+    """Whole-infrastructure read-only plan ("Check Env"): runs ``tofu plan``
+    across every non-empty environment without applying anything."""
+
+    def __init__(self):
+        super().__init__("Infra Plan: all environments")
+
+    async def run(self, engine, context: dict) -> StageResult:
+        success, data = await engine.execute_terraform_infra(
+            mode="plan",
+            job_id=context.get("job_id", 0),
+            force_apply=False,
+        )
+        envs = data.get("environments", 0) if isinstance(data, dict) else 0
+        msg = (
+            f"Infrastructure plan completed across {envs} environment(s)."
+            if success
+            else "Infrastructure plan failed."
+        )
+        return StageResult(success, msg, data=data)
+
+
+class InfraApplyStage(BaseStage):
+    """Whole-infrastructure apply ("Deploy Infra"): runs ``tofu apply`` across
+    every non-empty environment. Only reachable from explicit, operator-approved
+    triggers (``approve`` payload flag) — never the automatic webhook path."""
+
+    def __init__(self):
+        super().__init__("Infra Deploy: all environments")
+
+    async def run(self, engine, context: dict) -> StageResult:
+        payload = context.get("payload") or {}
+        force_apply = bool(payload.get("approve"))
+        success, data = await engine.execute_terraform_infra(
+            mode="apply",
+            job_id=context.get("job_id", 0),
+            force_apply=force_apply,
+        )
+        envs = data.get("environments", 0) if isinstance(data, dict) else 0
+        msg = (
+            f"Infrastructure deploy completed across {envs} environment(s)."
+            if success
+            else "Infrastructure deploy failed."
+        )
+        return StageResult(success, msg, data=data)
+
 
 class ComplianceBootstrapStage(BaseStage):
     """Runs the baseline compliance playbook against a single freshly-provisioned
@@ -571,7 +622,21 @@ class DeploymentEngine:
                     })
                     return
                 self._active_terraform_host_keys.add(terraform_key)
-                
+            if pipeline_type in ("infra_plan", "infra_apply"):
+                active_infra_jobs = [
+                    j for j in self.db.get_jobs_by_status("RUNNING")
+                    if str(j.pipeline_type or "").startswith(("infra_plan", "infra_apply"))
+                ]
+                if active_infra_jobs:
+                    log.warning("ENGINE: An infrastructure plan/apply is already in progress.")
+                    self.ctx.emit("system:notify", {
+                        "title": "Pipeline Ignored",
+                        "message": "An infrastructure plan/apply is already running.",
+                        "type": "warning",
+                        "toast": True,
+                    })
+                    return
+
         # Safely increment running job counter
         self.state["running_jobs"] = self.state.get("running_jobs", 0) + 1
         self.state["is_running"] = self.state["running_jobs"] > 0
@@ -622,7 +687,8 @@ class DeploymentEngine:
 
         # For single_service runs we do not persist generated inventory back to inventory_state.
         # This avoids unnecessary commit/push contention and keeps service deploys focused.
-        if pipeline_type != "single_service":
+        # infra_plan is read-only (Check Env) and likewise must not commit state.
+        if pipeline_type not in ("single_service", "infra_plan"):
             pipeline.append(CommitPushStage("inventory_state", "ci: automated state update"))
         
         if pipeline_type == "single_service":
@@ -653,6 +719,16 @@ class DeploymentEngine:
         elif pipeline_type == "bootstrap_compliance":
             pipeline.extend([
                 ComplianceBootstrapStage(host_name=payload.get("host_name")),
+                DynamicRuleExecutionStage(pipeline_type),
+            ])
+        elif pipeline_type == "infra_plan":
+            pipeline.extend([
+                InfraPlanStage(),
+                DynamicRuleExecutionStage(pipeline_type),
+            ])
+        elif pipeline_type == "infra_apply":
+            pipeline.extend([
+                InfraApplyStage(),
                 DynamicRuleExecutionStage(pipeline_type),
             ])
         elif pipeline_type == "rollout":
@@ -1293,11 +1369,24 @@ class DeploymentEngine:
         self,
         *,
         run_rel_dir: str,
-        host_name: str,
-        node_name: str,
         task_name: str,
         job_id: int,
+        targets: list[str] | None = None,
+        mode: str = "apply",
+        force_apply: bool = False,
+        host_name: str = "",
     ) -> tuple[bool, dict]:
+        """Run OpenTofu/Terraform in an ephemeral Docker container against a
+        rendered run dir.
+
+        - ``targets`` limits the run to specific resource addresses (per-host
+          provisioning). ``None`` runs the whole rendered environment.
+        - ``mode="plan"`` only computes and prints a plan (read-only "check env",
+          never applies). ``mode="apply"`` plans and then applies when allowed.
+        - Apply happens only when ``force_apply`` (explicit operator approval) or
+          the ``auto_apply`` config is set; otherwise the plan is shown but not
+          applied — preserving the safe default for the webhook/auto path.
+        """
         if not shutil.which("docker"):
             return False, {"successful_hosts": 0, "failed_hosts": 1}
 
@@ -1318,24 +1407,26 @@ class DeploymentEngine:
         )
 
         tf_bin = str(self.config.terraform_binary or "tofu").strip()
-        target_tpl = f'module.download.proxmox_virtual_environment_download_file.tpl["{node_name}"]'
-        target_ct = f'module.lxc_{node_name}.proxmox_virtual_environment_container.ct["{host_name}"]'
+        target_flags = "".join(f" -target='{t}'" for t in (targets or []))
         run_dir = f"/data/storage/git_repos/{run_rel_dir}"
-        plan_cmd = (
-            f"{tf_bin} plan -input=false -no-color -out=tfplan "
-            f"-target='{target_tpl}' -target='{target_ct}'"
-        )
-        apply_cmd = (
-            f"{tf_bin} apply -input=false -no-color -auto-approve tfplan"
-            if self.config.auto_apply
-            else f"{tf_bin} show -no-color tfplan"
-        )
+        do_apply = mode == "apply" and (force_apply or self.config.auto_apply)
+        if mode == "plan":
+            action_cmd = f"{tf_bin} plan -input=false -no-color{target_flags}"
+        else:
+            plan_cmd = (
+                f"{tf_bin} plan -input=false -no-color -out=tfplan{target_flags}"
+            )
+            apply_cmd = (
+                f"{tf_bin} apply -input=false -no-color -auto-approve tfplan"
+                if do_apply
+                else f"{tf_bin} show -no-color tfplan"
+            )
+            action_cmd = f"{plan_cmd}; {apply_cmd}"
         shell_cmd = (
             "set -euo pipefail; "
             f"cd '{run_dir}'; "
             f"{tf_bin} init -input=false -no-color; "
-            f"{plan_cmd}; "
-            f"{apply_cmd}"
+            f"{action_cmd}"
         )
 
         h_git = self.config.host_git_repos_dir
@@ -1353,10 +1444,11 @@ class DeploymentEngine:
         ]
 
         log.info(
-            "Executing Terraform in Docker for host=%s node=%s auto_apply=%s",
-            host_name,
-            node_name,
-            self.config.auto_apply,
+            "Executing Terraform in Docker: scope=%s mode=%s apply=%s host=%s",
+            "host" if targets else "environment",
+            mode,
+            do_apply,
+            host_name or "(env)",
         )
         self.state["active_tasks"][task_name]["status"] = "running_terraform"
         proc = await asyncio.create_subprocess_exec(
@@ -1376,7 +1468,9 @@ class DeploymentEngine:
             "container_created": bool(_stats.get("containers_created", 0)),
         }
 
-    async def execute_terraform_provision(self, host_name: str, job_id: int) -> tuple[bool, dict]:
+    async def execute_terraform_provision(
+        self, host_name: str, job_id: int, force_apply: bool = False
+    ) -> tuple[bool, dict]:
         host_name = str(host_name or "").strip().lower()
         if not host_name:
             return False, {"successful_hosts": 0, "failed_hosts": 1}
@@ -1429,13 +1523,191 @@ class DeploymentEngine:
         if render_proc.returncode != 0:
             raise RuntimeError("Terraform render failed before runner execution.")
 
+        node_name = ctx["node_name"]
+        targets = [
+            f'module.download.proxmox_virtual_environment_download_file.tpl["{node_name}"]',
+            f'module.lxc_{node_name}.proxmox_virtual_environment_container.ct["{host_name}"]',
+        ]
         return await self.execute_terraform_docker(
             run_rel_dir=run_rel_dir,
             host_name=host_name,
-            node_name=ctx["node_name"],
+            targets=targets,
+            mode="apply",
+            force_apply=force_apply,
             task_name=f"Terraform Provision: {host_name}",
             job_id=job_id,
         )
+
+    def _iter_terraform_environments(self) -> list[dict]:
+        """Enumerate rendered Terraform environments that have at least one
+        container, returning a context per environment suitable for a
+        whole-environment plan/apply (no -target scoping)."""
+        environments: list[dict] = []
+        inventory_root = self.base_git_dir / "inventory_state"
+        if not inventory_root.exists():
+            return environments
+        seen: set[str] = set()
+        for tfvars_path in inventory_root.glob("*/*/terraform/terraform.tfvars.json"):
+            try:
+                with open(tfvars_path, "r", encoding="utf-8") as fh:
+                    tfvars = json.load(fh)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Skipping unreadable tfvars %s: %s", tfvars_path, exc)
+                continue
+            containers = tfvars.get("containers") or {}
+            if not containers:
+                continue
+            try:
+                stage = tfvars_path.parents[1].name
+                site = tfvars_path.parents[2].name
+            except IndexError:
+                continue
+            env_name = f"{site}_{stage}"
+            if env_name in seen:
+                continue
+            first_host = next(iter(containers))
+            first_cfg = containers.get(first_host) or {}
+            node_name = first_cfg.get("node_name") or next(
+                iter(tfvars.get("proxmox_nodes") or {}), ""
+            )
+            seen.add(env_name)
+            environments.append(
+                {
+                    "env_name": env_name,
+                    "site": site,
+                    "stage": stage,
+                    "tfvars_path": tfvars_path,
+                    "node_name": node_name,
+                    "host_count": len(containers),
+                    "representative_host": first_host,
+                }
+            )
+        return environments
+
+    async def execute_terraform_environment(
+        self, env_ctx: dict, mode: str, job_id: int, force_apply: bool = False
+    ) -> tuple[bool, dict]:
+        """Render and run OpenTofu for an entire environment (no -target)."""
+        env_name = env_ctx["env_name"]
+        ctx = self._find_terraform_context_for_host(env_ctx["representative_host"])
+
+        infra_repo = self.base_git_dir / "infra_engine"
+        render_script = infra_repo / "scripts" / "python" / "render_environment.py"
+        templates_dir = infra_repo / "terraform-templates"
+        if not render_script.exists():
+            raise RuntimeError(f"Missing render script: {render_script}")
+        if not templates_dir.exists():
+            raise RuntimeError(f"Missing templates dir: {templates_dir}")
+
+        secrets_payload, missing = self._build_terraform_secrets_payload(ctx)
+        if missing:
+            raise RuntimeError(
+                "Missing Terraform secret(s): " + ", ".join(sorted(set(missing)))
+            )
+
+        run_rel_dir = f"inventory_state/.terraform_runs/{env_name}__{mode}"
+        run_dir = self.base_git_dir / run_rel_dir
+        if run_dir.exists():
+            shutil.rmtree(run_dir)
+        run_dir.mkdir(parents=True, exist_ok=True)
+
+        secrets_file = run_dir / "secrets.json"
+        with open(secrets_file, "w", encoding="utf-8") as fh:
+            json.dump(secrets_payload, fh)
+
+        render_cmd = [
+            sys.executable,
+            str(render_script),
+            "--templates", str(templates_dir),
+            "--tfvars", str(ctx["tfvars_path"]),
+            "--output", str(run_dir),
+            "--env-name", str(env_name),
+            "--secrets", str(secrets_file),
+        ]
+        log.info("Rendering Terraform environment '%s' (%s)", env_name, mode)
+        render_proc = await asyncio.create_subprocess_exec(
+            *render_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        render_out, _ = await render_proc.communicate()
+        render_text = render_out.decode("utf-8", errors="replace").strip()
+        if render_text:
+            for line in render_text.splitlines():
+                log.info(f"[TF-Render] {line}")
+        if render_proc.returncode != 0:
+            raise RuntimeError("Terraform render failed before runner execution.")
+
+        verb = "Plan" if mode == "plan" else "Apply"
+        return await self.execute_terraform_docker(
+            run_rel_dir=run_rel_dir,
+            host_name=f"env:{env_name}",
+            targets=None,
+            mode=mode,
+            force_apply=force_apply,
+            task_name=f"Terraform {verb}: {env_name}",
+            job_id=job_id,
+        )
+
+    async def execute_terraform_infra(
+        self, mode: str, job_id: int, force_apply: bool = False
+    ) -> tuple[bool, dict]:
+        """Run a whole-infrastructure plan or apply across every non-empty
+        Terraform environment."""
+        environments = self._iter_terraform_environments()
+        if not environments:
+            log.warning("No Terraform environments with containers found; nothing to %s.", mode)
+            return True, {"successful_hosts": 0, "failed_hosts": 0, "environments": 0}
+
+        overall_ok = True
+        succeeded = 0
+        failed = 0
+        skipped = 0
+        for env_ctx in environments:
+            log.info(
+                "Infra %s: environment '%s' (%d host(s))",
+                mode,
+                env_ctx["env_name"],
+                env_ctx["host_count"],
+            )
+            try:
+                ok, _stats = await self.execute_terraform_environment(
+                    env_ctx, mode, job_id, force_apply=force_apply
+                )
+            except RuntimeError as exc:
+                # Environments that are not yet configured (missing secret/render
+                # inputs) are skipped rather than failing the whole infra run, so
+                # configured environments still plan/apply cleanly.
+                msg = str(exc)
+                if "Missing Terraform secret" in msg or "render failed" in msg.lower():
+                    log.warning(
+                        "Infra %s: skipping unconfigured env '%s' (%s).",
+                        mode,
+                        env_ctx["env_name"],
+                        msg,
+                    )
+                    skipped += 1
+                    continue
+                log.error("Infra %s failed for env '%s': %s", mode, env_ctx["env_name"], exc)
+                ok = False
+            except Exception as exc:  # noqa: BLE001
+                log.error("Infra %s failed for env '%s': %s", mode, env_ctx["env_name"], exc)
+                ok = False
+            if ok:
+                succeeded += 1
+            else:
+                failed += 1
+                overall_ok = False
+        log.info(
+            "Infra %s summary: %d ok, %d failed, %d skipped (of %d env).",
+            mode, succeeded, failed, skipped, len(environments),
+        )
+        return overall_ok, {
+            "successful_hosts": succeeded,
+            "failed_hosts": failed,
+            "skipped": skipped,
+            "environments": len(environments),
+        }
 
     async def execute_ansible_docker(self, playbook_subpath: str, inventory_subpath: str, limit: str = None, extra_vars: dict = None, task_name: str = "global", job_id: int = 0, ssh_key_secret: str = "ansible_ssh_key", remote_user: str = "ansible-agent"):
         key_path = None # Safe default so the 'finally' block doesn't crash on early exit

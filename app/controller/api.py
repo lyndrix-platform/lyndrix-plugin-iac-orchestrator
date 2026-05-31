@@ -470,6 +470,46 @@ async def trigger_host_bootstrap(host_name: str, payload: TestHostDeployRequest)
         "host_name": host,
     }
 
+@iac_api_router.post("/infra/plan")
+async def trigger_infra_plan():
+    """Triggers a read-only whole-infrastructure Terraform plan ("Check Env").
+
+    Renders and runs ``tofu plan`` across every non-empty environment without
+    applying anything, so the operator can compare the live infrastructure
+    against the desired Terraform plan.
+    """
+    if not _ctx:
+        raise HTTPException(status_code=500, detail="Context offline")
+    _ctx.emit(
+        "iac:webhook_verified",
+        {"pipeline_type": "infra_plan", "manual": True, "trigger": "manual_infra_plan"},
+    )
+    return {"status": "accepted", "message": "Infrastructure plan (Check Env) queued."}
+
+
+@iac_api_router.post("/infra/apply")
+async def trigger_infra_apply():
+    """Triggers a whole-infrastructure Terraform apply ("Deploy Infra").
+
+    Runs ``tofu apply`` across every non-empty environment. The explicit
+    ``approve`` flag forces the apply regardless of the ``auto_apply`` config so
+    this manual, operator-initiated action always applies — while the automatic
+    webhook path stays gated by ``auto_apply``.
+    """
+    if not _ctx:
+        raise HTTPException(status_code=500, detail="Context offline")
+    _ctx.emit(
+        "iac:webhook_verified",
+        {
+            "pipeline_type": "infra_apply",
+            "approve": True,
+            "manual": True,
+            "trigger": "manual_infra_apply",
+        },
+    )
+    return {"status": "accepted", "message": "Infrastructure deploy queued."}
+
+
 @iac_api_router.get("/jobs")
 async def list_orchestrator_jobs(limit: int = 20):
     """Returns a list of recent and active jobs."""

@@ -74,6 +74,11 @@ _KNOWN_TYPES: Dict[str, PipelineTypeDef] = {
     "terraform_provision": PipelineTypeDef("Host Provisioning", PHASE_PROVISION, "dns", "violet"),
     "terraform_plan":      PipelineTypeDef("Terraform Plan", PHASE_PROVISION, "preview", "violet"),
     "terraform_destroy":   PipelineTypeDef("Terraform Destroy", PHASE_PROVISION, "delete_forever", "rose"),
+    # infra_plan / infra_apply are the whole-infrastructure operations driven from
+    # the Provision tab: "Check Env" (read-only plan across all environments) and
+    # "Deploy Infra" (apply across all environments).
+    "infra_plan":          PipelineTypeDef("Infra Plan", PHASE_PROVISION, "preview", "violet"),
+    "infra_apply":         PipelineTypeDef("Infra Deploy", PHASE_PROVISION, "dns", "violet"),
     # --- Configure (Ansible) ---
     "connectivity": PipelineTypeDef("Connectivity Check", PHASE_CONFIGURE, "lan", "sky"),
     "rollout":      PipelineTypeDef("Full Rollout", PHASE_CONFIGURE, "public", "sky"),

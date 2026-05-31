@@ -1,18 +1,24 @@
 """
-Terraform readiness panel.
+Terraform provisioning panel.
 
-Display-only (for now) view of the *Provision* phase. The Ansible pipeline is
-live today; Terraform is the next step in the host lifecycle:
+Operational view of the *Provision* phase of the host lifecycle:
 
     Terraform (provision the host)  ->  Ansible (bring to spec)  ->  Services (deploy)
 
 This panel scans the same site/host YAML the Assignments tab uses and surfaces a
 ``terraform:`` block per host (provider, resource, workspace, state). Hosts
 without one are shown as "Ansible-only / unmanaged" so operators can see exactly
-what still needs an IaC provisioning definition. The Provision actions are
-intentionally disabled and clearly marked *coming soon* -- the wiring point is a
-single ``ctx.emit("iac:webhook_verified", {"pipeline_type": "host_provision", ...})``
-once the engine stage lands, so nothing here needs to change when it does.
+what still needs an IaC provisioning definition.
+
+Actions wired here:
+
+- **Check Env** — ``infra_plan``: a read-only ``tofu plan`` across every
+  environment, comparing the live infrastructure against the desired plan.
+- **Deploy Infra** — ``infra_apply``: an operator-approved ``tofu apply`` across
+  every environment (guarded by a confirm dialog).
+- **Provision** (per host) — ``host_provision`` with ``approve`` so the single
+  host is brought into existence (Terraform) and bootstrapped (Ansible), also
+  guarded by a confirm dialog.
 
 All surfaces use the themed ``UIStyles`` cards (via ``components``) so light/dark
 mode is handled centrally.
@@ -72,32 +78,80 @@ def _scan_terraform_hosts(ctx, service) -> list:
 def render_terraform_panel(ctx, service):
     """Render the Provision/Terraform tab content. Returns the refresh callable."""
 
+    state = service.state
+
+    def _emit(payload: dict):
+        ctx.emit("iac:webhook_verified", payload)
+
     @ui.refreshable
     def _panel():
         hosts = _scan_terraform_hosts(ctx, service)
         managed = [h for h in hosts if h["managed"]]
         unmanaged = [h for h in hosts if not h["managed"]]
 
-        # Header + roadmap banner
+        # Confirm dialog: whole-infra apply.
+        with ui.dialog() as deploy_infra_dialog, ui.card().classes(
+            f"{UIStyles.MODAL_CONTAINER} !bg-zinc-900 border border-violet-500/40"
+        ):
+            with ui.column().classes("gap-3 p-2"):
+                with ui.row().classes("items-center gap-2"):
+                    ui.icon("warning", size="22px").classes("text-violet-400")
+                    ui.label("Deploy entire infrastructure?").classes(
+                        "text-base font-bold text-slate-100"
+                    )
+                ui.label(
+                    "This runs `tofu apply` across every Terraform environment and "
+                    "will create, change or destroy real infrastructure to match the "
+                    "desired plan. Run Check Env first to review the plan."
+                ).classes("text-xs text-slate-400 max-w-md")
+                with ui.row().classes("w-full justify-end gap-2 mt-1"):
+                    ui.button("Cancel", on_click=deploy_infra_dialog.close).props(
+                        "flat rounded size=sm color=zinc"
+                    )
+                    ui.button(
+                        "Deploy Infra", icon="rocket_launch", color="violet",
+                        on_click=lambda: [
+                            _emit({
+                                "pipeline_type": "infra_apply",
+                                "approve": True,
+                                "manual": True,
+                                "trigger": "ui_infra_apply",
+                            }),
+                            deploy_infra_dialog.close(),
+                            ui.notify("Infrastructure deploy queued.", type="positive"),
+                        ],
+                    ).props("unelevated rounded size=sm")
+
+        # Header + actions
         with ui.row().classes("w-full justify-between items-end"):
             c.section_header(
                 "Provisioning (Terraform)",
                 "Bring bare hosts into existence before Ansible configures them.",
                 icon="dns", color="violet",
             )
-            ui.button(icon="refresh", on_click=_panel.refresh).props("flat round color=zinc-500")
-
-        with ui.row().classes(UIStyles.WARNING_BANNER + " !bg-violet-500/10 !border-violet-500/30"):
-            ui.icon("construction", size="18px").classes("text-violet-400 shrink-0 mt-0.5")
-            with ui.column().classes("gap-0"):
-                ui.label("Terraform execution is coming next.").classes(
-                    "text-sm font-semibold text-violet-300"
+            with ui.row().classes("items-center gap-2"):
+                ui.button(
+                    "Check Env", icon="preview",
+                    on_click=lambda: [
+                        _emit({
+                            "pipeline_type": "infra_plan",
+                            "manual": True,
+                            "trigger": "ui_infra_plan",
+                        }),
+                        ui.notify("Infrastructure plan (Check Env) queued.", type="info"),
+                    ],
+                ).props("outline rounded size=sm color=violet").tooltip(
+                    "Run a read-only Terraform plan across all environments"
+                ).bind_enabled_from(state, "is_running", backward=lambda x: not x)
+                ui.button(
+                    "Deploy Infra", icon="rocket_launch",
+                    on_click=deploy_infra_dialog.open,
+                ).props("unelevated rounded size=sm color=violet").tooltip(
+                    "Apply Terraform across the entire infrastructure"
+                ).bind_enabled_from(state, "is_running", backward=lambda x: not x)
+                ui.button(icon="refresh", on_click=_panel.refresh).props(
+                    "flat round color=zinc-500"
                 )
-                ui.label(
-                    "Add a `terraform:` block to a host in its site YAML "
-                    "(provider, resource, workspace, state) to register it here. "
-                    "Provision actions activate once the engine stage ships."
-                ).classes("text-xs text-violet-300/70 leading-snug")
 
         # KPI summary
         with ui.grid(columns="repeat(auto-fit, minmax(180px, 1fr))").classes("w-full gap-4"):
@@ -172,9 +226,52 @@ def render_terraform_panel(ctx, service):
                     ui.label("No terraform block").classes(
                         "text-[10px] italic text-slate-400 dark:text-zinc-500"
                     )
-                ui.button("Provision", icon="rocket_launch").props(
+
+                host_name = h["host"]
+                with ui.dialog() as provision_dialog, ui.card().classes(
+                    f"{UIStyles.MODAL_CONTAINER} !bg-zinc-900 border border-violet-500/40"
+                ):
+                    with ui.column().classes("gap-3 p-2"):
+                        with ui.row().classes("items-center gap-2"):
+                            ui.icon("warning", size="22px").classes("text-violet-400")
+                            ui.label(f"Provision host '{host_name}'?").classes(
+                                "text-base font-bold text-slate-100"
+                            )
+                        ui.label(
+                            "This runs Terraform to bring the host into existence, then "
+                            "the Ansible compliance bootstrap and host rollout. Real "
+                            "infrastructure will be created or changed."
+                        ).classes("text-xs text-slate-400 max-w-md")
+                        with ui.row().classes("w-full justify-end gap-2 mt-1"):
+                            ui.button("Cancel", on_click=provision_dialog.close).props(
+                                "flat rounded size=sm color=zinc"
+                            )
+                            ui.button(
+                                "Provision", icon="rocket_launch", color="violet",
+                                on_click=lambda hn=host_name, d=provision_dialog: [
+                                    _emit({
+                                        "pipeline_type": "host_provision",
+                                        "host_name": hn,
+                                        "approve": True,
+                                        "manual": True,
+                                        "trigger": "ui_host_provision",
+                                    }),
+                                    d.close(),
+                                    ui.notify(f"Host provisioning queued for '{hn}'.", type="positive"),
+                                ],
+                            ).props("unelevated rounded size=sm")
+
+                btn = ui.button("Provision", icon="rocket_launch").props(
                     "unelevated rounded size=sm color=violet"
-                ).classes("opacity-60").tooltip("Coming soon — Terraform stage not yet enabled").set_enabled(False)
+                )
+                if managed:
+                    btn.on_click(provision_dialog.open)
+                    btn.tooltip(f"Provision {h['host']} (Terraform + Ansible bootstrap)")
+                    btn.bind_enabled_from(state, "is_running", backward=lambda x: not x)
+                else:
+                    btn.classes("opacity-60").tooltip(
+                        "Add a terraform: block to this host to enable provisioning"
+                    ).set_enabled(False)
 
     _panel()
     return _panel.refresh

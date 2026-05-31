@@ -82,7 +82,71 @@ def render_settings_ui(ctx, service):
                 ui.label(
                     'Used by /api/iac/deploy/test-host/{host}; blocks rollout to non-allowlisted hosts.'
                 ).classes('text-xs text-slate-400')
-                with ui.row().classes('w-full justify-end mt-2'):
+
+                def _allowlisted_hosts() -> list:
+                    raw = current_config.get('test_deploy_allowed_hosts') or ''
+                    if isinstance(raw, (list, tuple)):
+                        items = list(raw)
+                    else:
+                        items = str(raw).replace('\n', ',').split(',')
+                    return [h.strip() for h in items if h.strip()]
+
+                with ui.dialog() as test_deploy_dialog, ui.card().classes(
+                    f'{UIStyles.MODAL_CONTAINER} !bg-zinc-900 border border-violet-500/40'
+                ):
+                    with ui.column().classes('gap-3 p-2'):
+                        with ui.row().classes('items-center gap-2'):
+                            ui.icon('warning', size='22px').classes('text-violet-400')
+                            ui.label('Run test deploy?').classes('text-base font-bold text-slate-100')
+                        dialog_body = ui.label('').classes('text-xs text-slate-400 max-w-md')
+                        with ui.row().classes('w-full justify-end gap-2 mt-1'):
+                            ui.button('Cancel', on_click=test_deploy_dialog.close).props(
+                                'flat rounded size=sm color=zinc'
+                            )
+
+                            def _run_test_deploy():
+                                hosts = _allowlisted_hosts()
+                                for hn in hosts:
+                                    ctx.emit('iac:webhook_verified', {
+                                        'pipeline_type': 'host_provision',
+                                        'host_name': hn,
+                                        'approve': True,
+                                        'manual': True,
+                                        'trigger': 'ui_settings_test_deploy',
+                                    })
+                                test_deploy_dialog.close()
+                                ui.notify(
+                                    f"Test deploy queued for: {', '.join(hosts)}",
+                                    type='positive',
+                                )
+
+                            ui.button(
+                                'Run Test Deploy', icon='rocket_launch', color='violet',
+                                on_click=_run_test_deploy,
+                            ).props('unelevated rounded size=sm')
+
+                def _open_test_deploy():
+                    hosts = _allowlisted_hosts()
+                    if not hosts:
+                        ui.notify(
+                            'No allowed test hosts configured. Add one above and save first.',
+                            type='warning',
+                        )
+                        return
+                    dialog_body.set_text(
+                        'This provisions and bootstraps the allowlisted test host(s) '
+                        f"({', '.join(hosts)}) with Terraform + Ansible. Real infrastructure "
+                        'will be created or changed.'
+                    )
+                    test_deploy_dialog.open()
+
+                with ui.row().classes('w-full justify-end mt-2 gap-2'):
+                    ui.button(
+                        'Run Test Deploy', on_click=_open_test_deploy,
+                        icon='rocket_launch', color='violet',
+                    ).props('outline rounded size=sm').tooltip(
+                        'Provision the allowlisted test host(s) (Terraform + Ansible bootstrap)'
+                    )
                     ui.button('Save Pipeline Settings', on_click=save_settings, icon='save', color='primary').props('unelevated rounded size=sm')
 
         # --- [SECTION 2: REPOSITORY ROLES] ---
