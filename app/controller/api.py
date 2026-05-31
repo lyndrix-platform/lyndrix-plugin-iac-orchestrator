@@ -409,6 +409,66 @@ async def gitlab_test_host_webhook(
 
     return await trigger_test_host_deployment(host_name, payload)
 
+
+@iac_api_router.post("/bootstrap/{host_name}")
+async def trigger_host_bootstrap(host_name: str, payload: TestHostDeployRequest):
+    """
+    Triggers a guarded compliance/bootstrap run (cd_compliance.yml) for exactly
+    one host, connecting as root with the Terraform-injected key
+    (Vault: iac_tf_ssh_private_key).
+
+    Safety constraints mirror the test-host deploy:
+    - host must be an exact hostname token (no Ansible patterns/wildcards),
+    - host must be listed in the test-deploy allowlist,
+    - host must exist in the generated inventory.
+    """
+    if not _ctx or not _engine:
+        raise HTTPException(status_code=500, detail="Orchestrator offline")
+
+    host = str(host_name or "").strip()
+    if not host or not _HOST_LIMIT_PATTERN.fullmatch(host):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid host_name: only exact host tokens [A-Za-z0-9._-] are allowed.",
+        )
+
+    allowed_hosts = _engine.config.test_deploy_allowed_hosts
+    if not allowed_hosts:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Host bootstrap is disabled. Configure "
+                "PLUGIN_IAC_ORCHESTRATOR_TEST_DEPLOY_ALLOWED_HOSTS or "
+                "Vault key iac_test_deploy_allowed_hosts."
+            ),
+        )
+    if host not in allowed_hosts:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Host '{host}' is not in the allowlist.",
+        )
+
+    known_hosts = _load_generated_inventory_hosts()
+    if host not in known_hosts:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Host '{host}' not found in generated inventory_state.",
+        )
+
+    event_payload = {
+        "pipeline_type": "bootstrap_compliance",
+        "host_name": host,
+        "manual": True,
+        "trigger": "manual_bootstrap",
+    }
+
+    _ctx.emit("iac:webhook_verified", event_payload)
+    return {
+        "status": "accepted",
+        "message": f"Compliance bootstrap queued for host '{host}'.",
+        "host_name": host,
+    }
+
 @iac_api_router.get("/jobs")
 async def list_orchestrator_jobs(limit: int = 20):
     """Returns a list of recent and active jobs."""

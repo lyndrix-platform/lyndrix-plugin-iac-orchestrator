@@ -8,13 +8,15 @@ from ..utils import StageResult
 log = get_logger("IaC:Engine:Ansible")
 
 class AnsiblePlaybookStage(BaseStage):
-    def __init__(self, playbook_path: str, inventory_path: str, limit: str = None, name_override: str = None, extra_vars: dict = None):
+    def __init__(self, playbook_path: str, inventory_path: str, limit: str = None, name_override: str = None, extra_vars: dict = None, ssh_key_secret: str = "ansible_ssh_key", remote_user: str = "ansible-agent"):
         self.display_name = name_override or f"Ansible: {playbook_path}"
         super().__init__(self.display_name)
         self.playbook_path = playbook_path
         self.inventory_path = inventory_path
         self.limit = limit
         self.extra_vars = extra_vars or {}
+        self.ssh_key_secret = ssh_key_secret
+        self.remote_user = remote_user
 
     async def run(self, engine, context: dict) -> StageResult:
         success, stats = await engine.execute_ansible_docker(
@@ -23,7 +25,9 @@ class AnsiblePlaybookStage(BaseStage):
             limit=self.limit,
             extra_vars=self.extra_vars,
             task_name=self.display_name,
-            job_id=context.get("job_id", 0)
+            job_id=context.get("job_id", 0),
+            ssh_key_secret=self.ssh_key_secret,
+            remote_user=self.remote_user,
         )
         msg = "Ansible execution completed." if success else "Ansible execution failed."
         return StageResult(success, msg, data=stats)

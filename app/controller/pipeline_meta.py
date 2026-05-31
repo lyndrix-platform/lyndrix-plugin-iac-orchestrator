@@ -72,6 +72,7 @@ _KNOWN_TYPES: Dict[str, PipelineTypeDef] = {
     # --- Configure (Ansible) ---
     "connectivity": PipelineTypeDef("Connectivity Check", PHASE_CONFIGURE, "lan", "sky"),
     "rollout":      PipelineTypeDef("Full Rollout", PHASE_CONFIGURE, "public", "sky"),
+    "bootstrap_compliance": PipelineTypeDef("Compliance Bootstrap", PHASE_CONFIGURE, "verified_user", "sky"),
     # --- Deploy (Services) ---
     "single_service": PipelineTypeDef("Service Deploy", PHASE_DEPLOY, "rocket", "emerald"),
 }

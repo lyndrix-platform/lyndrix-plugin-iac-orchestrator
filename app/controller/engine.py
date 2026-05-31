@@ -5,6 +5,7 @@ import os
 import importlib
 import logging
 import shutil
+import time
 import uuid
 import yaml
 from hashlib import sha256
@@ -55,6 +56,37 @@ class TerraformProvisionStage(BaseStage):
         )
         msg = "Terraform provisioning completed." if success else "Terraform provisioning failed."
         return StageResult(success, msg, data=data)
+
+class ComplianceBootstrapStage(BaseStage):
+    """Runs the baseline compliance playbook against a single freshly-provisioned
+    host, connecting as root with the Terraform-injected key (Vault:
+    ``iac_tf_ssh_private_key``) before the ansible-agent account exists."""
+
+    def __init__(self, host_name: str, wait_for_ssh: bool = True):
+        super().__init__(f"Compliance Bootstrap: {host_name or 'unknown-host'}")
+        self.host_name = str(host_name or "").strip().lower()
+        self.wait_for_ssh = wait_for_ssh
+
+    async def run(self, engine, context: dict) -> StageResult:
+        if not self.host_name:
+            return StageResult(False, "Missing host_name for compliance bootstrap.")
+        if not engine.ctx.get_secret("iac_tf_ssh_private_key"):
+            return StageResult(
+                False,
+                "Missing root SSH private key. Set 'Root SSH Private Key' in the "
+                "plugin Settings (Vault key iac_tf_ssh_private_key).",
+            )
+        if self.wait_for_ssh:
+            await engine._await_host_ssh(self.host_name)
+        inner = AnsiblePlaybookStage(
+            name_override=self.name,
+            playbook_path="playbooks/cd_playbooks/cd_compliance.yml",
+            inventory_path="global/ansible/inventory.yml",
+            limit=self.host_name,
+            ssh_key_secret="iac_tf_ssh_private_key",
+            remote_user="root",
+        )
+        return await inner.run(engine, context)
 
 class DynamicRuleExecutionStage:
     def __init__(self, pipeline_type: str):
@@ -402,7 +434,7 @@ class DeploymentEngine:
                         return
 
                     self._active_single_service_keys.add(single_key)
-            if pipeline_type == "terraform_provision":
+            if pipeline_type in ("terraform_provision", "bootstrap_compliance"):
                 host_name = str(
                     payload.get("host_name")
                     or payload.get("test_host")
@@ -410,21 +442,21 @@ class DeploymentEngine:
                     or ""
                 ).strip().lower()
                 if not host_name:
-                    log.warning("ENGINE: terraform_provision ignored (missing host_name).")
+                    log.warning(f"ENGINE: {pipeline_type} ignored (missing host_name).")
                     self.ctx.emit("system:notify", {
                         "title": "Pipeline Ignored",
-                        "message": "terraform_provision requires host_name.",
+                        "message": f"{pipeline_type} requires host_name.",
                         "type": "warning",
                         "toast": True,
                     })
                     return
                 payload["host_name"] = host_name
-                terraform_key = f"terraform_provision:{host_name}"
+                terraform_key = f"{pipeline_type}:{host_name}"
                 if terraform_key in self._active_terraform_host_keys:
-                    log.warning(f"ENGINE: Duplicate terraform_provision ignored for '{host_name}' (in-memory lock).")
+                    log.warning(f"ENGINE: Duplicate {pipeline_type} ignored for '{host_name}' (in-memory lock).")
                     self.ctx.emit("system:notify", {
                         "title": "Pipeline Ignored",
-                        "message": f"A terraform provision run for {host_name} is already being started.",
+                        "message": f"A {pipeline_type} run for {host_name} is already being started.",
                         "type": "warning",
                         "toast": True,
                     })
@@ -435,10 +467,10 @@ class DeploymentEngine:
                     if j.pipeline_type == terraform_key
                 ]
                 if active_tf_jobs:
-                    log.warning(f"ENGINE: Duplicate terraform_provision ignored for '{host_name}'.")
+                    log.warning(f"ENGINE: Duplicate {pipeline_type} ignored for '{host_name}'.")
                     self.ctx.emit("system:notify", {
                         "title": "Pipeline Ignored",
-                        "message": f"A terraform provision run for {host_name} is already running.",
+                        "message": f"A {pipeline_type} run for {host_name} is already running.",
                         "type": "warning",
                         "toast": True,
                     })
@@ -455,6 +487,8 @@ class DeploymentEngine:
             db_type = f"single_service:{payload.get('service_name')}"
         elif pipeline_type == "terraform_provision":
             db_type = f"terraform_provision:{payload.get('host_name')}"
+        elif pipeline_type == "bootstrap_compliance":
+            db_type = f"bootstrap_compliance:{payload.get('host_name')}"
             
         current_job_id = self.db.create_job(db_type)
         
@@ -503,8 +537,14 @@ class DeploymentEngine:
                 )
             ])
         elif pipeline_type == "terraform_provision":
+            pipeline.append(TerraformProvisionStage(host_name=payload.get("host_name")))
+            # Auto-chain the first compliance/bootstrap run (as root) unless opted out.
+            if not payload.get("skip_bootstrap"):
+                pipeline.append(ComplianceBootstrapStage(host_name=payload.get("host_name")))
+            pipeline.append(DynamicRuleExecutionStage(pipeline_type))
+        elif pipeline_type == "bootstrap_compliance":
             pipeline.extend([
-                TerraformProvisionStage(host_name=payload.get("host_name")),
+                ComplianceBootstrapStage(host_name=payload.get("host_name")),
                 DynamicRuleExecutionStage(pipeline_type),
             ])
         elif pipeline_type == "rollout":
@@ -840,6 +880,43 @@ class DeploymentEngine:
             if "active_tasks" in self.state and task_name in self.state["active_tasks"]:
                 self.state["active_tasks"][task_name]["status"] = "error"
             return False, {"successful_hosts": 0, "failed_hosts": 0}
+
+    def _resolve_host_ip(self, host_name: str) -> str | None:
+        """Best-effort lookup of a host's ansible_host (IP) from generated inventory."""
+        inv_path = self.base_git_dir / "inventory_state" / "global" / "ansible" / "inventory.yml"
+        try:
+            with open(inv_path, "r", encoding="utf-8") as fh:
+                data = yaml.safe_load(fh) or {}
+        except Exception:
+            return None
+        hosts = ((data.get("all") or {}).get("hosts") or {})
+        host_vars = hosts.get(host_name)
+        if isinstance(host_vars, dict):
+            ip = host_vars.get("ansible_host")
+            return str(ip).strip() if ip else None
+        return None
+
+    async def _await_host_ssh(self, host_name: str, timeout: float = 120.0):
+        """Poll TCP/22 on the host until reachable so a freshly-booted guest is
+        ready before the bootstrap playbook connects. Non-fatal on timeout."""
+        ip = self._resolve_host_ip(host_name)
+        if not ip:
+            log.info(f"No ansible_host for '{host_name}'; skipping SSH readiness wait.")
+            return
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                reader, writer = await asyncio.wait_for(asyncio.open_connection(ip, 22), timeout=5)
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+                log.info(f"Host '{host_name}' ({ip}:22) is reachable; proceeding with bootstrap.")
+                return
+            except Exception:
+                await asyncio.sleep(5)
+        log.warning(f"Timed out waiting for SSH on '{host_name}' ({ip}:22); proceeding anyway.")
 
     def _find_terraform_context_for_host(self, host_name: str) -> dict:
         inventory_root = self.base_git_dir / "inventory_state"
@@ -1243,7 +1320,7 @@ class DeploymentEngine:
             job_id=job_id,
         )
 
-    async def execute_ansible_docker(self, playbook_subpath: str, inventory_subpath: str, limit: str = None, extra_vars: dict = None, task_name: str = "global", job_id: int = 0):
+    async def execute_ansible_docker(self, playbook_subpath: str, inventory_subpath: str, limit: str = None, extra_vars: dict = None, task_name: str = "global", job_id: int = 0, ssh_key_secret: str = "ansible_ssh_key", remote_user: str = "ansible-agent"):
         key_path = None # Safe default so the 'finally' block doesn't crash on early exit
         
         if not shutil.which("docker"): return False, {"successful_hosts": 0, "failed_hosts": 0}
@@ -1260,8 +1337,10 @@ class DeploymentEngine:
             proc = await asyncio.create_subprocess_exec("docker", "login", reg_url, "-u", reg_user, "--password-stdin", stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
             await proc.communicate(input=reg_token.encode('utf-8'))
 
-        ssh_key = self.ctx.get_secret("ansible_ssh_key")
-        if not ssh_key: return False, {"successful_hosts": 0, "failed_hosts": 0}
+        ssh_key = self.ctx.get_secret(ssh_key_secret)
+        if not ssh_key:
+            log.error(f"Ansible run aborted: secret '{ssh_key_secret}' is not set in Vault.")
+            return False, {"successful_hosts": 0, "failed_hosts": 0}
 
         # Use services_dir for temporary key exchange because its volume mount is proven to be correctly mapped
         key_filename = f"ansible_id_rsa_{uuid.uuid4().hex[:8]}"
@@ -1295,7 +1374,7 @@ class DeploymentEngine:
                 "mkdir -p /root/.ssh && cp \"$1\" /root/.ssh/id_rsa && chmod 600 /root/.ssh/id_rsa && shift && exec \"$@\"", 
                 "--", f"/data/storage/services/.iac_keys/{key_filename}",
                 "ansible-playbook", "-i", f"/data/storage/git_repos/inventory_state/{inventory_subpath}", f"/data/storage/git_repos/config_engine/{playbook_subpath}",
-                "-u", "ansible-agent", "--diff" 
+                "-u", remote_user, "--diff" 
             ]
             if limit: cmd.extend(["--limit", limit])
             if extra_vars:

@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **First-boot compliance bootstrap (root)** — after a Terraform provision the orchestrator now auto-runs the baseline compliance playbook (`cd_compliance.yml`) against the new host, connecting **as root** with the Terraform-injected key before the `ansible-agent` account exists. Also exposed as a guarded standalone trigger `POST /api/iac/bootstrap/{host_name}` (same allowlist + inventory-existence guards as the test-host deploy). Auto-chain can be skipped per run with `skip_bootstrap: true`.
+- **Root SSH private key in Settings UI** — new "Root SSH Private Key (bootstrap / first compliance run)" field on the Terraform Provisioning Secrets card, stored in Vault as `iac_tf_ssh_private_key`. It is the private counterpart of the injected public key and is used only for the initial root bootstrap connection.
+- `execute_ansible_docker` / `AnsiblePlaybookStage` now accept `ssh_key_secret` and `remote_user`, so playbooks can run under different identities (e.g. root for bootstrap vs. ansible-agent for steady-state) without duplicating the runner logic.
+- A best-effort TCP/22 readiness wait before the bootstrap run so a freshly-booted guest is reachable before Ansible connects.
 - **Terraform guest credentials auto-sourced from `iac-controller` global vars** — the injected root public key (`ssh_key`) and `root_password` now resolve from `global_vars.vault_vars.root_pub_key` / `root_password` (the same values Ansible already uses), with multi-line/PuTTY-exported keys normalized into a single valid `authorized_keys` line.
 - **Terraform provisioning secrets in Settings UI** — optional "Terraform Provisioning Secrets" card to store the root SSH public key (`iac_tf_ssh_key`) and root password (`iac_tf_root_password`) in Vault as a fallback when not present in `terraform_vars`/`global_vars`.
 - **Overview statistics dashboard** — modern KPI row (total deployments, success rate, average duration, last deployment) plus a status breakdown and a recent-deployments feed at the top of the Overview tab. Auto-refreshes as jobs progress.
