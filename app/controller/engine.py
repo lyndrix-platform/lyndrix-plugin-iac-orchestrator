@@ -1024,6 +1024,7 @@ class DeploymentEngine:
         containers_created = 0  # Terraform: count freshly (re)created LXC containers
         log_file = self.config.get_log_path(job_id)
         ansible_progress = 50.0  # Base progress for Ansible phase
+        tf_already_running = False  # Proxmox "CT already running" is a non-fatal drift condition
         
         try:
             log_proc = await asyncio.create_subprocess_exec("docker", "logs", "-f", container_name, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
@@ -1061,9 +1062,19 @@ class DeploymentEngine:
                     if "proxmox_virtual_environment_container.ct[" in decoded and "Creation complete" in decoded:
                         containers_created += 1
 
+                    # Terraform state drift: container exists and is already running on Proxmox.
+                    # This is the desired end-state — treat it as a non-fatal warning, not a failure.
+                    if "already running" in decoded and "CT " in decoded:
+                        tf_already_running = True
+                        log.warning("[TF] Proxmox state drift detected (%s): container is already running. Treating as success.", task_name)
+                        with open(log_file, "a", encoding="utf-8") as f:
+                            f.write(f"[{task_name}] [WARNING] State drift: container already running — desired state achieved, continuing.\n")
+
             wait_proc = await asyncio.create_subprocess_exec("docker", "wait", container_name, stdout=asyncio.subprocess.PIPE)
             stdout, _ = await wait_proc.communicate()
-            success = int(stdout.decode().strip()) == 0
+            exit_code = int(stdout.decode().strip())
+            # Override failure if the only Terraform error was "already running" (desired state IS achieved)
+            success = exit_code == 0 or tf_already_running
             
             if "active_tasks" in self.state and task_name in self.state["active_tasks"]:
                 self.state["active_tasks"][task_name]["status"] = "success" if success else "failed"
