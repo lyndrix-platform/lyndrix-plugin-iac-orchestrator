@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+- **Legacy pre-`app/` root modules** — deleted the old flat-layout source files that were fully superseded by the `./app/` sub-package refactor (per the core Plugin Development Guide): `api.py`, `config.py`, `database.py`, `engine.py`, `models.py`, `ui_dashboard.py`, `ui_settings.py`. Their live counterparts are `app/controller/{api,config,engine}.py`, `app/model/{database,models}.py`, and `app/ui/{dashboard,settings}.py`. Also removed the never-wired `aac-client.py` (AWX/AAC `AACClient`, unreferenced) and a stray empty `lyndrix-core.code-workspace`. The root `utils.py` and `stages/` are retained — they are still imported by `app/controller/engine.py`.
+
 ### Added
 - **"Clear All Stats" button (Settings → Maintenance)** — new maintenance card in the plugin Settings UI with a confirmation dialog that wipes deployment job history (the data behind the Overview KPIs and recent-deployments feed) via the new `JobDatabase.clear_all_jobs()`. Currently RUNNING jobs are preserved so an active pipeline isn't disrupted.
 - **Complete-reinstall redeploy** — when Terraform actually (re)creates a host's LXC container, the provision chain now clears that host's entry from the persisted `last_known_good` state (`InvalidateHostStateStage`) before handing off to the host rollout. The standard per-host drift check then sees the host's services as missing and redeploys exactly them on that host. Ordinary idempotent re-runs (no container created) are unaffected and keep the normal "no drift → deploy nothing" short-circuit. This fixes a freshly wiped-and-reprovisioned host coming back up with **zero** services because the stale `last_known_good` still listed them.
