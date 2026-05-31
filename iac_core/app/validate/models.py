@@ -28,6 +28,11 @@ class TerraformConfig(BaseModel):
     gateway: Optional[str] = None
     nameserver: Optional[str] = None
 
+    # Allow all extra LXC container fields (cores, ram/memory, disk/disk_size,
+    # bridge, vlan, arch, swap, unprivileged, nesting, etc.) to pass through
+    # without being silently dropped.
+    model_config = {"extra": "allow"}
+
 class NetworkDefinition(BaseModel):
     name: str
     ip: Union[IPvAnyAddress, str] # Accepting str to allow CIDR notations if needed

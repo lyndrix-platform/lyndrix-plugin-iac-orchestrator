@@ -28,6 +28,13 @@ from .schema import (
 
 _log = logging.getLogger("IaC:Generator:TerraformGen")
 
+# Short-form aliases accepted in hosts.yml terraform blocks.
+# Keys are the alias names; values are the canonical schema field names.
+_FIELD_ALIASES: Dict[str, str] = {
+    "ram": "memory",
+    "disk": "disk_size",
+}
+
 
 def _truthy(value: Any) -> bool:
     """Tolerant boolean coercion (handles real bools and 'true'/'false' strings)."""
@@ -96,6 +103,13 @@ def build_container(name: str, host: Dict[str, Any], log: logging.Logger = _log)
     tf = host.get("terraform")
     if not isinstance(tf, dict):
         return {}
+
+    # Normalise short-form aliases (e.g. ram→memory, disk→disk_size).
+    # Build a copy so we never mutate the caller's data.
+    tf = dict(tf)
+    for alias, canonical in _FIELD_ALIASES.items():
+        if alias in tf and canonical not in tf:
+            tf[canonical] = tf.pop(alias)
 
     missing = [f for f in CONTAINER_REQUIRED if tf.get(f) in (None, "")]
     if missing:

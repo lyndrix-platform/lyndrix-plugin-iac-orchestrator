@@ -118,7 +118,17 @@ def main() -> None:
 
                 # 2. Validate
                 validated_data = validate_configuration(rendered_data)
-                
+
+                # Apply site-level terraform defaults into each host's terraform
+                # block before building the state. Host-explicit values always win
+                # (setdefault); this only fills in keys the host did not specify.
+                site_tf_defaults = (validated_data.get("site_vars") or {}).get("terraform") or {}
+                if site_tf_defaults:
+                    for host in (validated_data.get("hosts") or {}).values():
+                        if isinstance(host, dict) and isinstance(host.get("terraform"), dict):
+                            for key, val in site_tf_defaults.items():
+                                host["terraform"].setdefault(key, val)
+
                 # 3. Generate isolated states for this specific stage
                 isolated_dir = args.output_dir / site / stage
                 generate_ansible_state(validated_data, isolated_dir)
