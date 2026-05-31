@@ -83,7 +83,7 @@ def render_terraform_panel(ctx, service):
             c.section_header(
                 "Provisioning (Terraform)",
                 "Bring bare hosts into existence before Ansible configures them.",
-                icon="dns",
+                icon="dns", color="violet",
             )
             ui.button(icon="refresh", on_click=_panel.refresh).props("flat round color=zinc-500")
 
@@ -117,14 +117,22 @@ def render_terraform_panel(ctx, service):
 
         # Managed hosts
         if managed:
-            ui.label("Terraform-Managed Hosts").classes(UIStyles.TITLE_H3 + " mt-2")
+            with ui.row().classes("w-full items-center gap-3 mt-2"):
+                ui.element("div").classes(
+                    f"h-9 w-1 bg-gradient-to-b {c.accent_grad('violet')} shrink-0"
+                )
+                ui.label("Terraform-Managed Hosts").classes(UIStyles.TITLE_H3)
             with ui.grid(columns="repeat(auto-fill, minmax(320px, 1fr))").classes("w-full gap-4"):
                 for h in managed:
                     _host_card(h, managed=True)
 
         # Unmanaged hosts
         if unmanaged:
-            ui.label("Awaiting Terraform Definition").classes(UIStyles.TITLE_H3 + " mt-4")
+            with ui.row().classes("w-full items-center gap-3 mt-4"):
+                ui.element("div").classes(
+                    f"h-9 w-1 bg-gradient-to-b {c.accent_grad('amber')} shrink-0"
+                )
+                ui.label("Awaiting Terraform Definition").classes(UIStyles.TITLE_H3)
             with ui.grid(columns="repeat(auto-fill, minmax(320px, 1fr))").classes("w-full gap-4"):
                 for h in unmanaged:
                     _host_card(h, managed=False)
@@ -132,42 +140,41 @@ def render_terraform_panel(ctx, service):
     def _host_card(h, *, managed: bool):
         color = "violet" if managed else "zinc"
         text_c = c.accent_text(color)
-        with ui.card().classes(c.CARD):
-            with ui.column().classes("w-full p-4 gap-2"):
-                with ui.row().classes("w-full justify-between items-start no-wrap"):
-                    with ui.column().classes("gap-0 min-w-0"):
-                        ui.label(h["host"]).classes(
-                            "text-md font-bold text-slate-800 dark:text-zinc-100 truncate"
-                        ).tooltip(h["host"])
-                        ui.label(f"{h['site']} / {h['stage']}").classes(UIStyles.LABEL_MINI)
-                    ui.icon("dns" if managed else "cloud_off", size="20px").classes(text_c)
+        with c.tile(color, inner="w-full p-4 gap-2", card_extra="flex flex-col"):
+            with ui.row().classes("w-full justify-between items-start no-wrap"):
+                with ui.column().classes("gap-0 min-w-0"):
+                    ui.label(h["host"]).classes(
+                        "text-md font-bold text-slate-800 dark:text-zinc-100 truncate"
+                    ).tooltip(h["host"])
+                    ui.label(f"{h['site']} / {h['stage']}").classes(UIStyles.LABEL_MINI)
+                ui.icon("dns" if managed else "cloud_off", size="20px").classes(text_c)
 
-                ui.separator().classes("opacity-20")
+            ui.separator().classes("opacity-20")
 
-                for label, value, icon in (
-                    ("Address", h["ansible_host"], "lan"),
-                    ("Provider", h["provider"], "cloud"),
-                    ("Resource", h["resource"], "category"),
-                    ("Workspace", h["workspace"], "folder"),
-                ):
-                    with ui.row().classes("w-full items-center gap-2 no-wrap"):
-                        ui.icon(icon, size="13px").classes("text-slate-400 dark:text-zinc-600 shrink-0")
-                        ui.label(label).classes("text-[11px] text-slate-400 dark:text-zinc-500 w-20 shrink-0")
-                        ui.label(str(value)).classes(
-                            "text-[11px] font-mono text-slate-600 dark:text-zinc-300 truncate"
-                        )
+            for label, value, icon in (
+                ("Address", h["ansible_host"], "lan"),
+                ("Provider", h["provider"], "cloud"),
+                ("Resource", h["resource"], "category"),
+                ("Workspace", h["workspace"], "folder"),
+            ):
+                with ui.row().classes("w-full items-center gap-2 no-wrap"):
+                    ui.icon(icon, size="13px").classes("text-slate-400 dark:text-zinc-600 shrink-0")
+                    ui.label(label).classes("text-[11px] text-slate-400 dark:text-zinc-500 w-20 shrink-0")
+                    ui.label(str(value)).classes(
+                        "text-[11px] font-mono text-slate-600 dark:text-zinc-300 truncate"
+                    )
 
-                ui.separator().classes("mt-1 opacity-20")
-                with ui.row().classes("w-full justify-between items-center gap-2"):
-                    if managed:
-                        c.status_badge("UNKNOWN" if h["state"] == "unknown" else h["state"].upper())
-                    else:
-                        ui.label("No terraform block").classes(
-                            "text-[10px] italic text-slate-400 dark:text-zinc-500"
-                        )
-                    ui.button("Provision", icon="rocket_launch").props(
-                        "unelevated rounded size=sm color=violet"
-                    ).classes("opacity-60").tooltip("Coming soon — Terraform stage not yet enabled").set_enabled(False)
+            ui.separator().classes("mt-1 opacity-20")
+            with ui.row().classes("w-full justify-between items-center gap-2"):
+                if managed:
+                    c.status_badge("UNKNOWN" if h["state"] == "unknown" else h["state"].upper())
+                else:
+                    ui.label("No terraform block").classes(
+                        "text-[10px] italic text-slate-400 dark:text-zinc-500"
+                    )
+                ui.button("Provision", icon="rocket_launch").props(
+                    "unelevated rounded size=sm color=violet"
+                ).classes("opacity-60").tooltip("Coming soon — Terraform stage not yet enabled").set_enabled(False)
 
     _panel()
     return _panel.refresh

@@ -7,6 +7,7 @@ instead of hardcoding backgrounds, so light/dark mode is handled by the central
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
 from typing import Optional
 
 from nicegui import ui
@@ -15,6 +16,26 @@ from ui.theme import UIStyles
 
 # Themed card surface (respects light/dark via the `lyndrix-card` rule).
 CARD = UIStyles.CARD_BASE + " !p-0"
+
+
+@contextmanager
+def tile(color: str = "indigo", *, inner: str = "w-full p-4 gap-2",
+         card_extra: str = "", hover: bool = True, glass: bool = False):
+    """A themed tile matching the app design language (core dashboard / Assignments).
+
+    Sharp ``lyndrix-card`` surface with zeroed padding, a top accent gradient
+    stripe, and an inner content column — the same chrome every other tile in
+    the app uses. Yields inside the inner column so callers just add content.
+    """
+    grad = accent_grad(color)
+    base = UIStyles.CARD_GLASS if glass else UIStyles.CARD_BASE
+    hover_cls = " hover:border-indigo-500/50 transition-all" if hover else ""
+    with ui.card().classes(f"{base}{hover_cls} {card_extra}".strip()).style(
+        "padding: 0; flex-wrap: nowrap; min-width: 0"
+    ):
+        ui.element("div").classes(f"h-1 w-full bg-gradient-to-r {grad}")
+        with ui.column().classes(inner):
+            yield
 
 
 # Accent stems keyed by the colours pipeline_meta / stats emit.
@@ -50,18 +71,17 @@ def accent_grad(color: str) -> str:
 
 def kpi_card(label: str, value: str, *, icon: str, color: str = "indigo",
              sub: Optional[str] = None):
-    """A compact KPI tile: themed surface, accent icon, big value, optional sub."""
+    """A compact KPI tile: app card chrome, accent icon, big mono value, optional sub."""
     text_c = accent_text(color)
-    with ui.card().classes(CARD).style("min-width: 0"):
-        with ui.column().classes("w-full p-4 gap-1"):
-            with ui.row().classes("w-full items-center justify-between no-wrap"):
-                ui.label(label).classes(UIStyles.LABEL_MINI + " truncate")
-                ui.icon(icon, size="18px").classes(text_c)
-            ui.label(value).classes(
-                "text-3xl font-black leading-none text-slate-800 dark:text-zinc-100"
-            )
-            if sub:
-                ui.label(sub).classes("text-xs text-slate-500 dark:text-zinc-400 truncate")
+    with tile(color, inner="w-full p-4 gap-1", hover=False, card_extra="min-w-0"):
+        with ui.row().classes("w-full items-center justify-between no-wrap"):
+            ui.label(label).classes(UIStyles.LABEL_MINI + " truncate")
+            ui.icon(icon, size="18px").classes(text_c)
+        ui.label(value).classes(
+            f"text-3xl font-black font-mono leading-none {text_c}"
+        )
+        if sub:
+            ui.label(sub).classes("text-xs text-slate-500 dark:text-zinc-400 truncate")
 
 
 def status_badge(status: str):
@@ -97,10 +117,18 @@ def progress_bar(percent: float, color: str = "indigo"):
         ).style(f"width: {pct}%")
 
 
-def section_header(title: str, subtitle: str = "", icon: Optional[str] = None):
+def section_header(title: str, subtitle: str = "", icon: Optional[str] = None,
+                   color: str = "indigo"):
+    """Section header in the app style: a vertical accent gradient bar + title.
+
+    Mirrors the core dashboard stack headers (``h-* w-1 bg-gradient-to-b``),
+    keeping an optional accent icon for context.
+    """
+    grad = accent_grad(color)
     with ui.row().classes("w-full items-center gap-3"):
+        ui.element("div").classes(f"h-9 w-1 bg-gradient-to-b {grad} shrink-0")
         if icon:
-            ui.icon(icon, size="20px").classes(UIStyles.ICON_MUTED)
+            ui.icon(icon, size="20px").classes(accent_text(color))
         with ui.column().classes("gap-0"):
             ui.label(title).classes(UIStyles.TITLE_H3)
             if subtitle:
