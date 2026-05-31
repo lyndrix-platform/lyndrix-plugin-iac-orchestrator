@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Terraform guest credentials auto-sourced from `iac-controller` global vars** — the injected root public key (`ssh_key`) and `root_password` now resolve from `global_vars.vault_vars.root_pub_key` / `root_password` (the same values Ansible already uses), with multi-line/PuTTY-exported keys normalized into a single valid `authorized_keys` line.
+- **Terraform provisioning secrets in Settings UI** — optional "Terraform Provisioning Secrets" card to store the root SSH public key (`iac_tf_ssh_key`) and root password (`iac_tf_root_password`) in Vault as a fallback when not present in `terraform_vars`/`global_vars`.
 - **Overview statistics dashboard** — modern KPI row (total deployments, success rate, average duration, last deployment) plus a status breakdown and a recent-deployments feed at the top of the Overview tab. Auto-refreshes as jobs progress.
 - **Host Lifecycle pipeline** visualization (Provision → Configure → Deploy) with per-phase health, so Terraform runs surface automatically once they exist.
 - **Provision (Terraform) tab** — a modular, display-only readiness panel that scans site/host YAML for `terraform:` blocks and lists Terraform-managed vs. unmanaged hosts. Provision actions are present but disabled (clearly marked "coming soon") pending the engine stage.
@@ -34,8 +36,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `iac_core/tests/test_terraform_gen.py` — unit coverage for the mapper and the destroy-safety guard.
 - **Guarded test-host deploy API** — new `POST /api/iac/deploy/test-host/{host_name}` trigger and
   GitLab-token webhook variant `POST /api/iac/webhook/gitlab/test-host/{host_name}`. Both start a
-  rollout constrained to exactly one host (`limit=<host>`) and optionally a provided
-  `target_services` subset. They refuse wildcard/pattern limits and only allow hosts explicitly
+  `terraform_provision` run constrained to exactly one host (`host_name=<host>`). They refuse
+  wildcard/pattern limits and only allow hosts explicitly
   listed in `PLUGIN_IAC_ORCHESTRATOR_TEST_DEPLOY_ALLOWED_HOSTS` (or Vault key
   `iac_test_deploy_allowed_hosts`), then validate that the host exists in generated inventory.
 - **Pipeline settings UI** now includes `Test Deploy Allowed Hosts (comma-separated)` to manage the
@@ -47,6 +49,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `iac_core/app/gen/terraform_gen.py` — now a backwards-compatible shim re-exporting the new package.
 - Rollout dispatch now accepts an optional `target_services` payload key and passes it into
   `AsyncBulkRolloutStage`, allowing safe single-host smoke tests without forcing full catalog rollout.
+- `terraform_provision` is now executable in the engine via a spawned Docker runner (same model as
+  Ansible): syncs `infra_engine`, renders a per-host Terraform root from generated tfvars
+  (`render_environment.py`), then runs `init/plan` and (when auto-apply is enabled) `apply` with
+  strict `-target` to the selected host resource.
 
 ## [0.3.0] - 2026-05-26
 

@@ -50,6 +50,22 @@ class IaCConfig:
     def ansible_docker_image(self) -> str: return self._get("PLUGIN_IAC_ORCHESTRATOR_ANSIBLE_IMAGE", "ansible_docker_image", "registry.gitlab.int.fam-feser.de/aac-application-definitions/aac-template-engine:latest")
 
     @property
+    def terraform_docker_image(self) -> str:
+        return self._get(
+            "PLUGIN_IAC_ORCHESTRATOR_TERRAFORM_IMAGE",
+            "iac_terraform_docker_image",
+            "ghcr.io/opentofu/opentofu:latest",
+        )
+
+    @property
+    def terraform_binary(self) -> str:
+        return self._get(
+            "PLUGIN_IAC_ORCHESTRATOR_TERRAFORM_BINARY",
+            "iac_terraform_binary",
+            "tofu",
+        )
+
+    @property
     def auto_apply(self) -> bool: return str(self._get("PLUGIN_IAC_ORCHESTRATOR_AUTO_APPLY", "iac_auto_apply", "false")).lower() == "true"
 
     @property

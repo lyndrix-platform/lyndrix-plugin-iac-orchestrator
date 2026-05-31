@@ -150,6 +150,31 @@ def render_settings_ui(ctx, service):
                 with ui.row().classes('w-full justify-end mt-2'):
                     ui.button('Save Ansible Config', on_click=lambda: save_ansible_config(img_input.value, key_input.value, reg_url_input.value, reg_user_input.value, reg_token_input.value), icon='terminal', color='indigo').props('unelevated rounded size=sm')
 
+        # --- [SECTION 3b: TERRAFORM PROVISIONING SECRETS] ---
+        with ui.card().classes(f'{UIStyles.CARD_GLASS} w-full').style('padding: 0; flex-wrap: nowrap'):
+            ui.element('div').classes('h-1 w-full bg-gradient-to-r from-purple-400 via-fuchsia-400 to-violet-500')
+            with ui.column().classes('w-full flex-grow p-5 gap-3'):
+                with ui.row().classes('items-center gap-2 mb-1'):
+                    ui.icon('dns', size='18px').classes('text-purple-400')
+                    ui.label('Terraform Provisioning Secrets').classes('text-sm font-bold uppercase tracking-widest text-slate-300')
+                ui.label('Sensitive root credentials injected into provisioned hosts. Stored in Vault, never in the repo.').classes(UIStyles.TEXT_MUTED)
+
+                tf_key_exists = bool(ctx.get_secret("iac_tf_ssh_key"))
+                tf_key_input = ui.textarea('Root SSH Public Key (injected into new hosts)', value="********************************\n(Key is set. Overwrite to change)" if tf_key_exists else "").props('outlined dense').classes('w-full')
+
+                tf_root_pw_exists = bool(ctx.get_secret("iac_tf_root_password"))
+                tf_root_pw_input = ui.input('Root Password (new host)', password=True, value="********" if tf_root_pw_exists else "").props('outlined dense').classes('w-full')
+
+                ui.label('These take precedence only when not set in terraform_vars; keeping them here keeps the repo free of private credentials.').classes('text-xs text-slate-400')
+
+                def save_terraform_secrets(ssh_key, root_pw):
+                    if ssh_key and "********" not in ssh_key: ctx.set_secret("iac_tf_ssh_key", ssh_key.strip())
+                    if root_pw and "********" not in root_pw: ctx.set_secret("iac_tf_root_password", root_pw.strip())
+                    ui.notify("Terraform provisioning secrets saved to Vault.", type="positive")
+
+                with ui.row().classes('w-full justify-end mt-2'):
+                    ui.button('Save Terraform Secrets', on_click=lambda: save_terraform_secrets(tf_key_input.value, tf_root_pw_input.value), icon='dns', color='purple').props('unelevated rounded size=sm')
+
         # --- [SECTION 4: SECURITY CONFIG] ---
         with ui.card().classes(f'{UIStyles.CARD_GLASS} w-full').style('padding: 0; flex-wrap: nowrap'):
             ui.element('div').classes('h-1 w-full bg-gradient-to-r from-rose-400 via-pink-400 to-red-400')

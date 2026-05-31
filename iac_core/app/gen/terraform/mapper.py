@@ -74,10 +74,15 @@ def build_providers(config: Dict[str, Any], log: logging.Logger = _log) -> Dict[
             if tf.get(field) is not None:
                 entry[field] = tf[field]
         # Endpoint defaults to the node's management address when not explicit.
+        # bpg/proxmox requires a full URL (https://HOST:8006).
         if "endpoint" not in entry:
             addr = tf.get("endpoint") or details.get("ansible_host") or details.get("ip")
             if addr:
                 entry["endpoint"] = addr
+        if "endpoint" in entry:
+            ep = entry["endpoint"]
+            if ep and not ep.startswith("http"):
+                entry["endpoint"] = f"https://{ep}:8006"
         entry["node_name"] = name
         providers[name] = entry
     return providers

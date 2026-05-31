@@ -40,6 +40,22 @@ class NativeGenerateStage:
         except Exception as e:
             return StageResult(False, f"Native generation failed: {e}")
 
+
+class TerraformProvisionStage(BaseStage):
+    def __init__(self, host_name: str):
+        super().__init__(f"Terraform Provision: {host_name or 'unknown-host'}")
+        self.host_name = str(host_name or "").strip()
+
+    async def run(self, engine, context: dict) -> StageResult:
+        if not self.host_name:
+            return StageResult(False, "Missing host_name for terraform_provision pipeline.")
+        success, data = await engine.execute_terraform_provision(
+            host_name=self.host_name,
+            job_id=context.get("job_id", 0),
+        )
+        msg = "Terraform provisioning completed." if success else "Terraform provisioning failed."
+        return StageResult(success, msg, data=data)
+
 class DynamicRuleExecutionStage:
     def __init__(self, pipeline_type: str):
         self.name = f"Dynamic Rules: {pipeline_type}"
@@ -166,6 +182,7 @@ class DeploymentEngine:
         self.pending_syncs = {}
         self._pipeline_dispatch_lock = asyncio.Lock()
         self._active_single_service_keys: set[str] = set()
+        self._active_terraform_host_keys: set[str] = set()
         ctx.subscribe("git:status_update")(self._on_git_status)
 
     def get_default_ansible_stages(self, pipeline_type: str = "connectivity"):
@@ -346,6 +363,7 @@ class DeploymentEngine:
 
         pipeline_type = payload.get("pipeline_type", "connectivity")
         single_key = None
+        terraform_key = None
 
         # Prevent concurrent bulk rollouts and duplicate single_service runs for the same service.
         async with self._pipeline_dispatch_lock:
@@ -384,6 +402,48 @@ class DeploymentEngine:
                         return
 
                     self._active_single_service_keys.add(single_key)
+            if pipeline_type == "terraform_provision":
+                host_name = str(
+                    payload.get("host_name")
+                    or payload.get("test_host")
+                    or payload.get("limit")
+                    or ""
+                ).strip().lower()
+                if not host_name:
+                    log.warning("ENGINE: terraform_provision ignored (missing host_name).")
+                    self.ctx.emit("system:notify", {
+                        "title": "Pipeline Ignored",
+                        "message": "terraform_provision requires host_name.",
+                        "type": "warning",
+                        "toast": True,
+                    })
+                    return
+                payload["host_name"] = host_name
+                terraform_key = f"terraform_provision:{host_name}"
+                if terraform_key in self._active_terraform_host_keys:
+                    log.warning(f"ENGINE: Duplicate terraform_provision ignored for '{host_name}' (in-memory lock).")
+                    self.ctx.emit("system:notify", {
+                        "title": "Pipeline Ignored",
+                        "message": f"A terraform provision run for {host_name} is already being started.",
+                        "type": "warning",
+                        "toast": True,
+                    })
+                    return
+
+                active_tf_jobs = [
+                    j for j in self.db.get_jobs_by_status("RUNNING")
+                    if j.pipeline_type == terraform_key
+                ]
+                if active_tf_jobs:
+                    log.warning(f"ENGINE: Duplicate terraform_provision ignored for '{host_name}'.")
+                    self.ctx.emit("system:notify", {
+                        "title": "Pipeline Ignored",
+                        "message": f"A terraform provision run for {host_name} is already running.",
+                        "type": "warning",
+                        "toast": True,
+                    })
+                    return
+                self._active_terraform_host_keys.add(terraform_key)
                 
         # Safely increment running job counter
         self.state["running_jobs"] = self.state.get("running_jobs", 0) + 1
@@ -393,6 +453,8 @@ class DeploymentEngine:
         db_type = pipeline_type
         if pipeline_type == "single_service":
             db_type = f"single_service:{payload.get('service_name')}"
+        elif pipeline_type == "terraform_provision":
+            db_type = f"terraform_provision:{payload.get('host_name')}"
             
         current_job_id = self.db.create_job(db_type)
         
@@ -413,10 +475,14 @@ class DeploymentEngine:
             SyncRepoStage("inventory_state"),
             SyncRepoStage("config_engine"),
             SyncRepoStage("aac_factory"),
+        ]
+        if pipeline_type == "terraform_provision":
+            pipeline.append(SyncRepoStage("infra_engine"))
+        pipeline.extend([
             # Refresh inventory_state right before generation to minimize staleness windows.
             SyncRepoStage("inventory_state"),
             NativeGenerateStage(),
-        ]
+        ])
 
         # For single_service runs we do not persist generated inventory back to inventory_state.
         # This avoids unnecessary commit/push contention and keeps service deploys focused.
@@ -435,6 +501,11 @@ class DeploymentEngine:
                     limit=target_group, 
                     extra_vars={"SERVICE_BRANCH": svc_branch, "target_service": svc_name, "target_group": target_group, "LOCAL_SERVICES_DIR": str(self.config.services_dir)}
                 )
+            ])
+        elif pipeline_type == "terraform_provision":
+            pipeline.extend([
+                TerraformProvisionStage(host_name=payload.get("host_name")),
+                DynamicRuleExecutionStage(pipeline_type),
             ])
         elif pipeline_type == "rollout":
             target_services = payload.get("target_services")
@@ -497,6 +568,9 @@ class DeploymentEngine:
             if single_key:
                 async with self._pipeline_dispatch_lock:
                     self._active_single_service_keys.discard(single_key)
+            if terraform_key:
+                async with self._pipeline_dispatch_lock:
+                    self._active_terraform_host_keys.discard(terraform_key)
 
     async def resume_bulk_rollout(self, job_id: int, pending_services: list[str]):
         if not pending_services: return
@@ -766,6 +840,408 @@ class DeploymentEngine:
             if "active_tasks" in self.state and task_name in self.state["active_tasks"]:
                 self.state["active_tasks"][task_name]["status"] = "error"
             return False, {"successful_hosts": 0, "failed_hosts": 0}
+
+    def _find_terraform_context_for_host(self, host_name: str) -> dict:
+        inventory_root = self.base_git_dir / "inventory_state"
+        matches: list[dict] = []
+        for tfvars_path in inventory_root.rglob("terraform/terraform.tfvars.json"):
+            try:
+                with open(tfvars_path, "r", encoding="utf-8") as fh:
+                    data = json.load(fh) or {}
+            except Exception:
+                continue
+            containers = data.get("containers") or {}
+            host_cfg = containers.get(host_name)
+            if not isinstance(host_cfg, dict):
+                continue
+
+            rel = tfvars_path.relative_to(inventory_root)
+            parts = rel.parts
+            if len(parts) < 4:
+                continue
+            site, stage = parts[0], parts[1]
+            env_name = f"{site}_{stage}"
+            node_name = str(host_cfg.get("node_name") or "").strip()
+            if not node_name:
+                continue
+            matches.append(
+                {
+                    "tfvars_path": tfvars_path,
+                    "site": site,
+                    "stage": stage,
+                    "env_name": env_name,
+                    "node_name": node_name,
+                }
+            )
+
+        if not matches:
+            raise RuntimeError(f"No terraform.tfvars.json contains host '{host_name}'.")
+        if len(matches) > 1:
+            locations = ", ".join(f"{m['site']}/{m['stage']}" for m in matches)
+            raise RuntimeError(f"Host '{host_name}' is ambiguous across environments: {locations}.")
+        return matches[0]
+
+    def _read_yaml_dict(self, path: Path, root_key: str) -> dict:
+        if not path.exists():
+            return {}
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = yaml.safe_load(fh) or {}
+            value = data.get(root_key)
+            return value if isinstance(value, dict) else {}
+        except (OSError, yaml.YAMLError) as exc:
+            logger.warning("Failed reading YAML config %s: %s", path, exc)
+            return {}
+
+    @staticmethod
+    def _deep_get(data: dict, path: str):
+        cur = data
+        for part in path.split("."):
+            if not isinstance(cur, dict):
+                return None
+            cur = cur.get(part)
+        return cur
+
+    @staticmethod
+    def _first_non_empty(*values):
+        for val in values:
+            if val is None:
+                continue
+            text = str(val).strip()
+            if text:
+                return text
+        return None
+
+    @staticmethod
+    def _normalize_ssh_public_key(value):
+        """Collapse multi-line / PuTTY-exported public keys into a single
+        valid authorized_keys line (`<type> <base64> [comment]`)."""
+        if value is None:
+            return None
+        collapsed = " ".join(str(value).split())
+        return collapsed or None
+
+    def _build_repo_terraform_inputs(self, tf_context: dict) -> dict:
+        site = str(tf_context.get("site") or "").strip()
+        stage = str(tf_context.get("stage") or "").strip()
+        node_name = str(tf_context.get("node_name") or "").strip()
+        iac_root = self.base_git_dir / "iac_controller" / "environments"
+
+        global_vars = self._read_yaml_dict(iac_root / "global" / "01_global_vars.yml", "global_vars")
+        site_vars = self._read_yaml_dict(iac_root / "sites" / site / "site_vars.yml", "site_vars")
+        stage_vars = self._read_yaml_dict(iac_root / "sites" / site / "stages" / stage / "stage_vars.yml", "stage_vars")
+        hardware_hosts = self._read_yaml_dict(iac_root / "sites" / site / "hardware.yml", "hardware_hosts")
+
+        tf_repo_vars: dict = {}
+        for src in (global_vars, site_vars, stage_vars):
+            for key in ("terraform_vars", "terraform"):
+                val = src.get(key)
+                if isinstance(val, dict):
+                    tf_repo_vars.update(val)
+
+        vault_vars = global_vars.get("vault_vars") if isinstance(global_vars.get("vault_vars"), dict) else {}
+        node_tf = {}
+        node_cfg = hardware_hosts.get(node_name)
+        if isinstance(node_cfg, dict):
+            tf_block = node_cfg.get("terraform")
+            if isinstance(tf_block, dict):
+                node_tf = tf_block
+
+        node_username = self._first_non_empty(node_tf.get("username"))
+        node_realm = self._first_non_empty(node_tf.get("realm"))
+        node_full_user = (
+            f"{node_username}@{node_realm}"
+            if node_username and node_realm and "@" not in node_username
+            else node_username
+        )
+
+        repo_backend = tf_repo_vars.get("backend") if isinstance(tf_repo_vars.get("backend"), dict) else {}
+        repo_download = tf_repo_vars.get("download") if isinstance(tf_repo_vars.get("download"), dict) else {}
+        repo_proxmox = tf_repo_vars.get("proxmox") if isinstance(tf_repo_vars.get("proxmox"), dict) else {}
+
+        return {
+            "proxmox_username": self._first_non_empty(
+                tf_repo_vars.get("proxmox_username"),
+                repo_proxmox.get("username"),
+                node_full_user,
+            ),
+            "proxmox_password": self._first_non_empty(
+                tf_repo_vars.get("proxmox_password"),
+                repo_proxmox.get("password"),
+                node_tf.get("password"),
+            ),
+            "ssh_key": self._normalize_ssh_public_key(self._first_non_empty(
+                tf_repo_vars.get("ssh_key"),
+                tf_repo_vars.get("public_ssh_key"),
+                tf_repo_vars.get("root_pub_key"),
+                tf_repo_vars.get("ansible_agent_pub_key"),
+                vault_vars.get("root_pub_key"),
+                vault_vars.get("ansible_agent_pub_key"),
+            )),
+            "root_password": self._first_non_empty(
+                tf_repo_vars.get("root_password"),
+                vault_vars.get("root_password"),
+            ),
+            "backend": {
+                "endpoint": self._first_non_empty(
+                    repo_backend.get("endpoint"),
+                    tf_repo_vars.get("backend_endpoint"),
+                ),
+                "bucket": self._first_non_empty(
+                    repo_backend.get("bucket"),
+                    tf_repo_vars.get("backend_bucket"),
+                ),
+                "region": self._first_non_empty(
+                    repo_backend.get("region"),
+                    tf_repo_vars.get("backend_region"),
+                ),
+                "access_key": self._first_non_empty(
+                    repo_backend.get("access_key"),
+                    tf_repo_vars.get("backend_access_key"),
+                ),
+                "secret_key": self._first_non_empty(
+                    repo_backend.get("secret_key"),
+                    tf_repo_vars.get("backend_secret_key"),
+                ),
+            },
+            "download": {
+                "datastore_id": self._first_non_empty(
+                    repo_download.get("datastore_id"),
+                    tf_repo_vars.get("download_datastore_id"),
+                ),
+                "url": self._first_non_empty(
+                    repo_download.get("url"),
+                    tf_repo_vars.get("download_url"),
+                ),
+                "checksum": self._first_non_empty(
+                    repo_download.get("checksum"),
+                    tf_repo_vars.get("download_checksum"),
+                ),
+            },
+        }
+
+    def _build_terraform_secrets_payload(self, tf_context: dict) -> tuple[dict, list[str]]:
+        missing: list[str] = []
+        repo = self._build_repo_terraform_inputs(tf_context)
+
+        def _required(repo_value, secret_key: str, missing_label: str) -> str:
+            val = self._first_non_empty(repo_value, self.ctx.get_secret(secret_key))
+            if val is None:
+                missing.append(missing_label)
+                return ""
+            return val
+
+        payload = {
+            "proxmox_username": _required(
+                repo.get("proxmox_username"),
+                "iac_tf_proxmox_username",
+                "terraform_vars.proxmox_username (or hardware terraform username/realm)",
+            ),
+            "proxmox_password": _required(
+                repo.get("proxmox_password"),
+                "iac_tf_proxmox_password",
+                "terraform_vars.proxmox_password (or hardware terraform password)",
+            ),
+            "ssh_key": _required(
+                repo.get("ssh_key"),
+                "iac_tf_ssh_key",
+                "terraform_vars.ssh_key (or global_vars.vault_vars.root_pub_key)",
+            ),
+            "root_password": _required(
+                repo.get("root_password"),
+                "iac_tf_root_password",
+                "terraform_vars.root_password (or global_vars.vault_vars.root_password)",
+            ),
+            "backend": {
+                "endpoint": self._first_non_empty(
+                    self._deep_get(repo, "backend.endpoint"),
+                    self.ctx.get_secret("iac_tf_backend_endpoint"),
+                    "http://10.100.1.5:9000",
+                ),
+                "bucket": self._first_non_empty(
+                    self._deep_get(repo, "backend.bucket"),
+                    self.ctx.get_secret("iac_tf_backend_bucket"),
+                    "tfstate",
+                ),
+                "region": self._first_non_empty(
+                    self._deep_get(repo, "backend.region"),
+                    self.ctx.get_secret("iac_tf_backend_region"),
+                    "us-east-1",
+                ),
+                "access_key": self._first_non_empty(
+                    self._deep_get(repo, "backend.access_key"),
+                    self.ctx.get_secret("iac_tf_backend_access_key"),
+                    "terraform",
+                ),
+                "secret_key": _required(
+                    self._deep_get(repo, "backend.secret_key"),
+                    "iac_tf_backend_secret_key",
+                    "terraform_vars.backend.secret_key",
+                ),
+            },
+            "download": {
+                "datastore_id": self._first_non_empty(
+                    self._deep_get(repo, "download.datastore_id"),
+                    self.ctx.get_secret("iac_tf_download_datastore_id"),
+                    "local",
+                ),
+                "url": _required(
+                    self._deep_get(repo, "download.url"),
+                    "iac_tf_download_url",
+                    "terraform_vars.download.url",
+                ),
+                "checksum": _required(
+                    self._deep_get(repo, "download.checksum"),
+                    "iac_tf_download_checksum",
+                    "terraform_vars.download.checksum",
+                ),
+            },
+        }
+        return payload, missing
+
+    async def execute_terraform_docker(
+        self,
+        *,
+        run_rel_dir: str,
+        host_name: str,
+        node_name: str,
+        task_name: str,
+        job_id: int,
+    ) -> tuple[bool, dict]:
+        if not shutil.which("docker"):
+            return False, {"successful_hosts": 0, "failed_hosts": 1}
+
+        if "active_tasks" not in self.state:
+            self.state["active_tasks"] = {}
+        self.state["active_tasks"][task_name] = {
+            "status": "pulling_image",
+            "logs": [],
+            "job_id": job_id,
+        }
+
+        safe_task_name = "".join(c if c.isalnum() or c in ".-_" else "-" for c in task_name).strip("-")
+        c_name = f"iac-tf-{safe_task_name}"[:62]
+        await asyncio.create_subprocess_exec(
+            "docker", "rm", "-f", c_name,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+        tf_bin = str(self.config.terraform_binary or "tofu").strip()
+        target_tpl = f'module.download.proxmox_virtual_environment_download_file.tpl["{node_name}"]'
+        target_ct = f'module.lxc_{node_name}.proxmox_virtual_environment_container.ct["{host_name}"]'
+        run_dir = f"/data/storage/git_repos/{run_rel_dir}"
+        plan_cmd = (
+            f"{tf_bin} plan -input=false -no-color -out=tfplan "
+            f"-target='{target_tpl}' -target='{target_ct}'"
+        )
+        apply_cmd = (
+            f"{tf_bin} apply -input=false -no-color -auto-approve tfplan"
+            if self.config.auto_apply
+            else f"{tf_bin} show -no-color tfplan"
+        )
+        shell_cmd = (
+            "set -euo pipefail; "
+            f"cd '{run_dir}'; "
+            f"{tf_bin} init -input=false -no-color; "
+            f"{plan_cmd}; "
+            f"{apply_cmd}"
+        )
+
+        h_git = self.config.host_git_repos_dir
+        cmd = [
+            "docker", "run", "-d", "--name", c_name, "--pull", "always",
+            "--label", f"iac_job_id={job_id}",
+            "--label", f"iac_task_name={task_name}",
+            "-e", f"IAC_JOB_ID={job_id}",
+            "-e", "TF_IN_AUTOMATION=1",
+            "-e", "CHECKPOINT_DISABLE=1",
+            "-v", f"{h_git}:/data/storage/git_repos",
+            "--entrypoint", "",
+            self.config.terraform_docker_image,
+            "/bin/sh", "-lc", shell_cmd,
+        ]
+
+        log.info(
+            "Executing Terraform in Docker for host=%s node=%s auto_apply=%s",
+            host_name,
+            node_name,
+            self.config.auto_apply,
+        )
+        self.state["active_tasks"][task_name]["status"] = "running_terraform"
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        stdout, _ = await proc.communicate()
+        if proc.returncode != 0:
+            error_msg = stdout.decode("utf-8", errors="replace").strip()
+            raise RuntimeError(f"Failed to spawn Terraform runner container: {error_msg}")
+
+        success, _stats = await self._watch_detached_runner(c_name, task_name, job_id)
+        return success, {"successful_hosts": 1 if success else 0, "failed_hosts": 0 if success else 1}
+
+    async def execute_terraform_provision(self, host_name: str, job_id: int) -> tuple[bool, dict]:
+        host_name = str(host_name or "").strip().lower()
+        if not host_name:
+            return False, {"successful_hosts": 0, "failed_hosts": 1}
+
+        ctx = self._find_terraform_context_for_host(host_name)
+        infra_repo = self.base_git_dir / "infra_engine"
+        render_script = infra_repo / "scripts" / "python" / "render_environment.py"
+        templates_dir = infra_repo / "terraform-templates"
+        if not render_script.exists():
+            raise RuntimeError(f"Missing render script: {render_script}")
+        if not templates_dir.exists():
+            raise RuntimeError(f"Missing templates dir: {templates_dir}")
+
+        secrets_payload, missing = self._build_terraform_secrets_payload(ctx)
+        if missing:
+            raise RuntimeError(
+                "Missing Terraform secret(s): " + ", ".join(sorted(set(missing)))
+            )
+
+        run_rel_dir = f"inventory_state/.terraform_runs/{ctx['env_name']}__{host_name}"
+        run_dir = self.base_git_dir / run_rel_dir
+        if run_dir.exists():
+            shutil.rmtree(run_dir)
+        run_dir.mkdir(parents=True, exist_ok=True)
+
+        secrets_file = run_dir / "secrets.json"
+        with open(secrets_file, "w", encoding="utf-8") as fh:
+            json.dump(secrets_payload, fh)
+
+        render_cmd = [
+            sys.executable,
+            str(render_script),
+            "--templates", str(templates_dir),
+            "--tfvars", str(ctx["tfvars_path"]),
+            "--output", str(run_dir),
+            "--env-name", str(ctx["env_name"]),
+            "--secrets", str(secrets_file),
+        ]
+        log.info("Rendering Terraform env for host '%s' using %s", host_name, ctx["tfvars_path"])
+        render_proc = await asyncio.create_subprocess_exec(
+            *render_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        render_out, _ = await render_proc.communicate()
+        render_text = render_out.decode("utf-8", errors="replace").strip()
+        if render_text:
+            for line in render_text.splitlines():
+                log.info(f"[TF-Render] {line}")
+        if render_proc.returncode != 0:
+            raise RuntimeError("Terraform render failed before runner execution.")
+
+        return await self.execute_terraform_docker(
+            run_rel_dir=run_rel_dir,
+            host_name=host_name,
+            node_name=ctx["node_name"],
+            task_name=f"Terraform Provision: {host_name}",
+            job_id=job_id,
+        )
 
     async def execute_ansible_docker(self, playbook_subpath: str, inventory_subpath: str, limit: str = None, extra_vars: dict = None, task_name: str = "global", job_id: int = 0):
         key_path = None # Safe default so the 'finally' block doesn't crash on early exit
