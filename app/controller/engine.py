@@ -559,10 +559,14 @@ class DeploymentEngine:
                 )
             ])
         elif pipeline_type == "terraform_provision":
-            pipeline.extend([
-                TerraformProvisionStage(host_name=payload.get("host_name")),
-                DynamicRuleExecutionStage(pipeline_type),
-            ])
+            pipeline.append(TerraformProvisionStage(host_name=payload.get("host_name")))
+            # Ansible init: first compliance/baseline run as root (creates ansible-agent).
+            if not payload.get("skip_bootstrap"):
+                pipeline.append(ComplianceBootstrapStage(host_name=payload.get("host_name")))
+            # Hand off to the existing host deployment (Assignments 'Deploy Host' = rollout limit=host).
+            if not payload.get("skip_rollout"):
+                pipeline.append(TriggerHostRolloutStage(host_name=payload.get("host_name")))
+            pipeline.append(DynamicRuleExecutionStage(pipeline_type))
         elif pipeline_type == "bootstrap_compliance":
             pipeline.extend([
                 ComplianceBootstrapStage(host_name=payload.get("host_name")),
