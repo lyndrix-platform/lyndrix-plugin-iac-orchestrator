@@ -551,10 +551,23 @@ class DeploymentEngine:
         # Prevent concurrent bulk rollouts and duplicate single_service runs for the same service.
         async with self._pipeline_dispatch_lock:
             if pipeline_type == "rollout":
+                incoming_limit = str(payload.get("limit") or "").strip().lower()
                 active_rollouts = [j for j in self.db.get_jobs_by_status("RUNNING") if str(j.pipeline_type or "").startswith("rollout")]
                 if active_rollouts:
-                    log.warning("ENGINE: A full rollout is already in progress.")
-                    return
+                    if not incoming_limit:
+                        # Global (no-limit) rollout: block if ANY rollout is running.
+                        log.warning("ENGINE: A full rollout is already in progress — global rollout blocked.")
+                        return
+                    # Host-scoped rollout: only block if the SAME host is already rolling out.
+                    same_host_rollouts = [j for j in active_rollouts if str(j.pipeline_type or "") == f"rollout:{incoming_limit}"]
+                    if same_host_rollouts:
+                        log.warning(f"ENGINE: Rollout for host '{incoming_limit}' is already running — duplicate blocked.")
+                        return
+                    # Also block if a global (no-limit) rollout is running to avoid conflicts.
+                    global_rollouts = [j for j in active_rollouts if str(j.pipeline_type or "") == "rollout:all" or str(j.pipeline_type or "") == "rollout"]
+                    if global_rollouts:
+                        log.warning(f"ENGINE: Global rollout in progress — host rollout for '{incoming_limit}' blocked.")
+                        return
             if pipeline_type == "single_service":
                 service_name = str(payload.get("service_name") or "").strip().lower()
                 if service_name:
