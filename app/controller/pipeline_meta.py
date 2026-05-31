@@ -65,8 +65,13 @@ class PipelineTypeDef:
 # Known pipeline types. ``single_service`` is stored as ``single_service:<name>``
 # so classification uses a prefix match (see :func:`classify`).
 _KNOWN_TYPES: Dict[str, PipelineTypeDef] = {
-    # --- Provision (Terraform) — defined ahead of implementation ---
-    "terraform_provision": PipelineTypeDef("Terraform Provision", PHASE_PROVISION, "dns", "violet"),
+    # --- Provision (Terraform + Ansible host bootstrap) ---
+    # host_provision is the full host lifecycle pipeline: Terraform brings the
+    # container into existence, then Ansible runs the root compliance bootstrap
+    # and hands off to the host rollout. terraform_provision is kept as a legacy
+    # alias so historical jobs still classify correctly.
+    "host_provision":      PipelineTypeDef("Host Provisioning", PHASE_PROVISION, "dns", "violet"),
+    "terraform_provision": PipelineTypeDef("Host Provisioning", PHASE_PROVISION, "dns", "violet"),
     "terraform_plan":      PipelineTypeDef("Terraform Plan", PHASE_PROVISION, "preview", "violet"),
     "terraform_destroy":   PipelineTypeDef("Terraform Destroy", PHASE_PROVISION, "delete_forever", "rose"),
     # --- Configure (Ansible) ---

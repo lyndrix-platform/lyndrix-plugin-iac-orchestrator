@@ -328,7 +328,8 @@ async def trigger_service_deployment(service_name: str, payload: DeployRequest):
 @iac_api_router.post("/deploy/test-host/{host_name}")
 async def trigger_test_host_deployment(host_name: str, payload: TestHostDeployRequest):
     """
-    Triggers a guarded terraform_provision run for exactly one host.
+    Triggers a guarded host_provision run (Terraform + Ansible bootstrap +
+    host rollout hand-off) for exactly one host.
 
     Safety constraints:
     - host must be an exact hostname token (no Ansible patterns/wildcards),
@@ -370,7 +371,7 @@ async def trigger_test_host_deployment(host_name: str, payload: TestHostDeployRe
         )
 
     event_payload = {
-        "pipeline_type": "terraform_provision",
+        "pipeline_type": "host_provision",
         "host_name": host,
         "manual": True,
         "trigger": "manual_test_host",
@@ -380,7 +381,7 @@ async def trigger_test_host_deployment(host_name: str, payload: TestHostDeployRe
     _ctx.emit("iac:webhook_verified", event_payload)
     return {
         "status": "accepted",
-        "message": f"Terraform test deployment queued for host '{host}'.",
+        "message": f"Host provisioning queued for host '{host}'.",
         "host_name": host,
         "services": [str(s).strip() for s in (payload.services or []) if str(s).strip()],
     }

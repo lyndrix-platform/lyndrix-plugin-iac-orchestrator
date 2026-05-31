@@ -11,7 +11,7 @@ This panel scans the same site/host YAML the Assignments tab uses and surfaces a
 without one are shown as "Ansible-only / unmanaged" so operators can see exactly
 what still needs an IaC provisioning definition. The Provision actions are
 intentionally disabled and clearly marked *coming soon* -- the wiring point is a
-single ``ctx.emit("iac:webhook_verified", {"pipeline_type": "terraform_provision", ...})``
+single ``ctx.emit("iac:webhook_verified", {"pipeline_type": "host_provision", ...})``
 once the engine stage lands, so nothing here needs to change when it does.
 
 All surfaces use the themed ``UIStyles`` cards (via ``components``) so light/dark

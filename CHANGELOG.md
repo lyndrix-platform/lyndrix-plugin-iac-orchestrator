@@ -50,6 +50,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   same allowlist from the dashboard.
 
 ### Changed
+- **Renamed `terraform_provision` pipeline to `host_provision`** — the pipeline isn't solely Terraform: after the Terraform apply it also runs the Ansible root compliance bootstrap and hands off to the host rollout. Display label is now "Host Provisioning". The legacy `terraform_provision` `pipeline_type` is still accepted (normalized to `host_provision`) and still classifies correctly for historical jobs, so existing webhooks/buttons keep working.
+- **Host-scoped rollouts are tagged `rollout:<host>`** — a rollout triggered with a specific host limit (the `host_provision` chain hand-off, or the Assignments "Deploy Host" button) is now recorded as `rollout:docker-dev` instead of a bare `rollout`, so the job list reads like the provision job that spawned it. Full/site rollouts keep their `rollout` / `rollout:<site>` tags. The one-rollout-at-a-time guard now matches any `rollout*` tag.
 - `iac_core/app/generator.py` — Terraform generation is built per-stage in memory and written in a
   single guarded phase after a fully clean pass (gated on `error_count == 0`).
 - `iac_core/app/gen/terraform_gen.py` — now a backwards-compatible shim re-exporting the new package.

@@ -49,7 +49,7 @@ class TerraformProvisionStage(BaseStage):
 
     async def run(self, engine, context: dict) -> StageResult:
         if not self.host_name:
-            return StageResult(False, "Missing host_name for terraform_provision pipeline.")
+            return StageResult(False, "Missing host_name for host_provision pipeline.")
         success, data = await engine.execute_terraform_provision(
             host_name=self.host_name,
             job_id=context.get("job_id", 0),
@@ -147,7 +147,7 @@ class TriggerHostRolloutStage(BaseStage):
             "pipeline_type": "rollout",
             "limit": self.host_name,
             "manual": True,
-            "source": "terraform_provision_chain",
+            "source": "host_provision_chain",
         })
         return StageResult(True, f"Host rollout queued for '{self.host_name}' (existing Deploy Host flow).")
 
@@ -482,13 +482,20 @@ class DeploymentEngine:
                 payload.update({"pipeline_type": "single_service", "service_name": name, "service_branch": ref.replace("refs/heads/", "")})
 
         pipeline_type = payload.get("pipeline_type", "connectivity")
+        # The provision pipeline also runs Ansible (root compliance bootstrap +
+        # host rollout hand-off), so it is not solely Terraform: it is named
+        # 'host_provision'. Accept the legacy 'terraform_provision' name for
+        # backwards compatibility (old webhooks/buttons keep working).
+        if pipeline_type == "terraform_provision":
+            pipeline_type = "host_provision"
+        payload["pipeline_type"] = pipeline_type
         single_key = None
         terraform_key = None
 
         # Prevent concurrent bulk rollouts and duplicate single_service runs for the same service.
         async with self._pipeline_dispatch_lock:
             if pipeline_type == "rollout":
-                active_rollouts = [j for j in self.db.get_jobs_by_status("RUNNING") if j.pipeline_type == "rollout"]
+                active_rollouts = [j for j in self.db.get_jobs_by_status("RUNNING") if str(j.pipeline_type or "").startswith("rollout")]
                 if active_rollouts:
                     log.warning("ENGINE: A full rollout is already in progress.")
                     return
@@ -522,7 +529,7 @@ class DeploymentEngine:
                         return
 
                     self._active_single_service_keys.add(single_key)
-            if pipeline_type in ("terraform_provision", "bootstrap_compliance"):
+            if pipeline_type in ("host_provision", "bootstrap_compliance"):
                 host_name = str(
                     payload.get("host_name")
                     or payload.get("test_host")
@@ -573,10 +580,17 @@ class DeploymentEngine:
         db_type = pipeline_type
         if pipeline_type == "single_service":
             db_type = f"single_service:{payload.get('service_name')}"
-        elif pipeline_type == "terraform_provision":
-            db_type = f"terraform_provision:{payload.get('host_name')}"
+        elif pipeline_type == "host_provision":
+            db_type = f"host_provision:{payload.get('host_name')}"
         elif pipeline_type == "bootstrap_compliance":
             db_type = f"bootstrap_compliance:{payload.get('host_name')}"
+        elif pipeline_type == "rollout":
+            # Host-scoped rollouts (e.g. the host_provision hand-off or the
+            # Assignments 'Deploy Host' button) are tagged rollout:<host> so the
+            # job list reads like the provision job that spawned it.
+            _limit = str(payload.get("limit") or "").strip().lower()
+            if _limit and _limit != "all":
+                db_type = f"rollout:{_limit}"
             
         current_job_id = self.db.create_job(db_type)
         
@@ -598,7 +612,7 @@ class DeploymentEngine:
             SyncRepoStage("config_engine"),
             SyncRepoStage("aac_factory"),
         ]
-        if pipeline_type == "terraform_provision":
+        if pipeline_type == "host_provision":
             pipeline.append(SyncRepoStage("infra_engine"))
         pipeline.extend([
             # Refresh inventory_state right before generation to minimize staleness windows.
@@ -624,7 +638,7 @@ class DeploymentEngine:
                     extra_vars={"SERVICE_BRANCH": svc_branch, "target_service": svc_name, "target_group": target_group, "LOCAL_SERVICES_DIR": str(self.config.services_dir)}
                 )
             ])
-        elif pipeline_type == "terraform_provision":
+        elif pipeline_type == "host_provision":
             pipeline.append(TerraformProvisionStage(host_name=payload.get("host_name")))
             # Ansible init: first compliance/baseline run as root (creates ansible-agent).
             if not payload.get("skip_bootstrap"):
