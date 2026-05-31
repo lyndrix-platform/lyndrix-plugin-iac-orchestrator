@@ -1779,7 +1779,15 @@ class DeploymentEngine:
             h_svc = self.config.host_services_dir
             
             safe_task_name = "".join(c if c.isalnum() or c in ".-_" else "-" for c in task_name).strip("-")
-            c_name = f"aac-runner-{safe_task_name}"
+            # Include the target host in the container name to prevent conflicts when
+            # the same service deploys to multiple hosts in parallel (e.g., docker-dev
+            # and docker-devops both deploying aac-docker-to-dns at the same time).
+            host_slug = ""
+            if limit:
+                # limit may be "docker-dev:&service_aac_docker_to_dns" — extract hostname part
+                raw_host = limit.split(":")[0].strip()
+                host_slug = "-" + "".join(c if c.isalnum() or c in ".-_" else "-" for c in raw_host).strip("-")
+            c_name = f"aac-runner-{safe_task_name}{host_slug}"
             
             await asyncio.create_subprocess_exec("docker", "rm", "-f", c_name, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
 
