@@ -88,6 +88,28 @@ class ComplianceBootstrapStage(BaseStage):
         )
         return await inner.run(engine, context)
 
+class TriggerHostRolloutStage(BaseStage):
+    """Hands the freshly-provisioned + bootstrapped host off to the existing,
+    already-coded host deployment path used by the Assignments tab 'Deploy Host'
+    button: emit ``iac:webhook_verified`` with ``pipeline_type=rollout`` limited
+    to this host. This runs as its own rollout job so the service deployment
+    reuses the standard ansible-agent flow without duplicating any logic here."""
+
+    def __init__(self, host_name: str):
+        super().__init__(f"Trigger Host Rollout: {host_name or 'unknown-host'}")
+        self.host_name = str(host_name or "").strip().lower()
+
+    async def run(self, engine, context: dict) -> StageResult:
+        if not self.host_name:
+            return StageResult(False, "Missing host_name for host rollout hand-off.")
+        engine.ctx.emit("iac:webhook_verified", {
+            "pipeline_type": "rollout",
+            "limit": self.host_name,
+            "manual": False,
+            "source": "terraform_provision_chain",
+        })
+        return StageResult(True, f"Host rollout queued for '{self.host_name}' (existing Deploy Host flow).")
+
 class DynamicRuleExecutionStage:
     def __init__(self, pipeline_type: str):
         self.name = f"Dynamic Rules: {pipeline_type}"
@@ -537,11 +559,10 @@ class DeploymentEngine:
                 )
             ])
         elif pipeline_type == "terraform_provision":
-            pipeline.append(TerraformProvisionStage(host_name=payload.get("host_name")))
-            # Auto-chain the first compliance/bootstrap run (as root) unless opted out.
-            if not payload.get("skip_bootstrap"):
-                pipeline.append(ComplianceBootstrapStage(host_name=payload.get("host_name")))
-            pipeline.append(DynamicRuleExecutionStage(pipeline_type))
+            pipeline.extend([
+                TerraformProvisionStage(host_name=payload.get("host_name")),
+                DynamicRuleExecutionStage(pipeline_type),
+            ])
         elif pipeline_type == "bootstrap_compliance":
             pipeline.extend([
                 ComplianceBootstrapStage(host_name=payload.get("host_name")),

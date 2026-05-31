@@ -341,7 +341,9 @@ async def render_dashboard(ctx, service):
                                                                 with ui.row().classes('items-center gap-2'):
                                                                     ui.icon('dns', size='18px').classes('text-slate-400')
                                                                     ui.label(host).classes('text-md font-bold text-slate-800 dark:text-slate-300 truncate max-w-[150px]').tooltip(host)
-                                                                ui.button('Deploy Host', icon='rocket', on_click=lambda h=host: ctx.emit("iac:webhook_verified", {"pipeline_type": "rollout", "limit": h, "manual": True})).props('unelevated rounded size=sm color=indigo').tooltip(f"Deploy to {host}").bind_enabled_from(state, 'is_running', backward=lambda x: not x)
+                                                                with ui.row().classes('gap-1 items-center'):
+                                                                    ui.button('Bootstrap', icon='verified_user', on_click=lambda h=host: ctx.emit("iac:webhook_verified", {"pipeline_type": "bootstrap_compliance", "host_name": h, "manual": True})).props('unelevated rounded size=sm color=sky').tooltip(f"Run initial compliance/baseline as root on {host}").bind_enabled_from(state, 'is_running', backward=lambda x: not x)
+                                                                    ui.button('Deploy Host', icon='rocket', on_click=lambda h=host: ctx.emit("iac:webhook_verified", {"pipeline_type": "rollout", "limit": h, "manual": True})).props('unelevated rounded size=sm color=indigo').tooltip(f"Deploy to {host}").bind_enabled_from(state, 'is_running', backward=lambda x: not x)
 
                                                             with ui.row().classes('gap-1.5 pt-1'):
                                                                 for svc in svcs:
