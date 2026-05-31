@@ -54,6 +54,10 @@ class TerraformProvisionStage(BaseStage):
             host_name=self.host_name,
             job_id=context.get("job_id", 0),
         )
+        # Tell downstream stages whether a fresh container was actually (re)created,
+        # so a complete reinstall can invalidate stale per-host state before rollout.
+        if isinstance(data, dict):
+            context["container_created"] = bool(data.get("container_created"))
         msg = "Terraform provisioning completed." if success else "Terraform provisioning failed."
         return StageResult(success, msg, data=data)
 
@@ -87,6 +91,40 @@ class ComplianceBootstrapStage(BaseStage):
             remote_user="root",
         )
         return await inner.run(engine, context)
+
+class InvalidateHostStateStage(BaseStage):
+    """After a *complete reinstall* (Terraform actually re-created the LXC
+    container), drop this host's entry from the persisted ``last_known_good``
+    state. The subsequent host rollout's drift check then naturally sees the
+    host's services as missing and redeploys exactly them on that host.
+
+    No-op when Terraform made no changes, so ordinary idempotent re-runs keep
+    the standard 'no drift -> deploy nothing' short-circuit untouched."""
+
+    def __init__(self, host_name: str):
+        super().__init__(f"Invalidate Host State: {host_name or 'unknown-host'}")
+        self.host_name = str(host_name or "").strip().lower()
+
+    async def run(self, engine, context: dict) -> StageResult:
+        if not self.host_name:
+            return StageResult(True, "No host_name; nothing to invalidate.")
+        if not context.get("container_created"):
+            return StageResult(True, "No fresh container created; preserving last_known_good.")
+
+        record = engine.db.get_state("last_known_good")
+        state = (record.get("data") if record else {}) or {}
+        removed = False
+        for key in list(state.keys()):
+            if str(key).strip().lower() == self.host_name:
+                state.pop(key, None)
+                removed = True
+        if removed:
+            engine.db.update_state("last_known_good", state, "latest")
+            return StageResult(
+                True,
+                f"Cleared '{self.host_name}' from last_known_good; host rollout will redeploy its services.",
+            )
+        return StageResult(True, f"Host '{self.host_name}' absent from last_known_good; nothing to clear.")
 
 class TriggerHostRolloutStage(BaseStage):
     """Hands the freshly-provisioned + bootstrapped host off to the existing,
@@ -125,14 +163,26 @@ class DetectDriftStage(BaseStage):
         super().__init__("Detect State Drift")
 
     def _load_current_state_from_git(self, engine):
-        """Parses all YAML files to build the current desired state."""
-        # This is a simplified example. A real implementation would be more robust,
-        # parsing profiles, sites, hosts, and services into one large dict.
+        """Parses all YAML files to build the current desired state, folding in
+        profile-inherited services so each host's desired service set matches
+        what the Assignments tab shows (direct + profile). This makes a complete
+        reinstall redeploy the host's *full* service set, and lets profile-driven
+        service changes register as drift."""
         assignments = {}
         base_dir = engine.config.git_repos_dir / "iac_controller" / "environments"
         sites_dir = base_dir / "sites"
         if not sites_dir.exists(): return {}
-        
+
+        # Load profiles once (name -> service list) for inheritance resolution.
+        profiles = {}
+        profiles_file = base_dir / "global" / "03_profiles.yml"
+        if profiles_file.exists():
+            try:
+                with open(profiles_file, 'r') as f:
+                    profiles = (yaml.safe_load(f) or {}).get("profiles") or {}
+            except Exception:
+                profiles = {}
+
         for yaml_file in sites_dir.rglob("*.yml"):
             try:
                 with open(yaml_file, 'r') as f:
@@ -140,8 +190,21 @@ class DetectDriftStage(BaseStage):
                     # Just using hostnames as keys for this example
                     hosts = {**data.get("hosts", {}), **data.get("hardware_hosts", {})}
                     for host_name, host_data in hosts.items():
+                        if not isinstance(host_data, dict): continue
                         if host_name not in assignments: assignments[host_name] = {}
                         assignments[host_name].update(host_data)
+                        # Fold profile-inherited services into the host's service
+                        # list so drift accounts for them (only profile-using hosts
+                        # are affected; direct-only hosts keep their exact shape).
+                        svcs = assignments[host_name].get("services")
+                        if not isinstance(svcs, list): svcs = []
+                        have = {s.get("name") for s in svcs if isinstance(s, dict) and s.get("name")}
+                        for p in (host_data.get("profiles") or []):
+                            for s in (profiles.get(p, {}).get("services") or []):
+                                nm = s.get("name") if isinstance(s, dict) else (s if isinstance(s, str) else None)
+                                if nm and nm not in have:
+                                    svcs.append({"name": nm}); have.add(nm)
+                        assignments[host_name]["services"] = svcs
             except Exception:
                 continue
         return assignments
@@ -568,6 +631,9 @@ class DeploymentEngine:
                 pipeline.append(ComplianceBootstrapStage(host_name=payload.get("host_name")))
             # Hand off to the existing host deployment (Assignments 'Deploy Host' = rollout limit=host).
             if not payload.get("skip_rollout"):
+                # On a complete reinstall (fresh container), clear stale per-host state so
+                # the rollout's drift check redeploys this host's services.
+                pipeline.append(InvalidateHostStateStage(host_name=payload.get("host_name")))
                 pipeline.append(TriggerHostRolloutStage(host_name=payload.get("host_name")))
             pipeline.append(DynamicRuleExecutionStage(pipeline_type))
         elif pipeline_type == "bootstrap_compliance":
@@ -860,6 +926,7 @@ class DeploymentEngine:
 
     async def _watch_detached_runner(self, container_name: str, task_name: str, job_id: int):
         successful_hosts, failed_hosts = 0, 0
+        containers_created = 0  # Terraform: count freshly (re)created LXC containers
         log_file = self.config.get_log_path(job_id)
         ansible_progress = 50.0  # Base progress for Ansible phase
         
@@ -895,6 +962,10 @@ class DeploymentEngine:
                             else: successful_hosts += 1
                         except Exception: pass
 
+                    # Terraform: a fresh LXC container was actually (re)created.
+                    if "proxmox_virtual_environment_container.ct[" in decoded and "Creation complete" in decoded:
+                        containers_created += 1
+
             wait_proc = await asyncio.create_subprocess_exec("docker", "wait", container_name, stdout=asyncio.subprocess.PIPE)
             stdout, _ = await wait_proc.communicate()
             success = int(stdout.decode().strip()) == 0
@@ -902,7 +973,7 @@ class DeploymentEngine:
             if "active_tasks" in self.state and task_name in self.state["active_tasks"]:
                 self.state["active_tasks"][task_name]["status"] = "success" if success else "failed"
             await asyncio.create_subprocess_exec("docker", "rm", "-f", container_name)
-            return success, {"successful_hosts": successful_hosts, "failed_hosts": failed_hosts}
+            return success, {"successful_hosts": successful_hosts, "failed_hosts": failed_hosts, "containers_created": containers_created}
             
         except Exception as e:
             if "active_tasks" in self.state and task_name in self.state["active_tasks"]:
@@ -1285,7 +1356,11 @@ class DeploymentEngine:
             raise RuntimeError(f"Failed to spawn Terraform runner container: {error_msg}")
 
         success, _stats = await self._watch_detached_runner(c_name, task_name, job_id)
-        return success, {"successful_hosts": 1 if success else 0, "failed_hosts": 0 if success else 1}
+        return success, {
+            "successful_hosts": 1 if success else 0,
+            "failed_hosts": 0 if success else 1,
+            "container_created": bool(_stats.get("containers_created", 0)),
+        }
 
     async def execute_terraform_provision(self, host_name: str, job_id: int) -> tuple[bool, dict]:
         host_name = str(host_name or "").strip().lower()
