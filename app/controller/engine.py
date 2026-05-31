@@ -354,6 +354,11 @@ class DeploymentEngine:
         self._pipeline_dispatch_lock = asyncio.Lock()
         self._active_single_service_keys: set[str] = set()
         self._active_terraform_host_keys: set[str] = set()
+        # Only one OpenTofu container may run at a time.  Concurrent runs race
+        # on provider downloads, share the S3 state backend lock, and can
+        # confuse resource-targeting.  A second host_provision queued while one
+        # is running will wait here rather than fail with a network timeout.
+        self._terraform_run_semaphore = asyncio.Semaphore(1)
         ctx.subscribe("git:status_update")(self._on_git_status)
 
     def get_default_ansible_stages(self, pipeline_type: str = "connectivity"):
@@ -1451,17 +1456,21 @@ class DeploymentEngine:
             host_name or "(env)",
         )
         self.state["active_tasks"][task_name]["status"] = "running_terraform"
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-        )
-        stdout, _ = await proc.communicate()
-        if proc.returncode != 0:
-            error_msg = stdout.decode("utf-8", errors="replace").strip()
-            raise RuntimeError(f"Failed to spawn Terraform runner container: {error_msg}")
 
-        success, _stats = await self._watch_detached_runner(c_name, task_name, job_id)
+        async with self._terraform_run_semaphore:
+            log.info("[TF] Acquired terraform run slot for '%s'.", host_name or "(env)")
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            stdout, _ = await proc.communicate()
+            if proc.returncode != 0:
+                error_msg = stdout.decode("utf-8", errors="replace").strip()
+                raise RuntimeError(f"Failed to spawn Terraform runner container: {error_msg}")
+
+            success, _stats = await self._watch_detached_runner(c_name, task_name, job_id)
+
         return success, {
             "successful_hosts": 1 if success else 0,
             "failed_hosts": 0 if success else 1,
