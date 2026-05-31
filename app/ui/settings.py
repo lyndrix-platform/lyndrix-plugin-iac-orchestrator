@@ -214,3 +214,39 @@ def render_settings_ui(ctx, service):
                         ui.notify(f"Credential '{alias}' securely stored.", type="positive")
 
                     ui.button('Save Credential', on_click=add_new_credential, icon='lock', color='emerald').props('unelevated rounded size=sm')
+
+        # --- [SECTION 5: MAINTENANCE / DATA] ---
+        def clear_stats():
+            deleted = service.db.clear_all_jobs(keep_running=True)
+            if deleted < 0:
+                ui.notify("Failed to clear statistics (see logs).", type="negative")
+                return
+            service.state["last_deployment"] = "N/A"
+            ui.notify(f"Cleared {deleted} job record(s). Statistics reset.", type="positive")
+
+        with ui.dialog() as clear_stats_dialog, ui.card().classes('bg-zinc-900 border border-rose-500/40'):
+            with ui.column().classes('gap-3 p-2'):
+                with ui.row().classes('items-center gap-2'):
+                    ui.icon('warning', size='22px').classes('text-rose-400')
+                    ui.label('Clear all statistics?').classes('text-base font-bold text-slate-100')
+                ui.label(
+                    'This permanently deletes all deployment job history that feeds the '
+                    'Overview KPIs and recent-deployments feed. Currently running jobs are '
+                    'kept. This cannot be undone.'
+                ).classes('text-xs text-slate-400 max-w-md')
+                with ui.row().classes('w-full justify-end gap-2 mt-1'):
+                    ui.button('Cancel', on_click=clear_stats_dialog.close).props('flat rounded size=sm color=zinc')
+                    ui.button(
+                        'Clear Stats', icon='delete_forever', color='negative',
+                        on_click=lambda: [clear_stats(), clear_stats_dialog.close()],
+                    ).props('unelevated rounded size=sm')
+
+        with ui.card().classes(f'{UIStyles.CARD_GLASS} w-full').style('padding: 0; flex-wrap: nowrap'):
+            ui.element('div').classes('h-1 w-full bg-gradient-to-r from-rose-500 via-red-500 to-orange-500')
+            with ui.column().classes('w-full flex-grow p-5 gap-3'):
+                with ui.row().classes('items-center gap-2 mb-1'):
+                    ui.icon('cleaning_services', size='18px').classes('text-rose-400')
+                    ui.label('Maintenance').classes('text-sm font-bold uppercase tracking-widest text-slate-300')
+                ui.label('Clear all deployment statistics and job history. Running jobs are preserved.').classes(UIStyles.TEXT_MUTED)
+                with ui.row().classes('w-full justify-end mt-2'):
+                    ui.button('Clear All Stats', on_click=clear_stats_dialog.open, icon='delete_sweep', color='negative').props('unelevated rounded size=sm')

@@ -161,6 +161,31 @@ class JobDatabase:
             if session:
                 session.close()
 
+    def clear_all_jobs(self, keep_running: bool = True) -> int:
+        """Deletes job history (the data behind the Overview statistics).
+
+        By default keeps any currently RUNNING jobs so an active pipeline is not
+        disrupted. Returns the number of deleted rows (-1 on failure).
+        """
+        session = self._get_session()
+        if not session:
+            return -1
+        try:
+            query = session.query(IaCJob)
+            if keep_running:
+                query = query.filter(IaCJob.status != "RUNNING")
+            deleted = query.delete(synchronize_session=False)
+            session.commit()
+            log.info(f"Cleared {deleted} job record(s) from statistics (keep_running={keep_running}).")
+            return int(deleted or 0)
+        except Exception as e:
+            log.error(f"Failed to clear job statistics: {e}")
+            session.rollback()
+            return -1
+        finally:
+            if session:
+                session.close()
+
     # --- STATE MANAGEMENT METHODS ---
 
     def get_state(self, state_id: str) -> dict:
