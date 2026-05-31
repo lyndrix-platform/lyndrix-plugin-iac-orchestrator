@@ -354,6 +354,10 @@ class DeploymentEngine:
         self._pipeline_dispatch_lock = asyncio.Lock()
         self._active_single_service_keys: set[str] = set()
         self._active_terraform_host_keys: set[str] = set()
+        # In-flight rollout keys ('rollout:<host>' or 'rollout:all'). Mirrors the
+        # single_service/terraform guards above to close the TOCTOU window between
+        # the concurrency check and create_job() marking the job RUNNING in the DB.
+        self._active_rollout_keys: set[str] = set()
         # Only one OpenTofu container may run at a time.  Concurrent runs race
         # on provider downloads, share the S3 state backend lock, and can
         # confuse resource-targeting.  A second host_provision queued while one
@@ -547,27 +551,34 @@ class DeploymentEngine:
         payload["pipeline_type"] = pipeline_type
         single_key = None
         terraform_key = None
+        rollout_key = None
 
         # Prevent concurrent bulk rollouts and duplicate single_service runs for the same service.
         async with self._pipeline_dispatch_lock:
             if pipeline_type == "rollout":
                 incoming_limit = str(payload.get("limit") or "").strip().lower()
-                active_rollouts = [j for j in self.db.get_jobs_by_status("RUNNING") if str(j.pipeline_type or "").startswith("rollout")]
-                if active_rollouts:
-                    if not incoming_limit:
-                        # Global (no-limit) rollout: block if ANY rollout is running.
-                        log.warning("ENGINE: A full rollout is already in progress — global rollout blocked.")
+                rollout_key = f"rollout:{incoming_limit}" if (incoming_limit and incoming_limit != "all") else "rollout:all"
+                # Combine DB RUNNING jobs with in-flight keys reserved this dispatch
+                # but not yet marked RUNNING (closes the create_job TOCTOU window).
+                active_rollout_types = {
+                    str(j.pipeline_type or "")
+                    for j in self.db.get_jobs_by_status("RUNNING")
+                    if str(j.pipeline_type or "").startswith("rollout")
+                } | set(self._active_rollout_keys)
+                if active_rollout_types:
+                    if not incoming_limit or incoming_limit == "all":
+                        # Global (no-limit) rollout: block if ANY rollout is in flight.
+                        log.warning("ENGINE: A rollout is already in progress — global rollout blocked.")
                         return
-                    # Host-scoped rollout: only block if the SAME host is already rolling out.
-                    same_host_rollouts = [j for j in active_rollouts if str(j.pipeline_type or "") == f"rollout:{incoming_limit}"]
-                    if same_host_rollouts:
+                    # Host-scoped rollout: block if the SAME host is already rolling out.
+                    if rollout_key in active_rollout_types:
                         log.warning(f"ENGINE: Rollout for host '{incoming_limit}' is already running — duplicate blocked.")
                         return
-                    # Also block if a global (no-limit) rollout is running to avoid conflicts.
-                    global_rollouts = [j for j in active_rollouts if str(j.pipeline_type or "") == "rollout:all" or str(j.pipeline_type or "") == "rollout"]
-                    if global_rollouts:
+                    # Also block if a global (no-limit) rollout is in flight to avoid conflicts.
+                    if "rollout:all" in active_rollout_types or "rollout" in active_rollout_types:
                         log.warning(f"ENGINE: Global rollout in progress — host rollout for '{incoming_limit}' blocked.")
                         return
+                self._active_rollout_keys.add(rollout_key)
             if pipeline_type == "single_service":
                 service_name = str(payload.get("service_name") or "").strip().lower()
                 if service_name:
@@ -813,6 +824,9 @@ class DeploymentEngine:
             if terraform_key:
                 async with self._pipeline_dispatch_lock:
                     self._active_terraform_host_keys.discard(terraform_key)
+            if rollout_key:
+                async with self._pipeline_dispatch_lock:
+                    self._active_rollout_keys.discard(rollout_key)
 
     async def resume_bulk_rollout(self, job_id: int, pending_services: list[str]):
         if not pending_services: return
@@ -1077,7 +1091,9 @@ class DeploymentEngine:
 
                     # Terraform state drift: container exists and is already running on Proxmox.
                     # This is the desired end-state — treat it as a non-fatal warning, not a failure.
-                    if "already running" in decoded and "CT " in decoded:
+                    # Match the actual Proxmox error shape ("CT <id> ... already running") rather than
+                    # loose substrings, to avoid masking unrelated failures as success.
+                    if re.search(r"CT\s+\d+\b.*already running", decoded, re.IGNORECASE):
                         tf_already_running = True
                         log.warning("[TF] Proxmox state drift detected (%s): container is already running. Treating as success.", task_name)
                         with open(log_file, "a", encoding="utf-8") as f:
