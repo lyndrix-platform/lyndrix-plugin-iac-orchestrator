@@ -983,7 +983,6 @@ class DeploymentEngine:
     async def sync_core_repos(self):
         """Periodic/Startup task to keep core repositories up to date."""
         log.info("[SYSTEM] Initiating background sync for core repositories...")
-        self.ctx.emit("system:notify", {"id": "sys_repo_sync", "title": "Repository Sync", "message": "Synchronizing core repositories...", "type": "ongoing", "toast": False})
         
         all_success = True
         for repo in ["iac_controller", "inventory_state", "config_engine", "aac_factory"]:
@@ -991,12 +990,8 @@ class DeploymentEngine:
             if not success:
                 log.warning(f"Failed to sync {repo} during background operation.")
                 all_success = False
-                
-        self.ctx.emit("system:notify", {"id": "sys_repo_sync", "action": "clear"})
-        if all_success:
-            self.ctx.emit("system:notify", {"title": "Repository Sync", "message": "Core repositories synchronized successfully.", "type": "positive", "toast": True})
-        else:
-            self.ctx.emit("system:notify", {"title": "Repository Sync", "message": "Some repositories failed to sync. Check logs.", "type": "negative", "toast": True})
+        if not all_success:
+            log.warning("[SYSTEM] Core repository sync completed with failures. Check logs.")
 
     async def _on_git_status(self, payload: dict):
         request_id = payload.get("request_id")
