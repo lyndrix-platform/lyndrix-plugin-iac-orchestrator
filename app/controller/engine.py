@@ -808,12 +808,15 @@ class DeploymentEngine:
             self.ctx.emit("system:notify", {"id": f"job_{current_job_id}", "action": "clear"})
             self.ctx.emit("system:notify", {"title": f"Pipeline #{current_job_id}", "message": "Completed successfully.", "type": "positive", "toast": True})
         except Exception as e:
-            log.error(f"!!! [FATAL] {str(e)}")
+            import traceback
+            error_detail = str(e) if str(e) else f"{type(e).__name__}: (no message)"
+            log.error(f"!!! [FATAL] {error_detail}")
+            log.debug(f"Exception traceback:\n{traceback.format_exc()}")
             self.state["last_deployment"] = "FAILED"
             self.db.update_progress(current_job_id, progress=None, current_step="Failed")
             
             # Update the existing ongoing notification in-place to an Error state
-            self.ctx.emit("system:notify", {"id": f"job_{current_job_id}", "title": f"Pipeline #{current_job_id} Failed", "message": str(e), "type": "negative", "toast": True})
+            self.ctx.emit("system:notify", {"id": f"job_{current_job_id}", "title": f"Pipeline #{current_job_id} Failed", "message": error_detail, "type": "negative", "toast": True})
         finally:
             logging.getLogger("IaC:Engine").removeHandler(bridge)
             self.state["running_jobs"] = max(0, self.state.get("running_jobs", 0) - 1)
@@ -1508,7 +1511,13 @@ class DeploymentEngine:
             log.info("[TF] Acquired terraform run slot for '%s'.", host_name or "(env)")
             if self.socket_client is None:
                 raise RuntimeError("Socket manager client is not configured.")
-            spawn_result = await self.socket_client.spawn_runner(**spawn_request)
+            try:
+                spawn_result = await self.socket_client.spawn_runner(**spawn_request, timeout=30.0)
+            except TimeoutError as te:
+                raise RuntimeError(f"[TF] Terraform spawn request timed out: {te}")
+            except Exception as se:
+                raise RuntimeError(f"[TF] Failed to send terraform spawn request: {se}")
+            
             if not isinstance(spawn_result, dict) or spawn_result.get("status") != "running":
                 error_msg = "unknown error"
                 if isinstance(spawn_result, dict):

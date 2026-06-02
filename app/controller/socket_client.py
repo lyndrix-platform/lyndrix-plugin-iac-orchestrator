@@ -41,7 +41,10 @@ class SocketBusClient:
             },
         )
         try:
-            return await asyncio.wait_for(future, timeout or self.timeout_seconds)
+            effective_timeout = timeout or self.timeout_seconds
+            return await asyncio.wait_for(future, effective_timeout)
+        except asyncio.TimeoutError:
+            raise TimeoutError(f"Socket {provider}:{operation} request timed out after {timeout or self.timeout_seconds}s (request_id={request_id})")
         finally:
             self._pending.pop(request_id, None)
 
