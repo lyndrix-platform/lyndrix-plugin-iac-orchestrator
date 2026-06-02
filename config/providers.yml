@@ -1,0 +1,21 @@
+# Terraform Provider Cache Configuration
+# Declares which providers to pre-fetch and cache locally.
+# This avoids repeated GitHub downloads and works around network timeouts.
+
+providers:
+  # Proxmox provider (required for onprem infra provisioning)
+  - hostname: registry.opentofu.org
+    namespace: bpg
+    type: proxmox
+    versions: ["0.77.1"]
+    platforms:
+      - linux_amd64
+      - darwin_amd64
+      - windows_amd64
+
+  # Add future providers here (modular structure):
+  # - hostname: registry.opentofu.org
+  #   namespace: hashicorp
+  #   type: aws
+  #   versions: ["5.0.0"]
+  #   platforms: [linux_amd64, darwin_amd64, windows_amd64]
