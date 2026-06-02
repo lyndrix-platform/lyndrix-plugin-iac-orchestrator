@@ -344,11 +344,12 @@ class PersistStateStage(BaseStage):
 # --- THE ENGINE ---
 
 class DeploymentEngine:
-    def __init__(self, ctx, state, db, config):
+    def __init__(self, ctx, state, db, config, socket_client=None):
         self.ctx = ctx
         self.state = state
         self.db = db
         self.config = config
+        self.socket_client = socket_client
         self.base_git_dir = self.config.git_repos_dir
         self.pending_syncs = {}
         self._pipeline_dispatch_lock = asyncio.Lock()
@@ -983,36 +984,27 @@ class DeploymentEngine:
 
     async def reconcile_orphaned_runners(self, job_id=None):
         try:
-            # Fetch exactly which Job ID the runner belongs to using its internal Docker Labels
-            proc = await asyncio.create_subprocess_exec(
-                "docker", "ps", "-a", "--filter", "name=^aac-runner-", 
-                "--format", "{{.Names}}|{{.Label \"iac_job_id\"}}|{{.Label \"iac_task_name\"}}", 
-                stdout=asyncio.subprocess.PIPE
-            )
-            try:
-                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=12)
-            except asyncio.TimeoutError:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
-                log.warning("Reconciliation: docker ps timed out after 12s; skipping orphaned runner scan.")
+            if self.socket_client is None:
+                raise RuntimeError("Socket manager client is not configured.")
+            payload = await self.socket_client.request("docker:runners", args={"prefix": "aac-runner-"})
+            containers = []
+            if isinstance(payload, dict):
+                containers = payload.get("containers") or []
+            if not containers:
                 return
-            lines = [c.strip() for c in stdout.decode().split('\n') if c.strip()]
-            if not lines: return
 
-            log.info(f"Reconciliation: Found {len(lines)} orphaned runners. Reattaching...")
+            log.info(f"Reconciliation: Found {len(containers)} orphaned runners. Reattaching...")
             self.state["is_running"] = True
             
-            for line in lines:
-                parts = line.split('|')
-                c_name = parts[0]
+            for container in containers:
+                c_name = container.get("name") or ""
+                labels = container.get("labels") or {}
                 try:
-                    recovered_job_id = int(parts[1]) if len(parts) > 1 and parts[1] else (job_id or 0)
+                    recovered_job_id = int(labels.get("iac_job_id")) if labels.get("iac_job_id") else (job_id or 0)
                 except ValueError:
                     recovered_job_id = job_id or 0
                     
-                task_name = parts[2] if len(parts) > 2 and parts[2] else c_name.replace("aac-runner-", "")
+                task_name = labels.get("iac_task_name") or c_name.replace("aac-runner-", "")
                 
                 if "active_tasks" not in self.state: self.state["active_tasks"] = {}
                 if task_name not in self.state["active_tasks"]:
@@ -1432,9 +1424,6 @@ class DeploymentEngine:
           the ``auto_apply`` config is set; otherwise the plan is shown but not
           applied — preserving the safe default for the webhook/auto path.
         """
-        if not shutil.which("docker"):
-            return False, {"successful_hosts": 0, "failed_hosts": 1}
-
         if "active_tasks" not in self.state:
             self.state["active_tasks"] = {}
         self.state["active_tasks"][task_name] = {
@@ -1475,18 +1464,36 @@ class DeploymentEngine:
         )
 
         h_git = self.config.host_git_repos_dir
-        cmd = [
-            "docker", "run", "-d", "--name", c_name, "--pull", "always",
-            "--label", f"iac_job_id={job_id}",
-            "--label", f"iac_task_name={task_name}",
-            "-e", f"IAC_JOB_ID={job_id}",
-            "-e", "TF_IN_AUTOMATION=1",
-            "-e", "CHECKPOINT_DISABLE=1",
-            "-v", f"{h_git}:/data/storage/git_repos",
-            "--entrypoint", "",
-            self.config.terraform_docker_image,
-            "/bin/sh", "-lc", shell_cmd,
+        mounts = [
+            {
+                "source": h_git,
+                "target": "/data/storage/git_repos",
+                "mode": "rw",
+            }
         ]
+        if getattr(self.config, "host_terraform_providers_dir", None):
+            mounts.append(
+                {
+                    "source": self.config.host_terraform_providers_dir,
+                    "target": "/data/storage/terraform-providers",
+                    "mode": "rw",
+                }
+            )
+        env_vars = [
+            {"key": "IAC_JOB_ID", "value": str(job_id)},
+            {"key": "TF_IN_AUTOMATION", "value": "1"},
+            {"key": "CHECKPOINT_DISABLE", "value": "1"},
+            {"key": "TF_PLUGIN_CACHE_DIR", "value": "/data/storage/terraform-providers"},
+        ]
+        spawn_request = {
+            "image": self.config.terraform_docker_image,
+            "name": c_name,
+            "env_vars": env_vars,
+            "mounts": mounts,
+            "command": ["/bin/sh", "-lc", shell_cmd],
+            "remove": True,
+            "networks": [],
+        }
 
         log.info(
             "Executing Terraform in Docker: scope=%s mode=%s apply=%s host=%s",
@@ -1499,14 +1506,13 @@ class DeploymentEngine:
 
         async with self._terraform_run_semaphore:
             log.info("[TF] Acquired terraform run slot for '%s'.", host_name or "(env)")
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-            )
-            stdout, _ = await proc.communicate()
-            if proc.returncode != 0:
-                error_msg = stdout.decode("utf-8", errors="replace").strip()
+            if self.socket_client is None:
+                raise RuntimeError("Socket manager client is not configured.")
+            spawn_result = await self.socket_client.spawn_runner(**spawn_request)
+            if not isinstance(spawn_result, dict) or spawn_result.get("status") != "running":
+                error_msg = "unknown error"
+                if isinstance(spawn_result, dict):
+                    error_msg = spawn_result.get("error") or error_msg
                 raise RuntimeError(f"Failed to spawn Terraform runner container: {error_msg}")
 
             success, _stats = await self._watch_detached_runner(c_name, task_name, job_id)

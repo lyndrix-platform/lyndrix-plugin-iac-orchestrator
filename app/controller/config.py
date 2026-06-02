@@ -4,6 +4,7 @@ from pathlib import Path
 class IaCConfig:
     def __init__(self, ctx):
         self.ctx = ctx
+        self._runtime_host_paths: dict[str, str] = {}
 
     def _get(self, env_var: str, vault_key: str = None, default: str = None) -> str:
         """Fetches a setting following the priority: Env Var > Vault/UI > Default."""
@@ -33,18 +34,46 @@ class IaCConfig:
     @property
     def security_dir(self) -> Path: return Path(self._get("PLUGIN_IAC_ORCHESTRATOR_INTERNAL_SECURITY_DIR", default="/data/security"))
 
+    @property
+    def terraform_providers_dir(self) -> Path:
+        return Path(
+            self._get(
+                "PLUGIN_IAC_ORCHESTRATOR_INTERNAL_TERRAFORM_PROVIDERS_DIR",
+                default=str(self.base_storage_dir / "terraform-providers"),
+            )
+        )
+
     # --- HOST PATHS FOR SIBLING DOCKER CONTAINERS ---
     @property
     def host_git_repos_dir(self) -> str: 
-        return self._get("PLUGIN_IAC_ORCHESTRATOR_HOST_GIT_REPOS_DIR", default=str(self.git_repos_dir))
+        return self._runtime_host_paths.get(
+            "git_repos",
+            self._get("PLUGIN_IAC_ORCHESTRATOR_HOST_GIT_REPOS_DIR", default=str(self.git_repos_dir)),
+        )
 
     @property
     def host_services_dir(self) -> str: 
-        return self._get("PLUGIN_IAC_ORCHESTRATOR_HOST_SERVICES_DIR", default=str(self.services_dir))
+        return self._runtime_host_paths.get(
+            "services",
+            self._get("PLUGIN_IAC_ORCHESTRATOR_HOST_SERVICES_DIR", default=str(self.services_dir)),
+        )
 
     @property
     def host_security_dir(self) -> str: 
-        return self._get("PLUGIN_IAC_ORCHESTRATOR_HOST_SECURITY_DIR", default=str(self.security_dir))
+        return self._runtime_host_paths.get(
+            "security",
+            self._get("PLUGIN_IAC_ORCHESTRATOR_HOST_SECURITY_DIR", default=str(self.security_dir)),
+        )
+
+    @property
+    def host_terraform_providers_dir(self) -> str:
+        return self._runtime_host_paths.get(
+            "terraform_providers",
+            self._get(
+                "PLUGIN_IAC_ORCHESTRATOR_HOST_TERRAFORM_PROVIDERS_DIR",
+                default=str(self.terraform_providers_dir),
+            ),
+        )
 
     @property
     def ansible_docker_image(self) -> str: return self._get("PLUGIN_IAC_ORCHESTRATOR_ANSIBLE_IMAGE", "ansible_docker_image", "registry.gitlab.int.fam-feser.de/aac-application-definitions/aac-template-engine:latest")
@@ -88,3 +117,16 @@ class IaCConfig:
 
     def get_log_path(self, job_id: int) -> Path:
         return self.logs_dir / f"job_{job_id}.log"
+
+    def apply_runtime_mount_paths(self, mounts: dict[str, str]) -> None:
+        """Apply socket-resolved host paths from the core socket manager."""
+        if not isinstance(mounts, dict):
+            return
+
+        mapping = {
+            "git_repos": mounts.get("/data/storage/git_repos"),
+            "services": mounts.get("/data/storage/services"),
+            "security": mounts.get("/data/security"),
+            "terraform_providers": mounts.get("/data/storage/terraform-providers"),
+        }
+        self._runtime_host_paths.update({k: v for k, v in mapping.items() if v})

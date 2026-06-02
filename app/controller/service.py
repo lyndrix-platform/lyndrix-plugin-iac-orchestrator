@@ -12,6 +12,7 @@ from ..model.models import Base
 from ..model.database import JobDatabase
 from .config import IaCConfig
 from .engine import DeploymentEngine
+from .socket_client import SocketBusClient
 
 log = logging.getLogger("IaC:Service")
 
@@ -30,8 +31,9 @@ class IaCService:
         }
 
         self.config = IaCConfig(ctx)
+        self.socket_client = SocketBusClient(ctx)
         self.db = JobDatabase()
-        self.engine = DeploymentEngine(ctx, self.state, self.db, self.config)
+        self.engine = DeploymentEngine(ctx, self.state, self.db, self.config, self.socket_client)
 
         # Restore the Auto-Apply setting from Vault/Config on boot
         self.state["auto_apply_enabled"] = self.config.auto_apply
@@ -98,10 +100,12 @@ class IaCService:
 
     async def run_pipeline(self, payload: dict):
         """Delegate to the engine."""
+        await self.ensure_runtime_paths()
         await self.engine.run_pipeline(payload)
 
     async def run_startup_reconciliation(self):
         """Reconcile orphaned runners and resume interrupted jobs after a restart."""
+        await self.ensure_runtime_paths()
         await asyncio.sleep(2)  # Give the DB a moment to wake up
         log.info("IaC Orchestrator: Checking for surviving Docker runners...")
         try:
@@ -136,3 +140,24 @@ class IaCService:
     async def emit_monitoring_inventory_sync(self):
         """Delegate to the engine."""
         await self.engine.emit_monitoring_inventory_sync()
+
+    async def ensure_runtime_paths(self):
+        """Resolve host bind mounts from the core socket manager once per boot."""
+        if getattr(self, "_runtime_paths_resolved", False):
+            return
+        try:
+            mounts = await self.socket_client.resolve_runtime_mounts(
+                [
+                    "/data/storage/git_repos",
+                    "/data/storage/services",
+                    "/data/storage/terraform-providers",
+                    "/data/security",
+                ]
+            )
+            if mounts:
+                self.config.apply_runtime_mount_paths(mounts)
+                self.ctx.log.info("IaC Orchestrator: Resolved runtime host mounts via socket manager.")
+        except Exception as exc:
+            self.ctx.log.warning(f"IaC Orchestrator: Runtime mount resolution failed, using configured paths: {exc}")
+        finally:
+            self._runtime_paths_resolved = True

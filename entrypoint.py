@@ -25,9 +25,9 @@ manifest = ModuleManifest(
     repo_url="https://github.com/lyndrix-platform/lyndrix-plugin-iac-orchestrator",
     ui_route="/iac",
     permissions={
-        "subscribe": ["vault:ready_for_data", "iac:webhook_verified", "git:status_update", "db:connected"],
+        "subscribe": ["vault:ready_for_data", "iac:webhook_verified", "git:status_update", "db:connected", "socket:response"],
         "emit": ["iac:pipeline_started", "iac:webhook_verified", "git:sync", "git:commit_push",
-                 "system:notify", "user:notify", "monitoring:inventory_sync"],
+                 "system:notify", "user:notify", "monitoring:inventory_sync", "socket:request"],
     },
 )
 
