@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
-from .pipeline_meta import classify, get_phases, PHASE_OTHER
+from .pipeline_meta import classify, get_phases, PHASE_OTHER, TASK_NAME_TO_PHASE, PHASE_PROVISION
 
 _SUCCESS = {"SUCCESS"}
 _FAILURE = {"FAILED", "ERROR", "ABORTED"}
@@ -83,8 +83,13 @@ def _enrich(job: dict) -> dict:
     }
 
 
-def compute(jobs: List[dict]) -> DeploymentStats:
-    """Aggregate a list of raw job dicts into a :class:`DeploymentStats`."""
+def compute(jobs: List[dict], tasks: List[dict] | None = None) -> DeploymentStats:
+    """Aggregate a list of raw job dicts into a :class:`DeploymentStats`.
+
+    ``tasks`` are ``IaCJobTask`` rows from ``host_provision`` jobs. When provided,
+    Configure and Deploy phase counts are derived from sub-tasks rather than the
+    parent job (which would otherwise only count toward Provision).
+    """
     stats = DeploymentStats()
     if not jobs:
         # Still expose empty phase rows so the UI renders the lifecycle skeleton.
@@ -97,33 +102,77 @@ def compute(jobs: List[dict]) -> DeploymentStats:
         p.id: PhaseStat(p.id, p.label, p.icon, p.color) for p in get_phases()
     }
 
+    # host_provision jobs are expanded via their sub-tasks below; only count them
+    # at the job level (total/success/failed/running) but skip phase attribution
+    # so sub-tasks drive the per-phase breakdown.
+    host_provision_job_ids: set = set()
+
     durations: List[float] = []
     for job in jobs:
         status = (job.get("status") or "").upper()
         stats.total += 1
         stats.by_status[status] = stats.by_status.get(status, 0) + 1
 
-        meta = classify(job.get("pipeline_type", ""))
-        ps = phase_map.get(meta.phase)
-        if ps is None:
-            ps = phase_map.setdefault(
-                meta.phase, PhaseStat(meta.phase, meta.phase.title(), "category", "zinc")
-            )
-        ps.total += 1
-
         if status in _SUCCESS:
             stats.success += 1
-            ps.success += 1
         elif status in _FAILURE:
             stats.failed += 1
-            ps.failed += 1
         elif status in _RUNNING:
             stats.running += 1
-            ps.running += 1
 
         dur = _duration_seconds(job)
         if dur is not None and status in _SUCCESS:
             durations.append(dur)
+
+        # Phase attribution: host_provision is expanded via tasks (see below).
+        # All other pipeline types map directly to their phase.
+        pipeline_type = job.get("pipeline_type", "")
+        if pipeline_type.startswith("host_provision"):
+            host_provision_job_ids.add(job.get("id"))
+            # Count only Provision phase for the terraform step inside host_provision.
+            ps = phase_map.get(PHASE_PROVISION)
+            if ps:
+                ps.total += 1
+                if status in _SUCCESS: ps.success += 1
+                elif status in _FAILURE: ps.failed += 1
+                elif status in _RUNNING: ps.running += 1
+        else:
+            meta = classify(pipeline_type)
+            ps = phase_map.get(meta.phase)
+            if ps is None:
+                ps = phase_map.setdefault(
+                    meta.phase, PhaseStat(meta.phase, meta.phase.title(), "category", "zinc")
+                )
+            ps.total += 1
+            if status in _SUCCESS: ps.success += 1
+            elif status in _FAILURE: ps.failed += 1
+            elif status in _RUNNING: ps.running += 1
+
+    # Expand host_provision sub-tasks into Configure and Deploy phases.
+    _TASK_SUCCESS = {"success"}
+    _TASK_FAILURE = {"failed", "error"}
+    for task in (tasks or []):
+        task_name = task.get("task_name", "")
+        phase_id = TASK_NAME_TO_PHASE.get(task_name)
+        # Provision phase is already counted at the job level above; skip here.
+        if not phase_id or phase_id == PHASE_PROVISION:
+            continue
+        ps = phase_map.get(phase_id)
+        if ps is None:
+            continue
+        t_status = (task.get("status") or "").lower()
+        ps.total += 1
+        if t_status in _TASK_SUCCESS:
+            ps.success += 1
+        elif t_status in _TASK_FAILURE:
+            ps.failed += 1
+        else:
+            ps.running += 1
+
+        dur_ms = task.get("duration_ms")
+        if dur_ms and t_status in _TASK_SUCCESS:
+            durations.append(dur_ms / 1000.0)
+
 
     stats.success_rate = (
         round((stats.success / stats.finished) * 100, 1) if stats.finished else 0.0

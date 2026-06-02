@@ -2,7 +2,7 @@ import json
 import logging
 from datetime import datetime
 from core.api import db_instance
-from .models import IaCJob, IaCState
+from .models import IaCJob, IaCState, IaCJobTask
 from sqlalchemy import or_
 
 log = logging.getLogger("IaC:Database")
@@ -98,6 +98,43 @@ class JobDatabase:
             if session:
                 session.close()
 
+    def get_latest_job_for_pipeline_type(self, pipeline_type: str, since_epoch: int = 0) -> dict | None:
+        """Returns the newest job for an exact pipeline type, optionally after epoch seconds."""
+        session = self._get_session()
+        if not session:
+            return None
+
+        try:
+            query = session.query(
+                IaCJob.id,
+                IaCJob.pipeline_type,
+                IaCJob.status,
+                IaCJob.progress,
+                IaCJob.current_step,
+                IaCJob.start_time,
+                IaCJob.end_time,
+            ).filter(IaCJob.pipeline_type == pipeline_type)
+
+            if since_epoch and since_epoch > 0:
+                query = query.filter(IaCJob.start_time >= datetime.fromtimestamp(since_epoch))
+
+            job = query.order_by(IaCJob.id.desc()).first()
+            if not job:
+                return None
+
+            return {
+                "id": job.id,
+                "pipeline_type": job.pipeline_type,
+                "status": job.status,
+                "progress": job.progress or 0,
+                "current_step": job.current_step or "",
+                "start_time": job.start_time,
+                "end_time": job.end_time,
+            }
+        finally:
+            if session:
+                session.close()
+
     def get_job_logs(self, job_id: int) -> list:
         """Fetches the raw log array for the popup window."""
         session = self._get_session()
@@ -171,10 +208,15 @@ class JobDatabase:
         if not session:
             return -1
         try:
-            query = session.query(IaCJob)
+            job_query = session.query(IaCJob)
             if keep_running:
-                query = query.filter(IaCJob.status != "RUNNING")
-            deleted = query.delete(synchronize_session=False)
+                job_query = job_query.filter(IaCJob.status != "RUNNING")
+            job_ids = [j.id for j in job_query.all()]
+            if not job_ids:
+                return 0
+            # Delete child tasks first to satisfy the FK constraint.
+            session.query(IaCJobTask).filter(IaCJobTask.job_id.in_(job_ids)).delete(synchronize_session=False)
+            deleted = session.query(IaCJob).filter(IaCJob.id.in_(job_ids)).delete(synchronize_session=False)
             session.commit()
             log.info(f"Cleared {deleted} job record(s) from statistics (keep_running={keep_running}).")
             return int(deleted or 0)
@@ -248,7 +290,76 @@ class JobDatabase:
         finally:
             if session:
                 session.close()
+
+    def insert_job_task(self, job_id: int, task_num: int, task_name: str, task_label: str, 
+                       start_time: float, end_time: float, duration_ms: int, status: str, error: str = None):
+        """Records a completed task within a job."""
+        session = self._get_session()
+        if not session or job_id == -1:
+            return
+
+        try:
+            from datetime import datetime as dt
+            task = IaCJobTask(
+                job_id=job_id,
+                task_num=task_num,
+                task_name=task_name,
+                task_label=task_label,
+                start_time=dt.fromtimestamp(start_time) if start_time else None,
+                end_time=dt.fromtimestamp(end_time) if end_time else None,
+                duration_ms=duration_ms,
+                status=status,
+                error=error
+            )
+            session.add(task)
+            session.commit()
+        except Exception as e:
+            log.error(f"Failed to insert job task for job {job_id}: {e}")
+            session.rollback()
+        finally:
+            if session:
+                session.close()
                 
+    def get_job_tasks_for_stats(self, limit: int = 500) -> list:
+        """
+        Fetch IaCJobTask rows for the most recent host_provision jobs.
+
+        Returns task-level records so the lifecycle dashboard can correctly
+        attribute Configure and Deploy phase counts to their sub-tasks rather
+        than rolling everything up into a single Provision entry.
+        """
+        session = self._get_session()
+        if not session:
+            return []
+        try:
+            rows = (
+                session.query(
+                    IaCJobTask.task_name,
+                    IaCJobTask.status,
+                    IaCJobTask.start_time,
+                    IaCJobTask.end_time,
+                    IaCJobTask.duration_ms,
+                )
+                .join(IaCJob, IaCJobTask.job_id == IaCJob.id)
+                .filter(IaCJob.pipeline_type.like("host_provision%"))
+                .order_by(IaCJobTask.id.desc())
+                .limit(limit)
+                .all()
+            )
+            return [
+                {
+                    "task_name": r.task_name,
+                    "status": r.status,
+                    "start_time": r.start_time,
+                    "end_time": r.end_time,
+                    "duration_ms": r.duration_ms or 0,
+                }
+                for r in rows
+            ]
+        finally:
+            if session:
+                session.close()
+
     def get_jobs_for_stats(self, limit: int = 500) -> list:
         """
         Fetch a lightweight, raw-typed slice of recent jobs for statistics.

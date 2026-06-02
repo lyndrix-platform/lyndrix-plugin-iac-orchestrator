@@ -32,7 +32,12 @@ def render_overview_dashboard(ctx, service):
         except Exception as exc:  # pragma: no cover - defensive
             ctx.log.error(f"UI: stats query failed: {exc}")
             jobs = []
-        s = stats_mod.compute(jobs)
+        try:
+            tasks = engine.db.get_job_tasks_for_stats(1500)
+        except Exception as exc:
+            ctx.log.error(f"UI: task stats query failed: {exc}")
+            tasks = []
+        s = stats_mod.compute(jobs, tasks)
 
         # ---- KPI row -------------------------------------------------------
         with ui.grid(columns="repeat(auto-fit, minmax(190px, 1fr))").classes("w-full gap-4"):

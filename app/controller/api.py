@@ -22,6 +22,18 @@ def init_api(ctx, service):
     _engine = service.engine
 
 
+def _require_gitlab_token(x_gitlab_token: str | None):
+    if not _ctx:
+        raise HTTPException(status_code=500, detail="API Context not initialized")
+    expected_token = _ctx.get_secret("gitlab_webhook_token")
+    if not expected_token:
+        _ctx.log.error("SECURITY HALT: Webhook token missing in Vault.")
+        raise HTTPException(status_code=500, detail="Configuration Error")
+    if not x_gitlab_token or not hmac.compare_digest(x_gitlab_token, expected_token):
+        _ctx.log.warning("SECURITY REJECTION: Unauthorized webhook attempt.")
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+
 
 def _prune_recent_events(now: float):
     expired = [k for k, ts in _recent_events.items() if now - ts > _EVENT_TTL_SECONDS]
@@ -224,14 +236,7 @@ async def gitlab_webhook(request: Request, x_gitlab_token: str = Header(None)):
         raise HTTPException(status_code=500, detail="API Context not initialized")
 
     # 1. Security Check
-    expected_token = _ctx.get_secret("gitlab_webhook_token")
-    if not expected_token:
-        _ctx.log.error("SECURITY HALT: Webhook token missing in Vault.")
-        raise HTTPException(status_code=500, detail="Configuration Error")
-
-    if not x_gitlab_token or not hmac.compare_digest(x_gitlab_token, expected_token):
-        _ctx.log.warning("SECURITY REJECTION: Unauthorized webhook attempt.")
-        raise HTTPException(status_code=401, detail="Unauthorized")
+    _require_gitlab_token(x_gitlab_token)
 
     # 2. Payload Processing
     try:
@@ -319,10 +324,79 @@ def _load_generated_inventory_hosts() -> set[str]:
 @iac_api_router.post("/deploy/service/{service_name}")
 async def trigger_service_deployment(service_name: str, payload: DeployRequest):
     """Triggers a targeted single-service deployment."""
-    if not _ctx: raise HTTPException(status_code=500, detail="Context offline")
-    event_payload = {"pipeline_type": "single_service", "service_name": service_name, "service_branch": payload.branch, "manual": True}
+    if not _ctx:
+        raise HTTPException(status_code=500, detail="Context offline")
+    normalized_service = str(service_name or "").strip().lower()
+    branch = str(payload.branch or "main").strip() or "main"
+    event_payload = {
+        "pipeline_type": "single_service",
+        "service_name": normalized_service,
+        "service_branch": branch,
+        "manual": True,
+    }
     _ctx.emit("iac:webhook_verified", event_payload)
-    return {"status": "accepted", "message": f"Deployment queued for {service_name}"}
+    return {"status": "accepted", "message": f"Deployment queued for {normalized_service}"}
+
+
+@iac_api_router.post("/deploy/service/{service_name}/gitlab")
+async def trigger_service_deployment_gitlab(
+    service_name: str,
+    payload: DeployRequest,
+    x_gitlab_token: str = Header(None),
+):
+    """GitLab-token-protected single-service trigger endpoint for CI pipelines."""
+    _require_gitlab_token(x_gitlab_token)
+    return await trigger_service_deployment(service_name, payload)
+
+
+@iac_api_router.get("/deploy/service/{service_name}/status")
+async def get_service_deployment_status(service_name: str, since_epoch: int = 0):
+    """Returns the latest deployment status for a service, optionally after an epoch timestamp."""
+    if not _engine:
+        raise HTTPException(status_code=500, detail="Engine offline")
+    normalized_service = str(service_name or "").strip().lower()
+    pipeline_type = f"single_service:{normalized_service}"
+    job = _engine.db.get_latest_job_for_pipeline_type(pipeline_type, since_epoch=since_epoch)
+    if not job:
+        return {
+            "status": "pending",
+            "service_name": normalized_service,
+            "pipeline_type": pipeline_type,
+            "found": False,
+            "since_epoch": since_epoch,
+        }
+
+    job_status = str(job.get("status") or "").upper()
+    if job_status == "SUCCESS":
+        status = "success"
+    elif job_status in {"FAILED", "ERROR", "ABORTED"}:
+        status = "failed"
+    elif job_status in {"RUNNING", "PENDING"}:
+        status = "running"
+    else:
+        status = "unknown"
+
+    return {
+        "status": status,
+        "found": True,
+        "service_name": normalized_service,
+        "pipeline_type": pipeline_type,
+        "job_id": job.get("id"),
+        "job_status": job_status,
+        "progress": job.get("progress") or 0,
+        "current_step": job.get("current_step") or "",
+    }
+
+
+@iac_api_router.get("/deploy/service/{service_name}/gitlab/status")
+async def get_service_deployment_status_gitlab(
+    service_name: str,
+    since_epoch: int = 0,
+    x_gitlab_token: str = Header(None),
+):
+    """GitLab-token-protected deployment status endpoint for CI wait loops."""
+    _require_gitlab_token(x_gitlab_token)
+    return await get_service_deployment_status(service_name, since_epoch=since_epoch)
 
 
 @iac_api_router.post("/deploy/test-host/{host_name}")
@@ -400,13 +474,7 @@ async def gitlab_test_host_webhook(
     if not _ctx:
         raise HTTPException(status_code=500, detail="API Context not initialized")
 
-    expected_token = _ctx.get_secret("gitlab_webhook_token")
-    if not expected_token:
-        _ctx.log.error("SECURITY HALT: Webhook token missing in Vault.")
-        raise HTTPException(status_code=500, detail="Configuration Error")
-    if not x_gitlab_token or not hmac.compare_digest(x_gitlab_token, expected_token):
-        _ctx.log.warning("SECURITY REJECTION: Unauthorized webhook test-host trigger attempt.")
-        raise HTTPException(status_code=401, detail="Unauthorized")
+    _require_gitlab_token(x_gitlab_token)
 
     return await trigger_test_host_deployment(host_name, payload)
 

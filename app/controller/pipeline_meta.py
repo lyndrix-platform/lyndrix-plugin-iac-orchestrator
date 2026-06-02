@@ -127,3 +127,11 @@ def classify(pipeline_type: str) -> PipelineTypeDef:
 def phase_of(pipeline_type: str) -> str:
     """Convenience: return just the phase id for a pipeline type."""
     return classify(pipeline_type).phase
+
+
+# Maps IaCJobTask.task_name values (from host_provision sub-tasks) to lifecycle phases.
+TASK_NAME_TO_PHASE: Dict[str, str] = {
+    "terraform_provision": PHASE_PROVISION,
+    "compliance_bootstrap": PHASE_CONFIGURE,
+    "service_rollout": PHASE_DEPLOY,
+}

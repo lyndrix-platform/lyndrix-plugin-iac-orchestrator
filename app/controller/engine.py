@@ -24,10 +24,29 @@ from ...stages.git import (
 )
 from ...stages.ansible import (
     AnsiblePlaybookStage,
-    AsyncBulkRolloutStage
+    AsyncBulkRolloutStage,
+    ServiceDeployStage
 )
 
 log = logging.getLogger("IaC:Engine")
+
+# --- TASK CLASS FOR MULTI-TASK JOB TRACKING ---
+class PipelineTask:
+    """Represents a named task within a job, containing multiple stages."""
+    def __init__(self, task_num: int, task_name: str, task_label: str, stages: list):
+        self.task_num = task_num
+        self.task_name = task_name
+        self.task_label = task_label
+        self.stages = stages
+        self.start_time = None
+        self.end_time = None
+        self.status = "pending"
+        self.error = None
+    
+    def get_duration_ms(self) -> int:
+        if self.start_time and self.end_time:
+            return int((self.end_time - self.start_time) * 1000)
+        return 0
 
 # --- LOCAL STAGE DEFINITIONS ---
 class NativeGenerateStage:
@@ -697,7 +716,17 @@ class DeploymentEngine:
         log.info(f"[SYSTEM] Job #{current_job_id} registered in database.")
         
         # Event-Driven Notification: Register a silent active task in the bell menu
-        self.ctx.emit("system:notify", {"id": f"job_{current_job_id}", "title": f"Pipeline #{current_job_id}", "message": f"Running: {pipeline_type}", "type": "ongoing", "toast": False})
+        self.ctx.emit(
+            "system:notify",
+            {
+                "id": f"job_{current_job_id}",
+                "title": f"Pipeline #{current_job_id}",
+                "message": f"Running: {pipeline_type}",
+                "type": "ongoing",
+                "toast": False,
+                "emit_outbound": False,
+            },
+        )
 
         context = {"payload": payload, "job_id": current_job_id}
         
@@ -735,16 +764,21 @@ class DeploymentEngine:
                 )
             ])
         elif pipeline_type == "host_provision":
-            pipeline.append(TerraformProvisionStage(host_name=payload.get("host_name")))
+            host_name = payload.get("host_name")
+            context["host_name"] = host_name  # Add to context for task tracking
+            pipeline.append(TerraformProvisionStage(host_name=host_name))
             # Ansible init: first compliance/baseline run as root (creates ansible-agent).
             if not payload.get("skip_bootstrap"):
-                pipeline.append(ComplianceBootstrapStage(host_name=payload.get("host_name")))
+                pipeline.append(ComplianceBootstrapStage(host_name=host_name))
+            # Service deployment: NEW STAGE for host_provision pipeline
+            if not payload.get("skip_service_deploy"):
+                pipeline.append(ServiceDeployStage(host_name=host_name))
             # Hand off to the existing host deployment (Assignments 'Deploy Host' = rollout limit=host).
             if not payload.get("skip_rollout"):
                 # On a complete reinstall (fresh container), clear stale per-host state so
                 # the rollout's drift check redeploys this host's services.
-                pipeline.append(InvalidateHostStateStage(host_name=payload.get("host_name")))
-                pipeline.append(TriggerHostRolloutStage(host_name=payload.get("host_name")))
+                pipeline.append(InvalidateHostStateStage(host_name=host_name))
+                pipeline.append(TriggerHostRolloutStage(host_name=host_name))
             pipeline.append(DynamicRuleExecutionStage(pipeline_type))
         elif pipeline_type == "bootstrap_compliance":
             pipeline.extend([
@@ -785,20 +819,25 @@ class DeploymentEngine:
             pipeline.append(DynamicRuleExecutionStage(pipeline_type))
 
         try:
-            total_stages = len(pipeline)
-            for idx, stage in enumerate(pipeline):
-                # PRE-ANSIBLE MACRO PROGRESS UPDATE (0% to 50%)
-                pct = int((idx / total_stages) * 50)
-                self.db.update_progress(current_job_id, progress=pct, current_step=f"Stage: {stage.name}")
-                
-                log.info(f"--- STAGE: {stage.name} ---")
-                res = await stage.run(self, context)
-                if not res.success:
-                    raise RuntimeError(f"Stage '{stage.name}' failed: {res.message}")
-                
-                if context.get("stop_pipeline"):
-                    log.info("[SYSTEM] Pipeline stopped gracefully by a stage.")
-                    break
+            # For host_provision, organize stages into named tasks with tracking
+            if pipeline_type == "host_provision":
+                tasks = self._organize_host_provision_tasks(pipeline, context)
+                await self._execute_tasks(current_job_id, tasks, context)
+            else:
+                # Legacy execution for other pipeline types
+                total_stages = len(pipeline)
+                for idx, stage in enumerate(pipeline):
+                    pct = int((idx / total_stages) * 50)
+                    self.db.update_progress(current_job_id, progress=pct, current_step=f"Stage: {stage.name}")
+                    
+                    log.info(f"--- STAGE: {stage.name} ---")
+                    res = await stage.run(self, context)
+                    if not res.success:
+                        raise RuntimeError(f"Stage '{stage.name}' failed: {res.message}")
+                    
+                    if context.get("stop_pipeline"):
+                        log.info("[SYSTEM] Pipeline stopped gracefully by a stage.")
+                        break
             
             log.info("[SYSTEM] Pipeline completed successfully.")
             self.state["last_deployment"] = "SUCCESS"
@@ -806,7 +845,28 @@ class DeploymentEngine:
             
             # Clear the ongoing notification from the bell menu and send a standalone success toast
             self.ctx.emit("system:notify", {"id": f"job_{current_job_id}", "action": "clear"})
-            self.ctx.emit("system:notify", {"title": f"Pipeline #{current_job_id}", "message": "Completed successfully.", "type": "positive", "toast": True})
+            if pipeline_type == "single_service":
+                service_name = str(payload.get("service_name") or "unknown-service")
+                service_branch = str(payload.get("service_branch") or "main")
+                success_message = (
+                    f"Service '{service_name}' deployed successfully "
+                    f"(branch: {service_branch}, job #{current_job_id})."
+                )
+                emit_outbound = True
+            else:
+                success_message = "Completed successfully."
+                emit_outbound = False
+            self.ctx.emit(
+                "system:notify",
+                {
+                    "title": f"Pipeline #{current_job_id}",
+                    "message": success_message,
+                    "type": "positive",
+                    "toast": True,
+                    "persist": False,
+                    "emit_outbound": emit_outbound,
+                },
+            )
         except Exception as e:
             import traceback
             error_detail = str(e) if str(e) else f"{type(e).__name__}: (no message)"
@@ -816,7 +876,28 @@ class DeploymentEngine:
             self.db.update_progress(current_job_id, progress=None, current_step="Failed")
             
             # Update the existing ongoing notification in-place to an Error state
-            self.ctx.emit("system:notify", {"id": f"job_{current_job_id}", "title": f"Pipeline #{current_job_id} Failed", "message": error_detail, "type": "negative", "toast": True})
+            if pipeline_type == "single_service":
+                service_name = str(payload.get("service_name") or "unknown-service")
+                service_branch = str(payload.get("service_branch") or "main")
+                fail_message = (
+                    f"Service '{service_name}' deployment failed "
+                    f"(branch: {service_branch}, job #{current_job_id}): {error_detail}"
+                )
+                emit_outbound = True
+            else:
+                fail_message = error_detail
+                emit_outbound = False
+            self.ctx.emit(
+                "system:notify",
+                {
+                    "id": f"job_{current_job_id}",
+                    "title": f"Pipeline #{current_job_id} Failed",
+                    "message": fail_message,
+                    "type": "negative",
+                    "toast": True,
+                    "emit_outbound": emit_outbound,
+                },
+            )
         finally:
             logging.getLogger("IaC:Engine").removeHandler(bridge)
             self.state["running_jobs"] = max(0, self.state.get("running_jobs", 0) - 1)
@@ -843,7 +924,17 @@ class DeploymentEngine:
         logging.getLogger("IaC:Engine").addHandler(bridge)
         log.info(f"[SYSTEM] Resuming {len(pending_services)} pending services from job #{job_id}")
         
-        self.ctx.emit("system:notify", {"id": f"job_{job_id}", "title": f"Pipeline #{job_id}", "message": "Resuming Bulk Rollout...", "type": "ongoing", "toast": False})
+        self.ctx.emit(
+            "system:notify",
+            {
+                "id": f"job_{job_id}",
+                "title": f"Pipeline #{job_id}",
+                "message": "Resuming Bulk Rollout...",
+                "type": "ongoing",
+                "toast": False,
+                "emit_outbound": False,
+            },
+        )
         
         context = {"payload": {}, "job_id": job_id}
         stage = AsyncBulkRolloutStage(inventory_path="global/ansible/inventory.yml", limit="all", target_services=pending_services)
@@ -855,9 +946,29 @@ class DeploymentEngine:
             if res.success: 
                 self.db.update_progress(job_id, progress=100, current_step="Resume Completed")
                 self.ctx.emit("system:notify", {"id": f"job_{job_id}", "action": "clear"})
-                self.ctx.emit("system:notify", {"title": f"Pipeline #{job_id}", "message": "Resume completed successfully.", "type": "positive", "toast": True})
+                self.ctx.emit(
+                    "system:notify",
+                    {
+                        "title": f"Pipeline #{job_id}",
+                        "message": "Resume completed successfully.",
+                        "type": "positive",
+                        "toast": True,
+                        "persist": False,
+                        "emit_outbound": False,
+                    },
+                )
             else:
-                self.ctx.emit("system:notify", {"id": f"job_{job_id}", "title": f"Pipeline #{job_id} Resume Failed", "message": "Stage failed.", "type": "negative", "toast": True})
+                self.ctx.emit(
+                    "system:notify",
+                    {
+                        "id": f"job_{job_id}",
+                        "title": f"Pipeline #{job_id} Resume Failed",
+                        "message": "Stage failed.",
+                        "type": "negative",
+                        "toast": True,
+                        "emit_outbound": False,
+                    },
+                )
         except Exception as e:
             log.error(f"!!! [FATAL] {str(e)}")
             self.state["last_deployment"] = "FAILED"
@@ -1512,7 +1623,7 @@ class DeploymentEngine:
             if self.socket_client is None:
                 raise RuntimeError("Socket manager client is not configured.")
             try:
-                spawn_result = await self.socket_client.spawn_runner(**spawn_request, timeout=30.0)
+                spawn_result = await self.socket_client.spawn_runner(**spawn_request, timeout=120.0)
             except TimeoutError as te:
                 raise RuntimeError(f"[TF] Terraform spawn request timed out: {te}")
             except Exception as se:
@@ -1862,3 +1973,146 @@ class DeploymentEngine:
             if key_path and os.path.exists(key_path):
                 try: os.remove(key_path)
                 except Exception: pass
+
+    def _organize_host_provision_tasks(self, pipeline, context):
+        """Group host_provision stages into named tasks for tracking."""
+        import time
+        tasks = []
+        
+        # Group stages into logical tasks
+        task_groups = {
+            "terraform_provision": [],
+            "compliance_bootstrap": [],
+            "service_rollout": [],
+            "finalize": []
+        }
+        
+        for stage in pipeline:
+            stage_name = stage.__class__.__name__
+            if stage_name in ["TerraformProvisionStage"]:
+                task_groups["terraform_provision"].append(stage)
+            elif stage_name in ["ComplianceBootstrapStage"]:
+                task_groups["compliance_bootstrap"].append(stage)
+            elif stage_name in ["ServiceDeployStage"]:
+                task_groups["service_rollout"].append(stage)
+            else:
+                # Other stages (TriggerHostRolloutStage, etc.) go to finalize
+                task_groups["finalize"].append(stage)
+        
+        # Create PipelineTask objects for non-empty groups
+        task_num = 1
+        host_name = ""
+        if context and context.get("host_name"):
+            host_name = context["host_name"]
+        
+        for task_name, stages in task_groups.items():
+            if stages:
+                if task_name == "terraform_provision":
+                    label = f"Terraform Provision: {host_name}" if host_name else "Terraform Provision"
+                elif task_name == "compliance_bootstrap":
+                    label = f"Compliance Bootstrap: {host_name}" if host_name else "Compliance Bootstrap"
+                elif task_name == "service_rollout":
+                    label = f"Service Deployment: {host_name}" if host_name else "Service Deployment"
+                else:
+                    label = "Finalize"
+                
+                task = PipelineTask(task_num, task_name, label, stages)
+                tasks.append(task)
+                task_num += 1
+        
+        return tasks
+
+    async def _execute_tasks(self, job_id, tasks, context):
+        """Execute pipeline tasks with tracking, logging, and DB persistence."""
+        import time
+        
+        total_tasks = len(tasks)
+        task_results = []
+        
+        for task in tasks:
+            task.start_time = time.time()
+            log.info(f"=== TASK [{task.task_num}/{total_tasks}] {task.task_label} ===")
+            
+            try:
+                for idx, stage in enumerate(task.stages):
+                    # Update progress per stage within task
+                    stage_pct = int(((task.task_num - 1 + idx / len(task.stages)) / total_tasks) * 50)
+                    self.db.update_progress(job_id, progress=stage_pct, current_step=f"[Task {task.task_num}/{total_tasks}] {stage.name}")
+                    
+                    log.info(f"  → Stage: {stage.name}")
+                    res = await stage.run(self, context)
+                    if not res.success:
+                        raise RuntimeError(f"Stage '{stage.name}' failed: {res.message}")
+                    
+                    if context.get("stop_pipeline"):
+                        log.info("[SYSTEM] Pipeline stopped gracefully by a stage.")
+                        context["task_stopped"] = True
+                        break
+                
+                if context.get("task_stopped"):
+                    task.status = "stopped"
+                    break
+                
+                task.status = "success"
+                log.info(f"✓ TASK [{task.task_num}/{total_tasks}] COMPLETED: {task.task_label}")
+            
+            except Exception as e:
+                task.status = "failed"
+                task.error = str(e)
+                log.error(f"✗ TASK [{task.task_num}/{total_tasks}] FAILED: {task.task_label}")
+                log.error(f"  Error: {task.error}")
+                raise  # Re-raise to stop pipeline on task failure
+            
+            finally:
+                task.end_time = time.time()
+                duration_ms = task.get_duration_ms()
+                task_results.append({
+                    "task_num": task.task_num,
+                    "task_name": task.task_name,
+                    "task_label": task.task_label,
+                    "status": task.status,
+                    "duration_ms": duration_ms,
+                    "error": task.error
+                })
+                
+                # Insert task record into database
+                try:
+                    self.db.insert_job_task(
+                        job_id=job_id,
+                        task_num=task.task_num,
+                        task_name=task.task_name,
+                        task_label=task.task_label,
+                        start_time=task.start_time,
+                        end_time=task.end_time,
+                        duration_ms=duration_ms,
+                        status=task.status,
+                        error=task.error
+                    )
+                except Exception as e:
+                    log.warning(f"Failed to insert task record: {e}")
+        
+        # Print task summary
+        self._print_task_summary(task_results, total_tasks)
+
+    def _print_task_summary(self, task_results, total_tasks):
+        """Print summary of completed tasks."""
+        if not task_results:
+            return
+        
+        total_duration_ms = sum(r.get("duration_ms", 0) for r in task_results)
+        total_duration_s = total_duration_ms / 1000
+        
+        log.info("\n" + "=" * 70)
+        log.info("TASK SUMMARY")
+        log.info("=" * 70)
+        
+        for result in task_results:
+            status_icon = "✓" if result["status"] == "success" else "✗" if result["status"] == "failed" else "⊘"
+            duration_s = result.get("duration_ms", 0) / 1000
+            log.info(f"{status_icon} Task {result['task_num']}/{total_tasks}: {result['task_label']} ({duration_s:.1f}s) [{result['status'].upper()}]")
+            if result.get("error"):
+                log.info(f"    Error: {result['error']}")
+        
+        log.info("-" * 70)
+        log.info(f"Total duration: {total_duration_s:.1f}s")
+        log.info("=" * 70 + "\n")

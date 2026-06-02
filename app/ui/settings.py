@@ -1,7 +1,9 @@
 import secrets
 import json
+import asyncio
 from nicegui import ui
 from ui.theme import UIStyles
+from ..controller.gitlab_webhooks import upsert_gitlab_group_webhooks
 
 def render_settings_ui(ctx, service):
     """Renders the settings interface for the IaC Orchestrator."""
@@ -9,6 +11,12 @@ def render_settings_ui(ctx, service):
     current_config = {
         "auto_apply": state.get("auto_apply_enabled", False),
         "test_deploy_allowed_hosts": ctx.get_secret("iac_test_deploy_allowed_hosts") or "",
+    }
+    gitlab_webhook_config = {
+        "gitlab_url": ctx.get_secret("iac_gitlab_url") or "https://gitlab.int.fam-feser.de",
+        "group_id": ctx.get_secret("iac_gitlab_group_id") or "",
+        "lyndrix_base_url": ctx.get_secret("iac_lyndrix_base_url") or "http://10.1.10.31:8081",
+        "gitlab_token_key": ctx.get_secret("iac_gitlab_api_token_key") or "",
     }
     token_display = {"value": "********************************"}
 
@@ -20,6 +28,13 @@ def render_settings_ui(ctx, service):
             str(current_config["test_deploy_allowed_hosts"] or "").strip(),
         )
         ui.notify("Settings saved successfully.", type="positive")
+
+    def save_gitlab_webhook_settings():
+        ctx.set_secret("iac_gitlab_url", str(gitlab_webhook_config["gitlab_url"] or "").strip())
+        ctx.set_secret("iac_gitlab_group_id", str(gitlab_webhook_config["group_id"] or "").strip())
+        ctx.set_secret("iac_lyndrix_base_url", str(gitlab_webhook_config["lyndrix_base_url"] or "").strip())
+        ctx.set_secret("iac_gitlab_api_token_key", str(gitlab_webhook_config["gitlab_token_key"] or "").strip())
+        ui.notify("GitLab webhook settings saved.", type="positive")
 
     def generate_token():
         new_token = secrets.token_urlsafe(32)
@@ -278,6 +293,114 @@ def render_settings_ui(ctx, service):
                         ui.notify(f"Credential '{alias}' securely stored.", type="positive")
 
                     ui.button('Save Credential', on_click=add_new_credential, icon='lock', color='emerald').props('unelevated rounded size=sm')
+
+        # --- [SECTION 4b: GITLAB WEBHOOK MANAGEMENT] ---
+        with ui.card().classes(f'{UIStyles.CARD_GLASS} w-full').style('padding: 0; flex-wrap: nowrap'):
+            ui.element('div').classes('h-1 w-full bg-gradient-to-r from-sky-400 via-blue-400 to-indigo-500')
+            with ui.column().classes('w-full flex-grow p-5 gap-3'):
+                with ui.row().classes('items-center gap-2 mb-1'):
+                    ui.icon('webhook', size='18px').classes('text-sky-400')
+                    ui.label('GitLab Webhooks').classes('text-sm font-bold uppercase tracking-widest text-slate-300')
+                ui.label(
+                    'Upsert merge-request-only webhooks for all projects in a GitLab group '
+                    'to the Lyndrix orchestrator endpoint.'
+                ).classes(UIStyles.TEXT_MUTED)
+
+                ui.input('GitLab Base URL').props('outlined dense').classes('w-full').bind_value(
+                    gitlab_webhook_config, 'gitlab_url'
+                )
+                ui.input('GitLab Group ID').props('outlined dense').classes('w-full').bind_value(
+                    gitlab_webhook_config, 'group_id'
+                )
+                ui.input('Lyndrix Base URL').props('outlined dense').classes('w-full').bind_value(
+                    gitlab_webhook_config, 'lyndrix_base_url'
+                )
+                token_select_webhook = ui.select(
+                    options=token_options,
+                    value=gitlab_webhook_config.get('gitlab_token_key', ''),
+                    label='GitLab API Credential (Vault key)',
+                ).classes('w-full').props('outlined dense').bind_value(
+                    gitlab_webhook_config, 'gitlab_token_key'
+                )
+                token_dropdowns.append(token_select_webhook)
+
+                webhook_preview = ui.input(
+                    'Webhook Endpoint Preview',
+                    value=f"{str(gitlab_webhook_config.get('lyndrix_base_url') or '').rstrip('/')}/api/iac/webhook/gitlab",
+                ).props('readonly outlined dense').classes('w-full')
+
+                def _refresh_webhook_preview():
+                    webhook_preview.value = (
+                        f"{str(gitlab_webhook_config.get('lyndrix_base_url') or '').rstrip('/')}/api/iac/webhook/gitlab"
+                    )
+                    webhook_preview.update()
+
+                async def run_webhook_upsert():
+                    _refresh_webhook_preview()
+                    save_gitlab_webhook_settings()
+
+                    group_id_raw = str(gitlab_webhook_config.get('group_id') or '').strip()
+                    if not group_id_raw.isdigit():
+                        ui.notify("GitLab Group ID must be a number.", type="negative")
+                        return
+
+                    token_key = str(gitlab_webhook_config.get('gitlab_token_key') or '').strip()
+                    if not token_key:
+                        ui.notify("Select a GitLab API credential Vault key.", type="negative")
+                        return
+                    gitlab_token = ctx.get_secret(token_key)
+                    if not gitlab_token:
+                        ui.notify(f"Vault key '{token_key}' has no secret value.", type="negative")
+                        return
+
+                    webhook_token = ctx.get_secret("gitlab_webhook_token")
+                    if not webhook_token:
+                        ui.notify("Generate a GitLab webhook token first in Security Configuration.", type="negative")
+                        return
+
+                    ui.notify("Configuring GitLab webhooks…", type="info")
+                    try:
+                        result = await asyncio.to_thread(
+                            upsert_gitlab_group_webhooks,
+                            str(gitlab_webhook_config.get('gitlab_url') or '').strip(),
+                            gitlab_token,
+                            int(group_id_raw),
+                            str(gitlab_webhook_config.get('lyndrix_base_url') or '').strip(),
+                            webhook_token,
+                        )
+                    except Exception as exc:
+                        ui.notify(f"Webhook upsert failed: {exc}", type="negative")
+                        return
+
+                    if result["failed"] > 0:
+                        ui.notify(
+                            f"Webhook upsert done with errors. "
+                            f"Updated={result['updated']}, Created={result['created']}, Failed={result['failed']}",
+                            type="warning",
+                            timeout=10,
+                        )
+                        for err in result["errors"][:5]:
+                            ui.notify(err, type="warning", timeout=8)
+                    else:
+                        ui.notify(
+                            f"Webhook upsert successful. "
+                            f"Projects={result['projects_total']}, Updated={result['updated']}, Created={result['created']}",
+                            type="positive",
+                        )
+
+                with ui.row().classes('w-full justify-end mt-2 gap-2'):
+                    ui.button(
+                        'Save Webhook Settings',
+                        on_click=save_gitlab_webhook_settings,
+                        icon='save',
+                        color='secondary',
+                    ).props('unelevated rounded size=sm')
+                    ui.button(
+                        'Upsert GitLab Webhooks',
+                        on_click=run_webhook_upsert,
+                        icon='webhook',
+                        color='primary',
+                    ).props('unelevated rounded size=sm')
 
         # --- [SECTION 5: MAINTENANCE / DATA] ---
         def clear_stats():
