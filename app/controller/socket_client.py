@@ -55,7 +55,7 @@ class SocketBusClient:
         )
         return result.get("mounts") if isinstance(result, dict) else {}
 
-    async def spawn_runner(self, *, image: str, name: str, env_vars: list[dict] | None = None, mounts: list[dict] | None = None, command: list[str] | None = None, remove: bool = True, networks: list[str] | None = None):
+    async def spawn_runner(self, *, image: str, name: str, env_vars: list[dict] | None = None, mounts: list[dict] | None = None, command: list[str] | None = None, remove: bool = True, networks: list[str] | None = None, timeout: float | None = None):
         return await self.request(
             "docker:spawn",
             args={
@@ -67,4 +67,5 @@ class SocketBusClient:
                 "remove": remove,
                 "networks": networks or [],
             },
+            timeout=timeout,
         )
