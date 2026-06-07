@@ -116,7 +116,15 @@ class JobDatabase:
             ).filter(IaCJob.pipeline_type == pipeline_type)
 
             if since_epoch and since_epoch > 0:
-                query = query.filter(IaCJob.start_time >= datetime.fromtimestamp(since_epoch))
+                # Allow a small skew window so CI/Orchestrator clock drift does not
+                # hide the freshly created deployment job from the status endpoint.
+                since_dt = datetime.fromtimestamp(max(0, since_epoch - 60))
+                query = query.filter(
+                    or_(
+                        IaCJob.start_time >= since_dt,
+                        IaCJob.end_time >= since_dt,
+                    )
+                )
 
             job = query.order_by(IaCJob.id.desc()).first()
             if not job:
