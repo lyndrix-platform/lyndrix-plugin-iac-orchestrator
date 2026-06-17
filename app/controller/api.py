@@ -22,6 +22,48 @@ def init_api(ctx, service):
     _engine = service.engine
 
 
+def _notify_ctx(ctx, title: str, body: str, severity: str, *, broadcast: bool = False) -> None:
+    """Emit a notification via the Messaging Gateway from module-level code (no self)."""
+    from core.api import OutboundMessage, MessageSeverity
+    _sev = {
+        "positive": MessageSeverity.SUCCESS,
+        "negative": MessageSeverity.ERROR,
+        "warning":  MessageSeverity.WARNING,
+        "info":     MessageSeverity.INFO,
+    }
+    msg = OutboundMessage(
+        title=title,
+        body=body,
+        severity=_sev.get(severity, MessageSeverity.INFO),
+        source_plugin_id="lyndrix.plugin.iac_orchestrator",
+        target_provider=None if broadcast else "system",
+        metadata={"toast": True, "persist": True},
+    )
+    ctx.emit("messaging:outbound", msg.model_dump(mode="json"))
+
+
+def _emit_webhook_verified(event_payload: dict) -> None:
+    """Notify the central router that a webhook was accepted and dispatched."""
+    if _ctx is None:
+        return
+    try:
+        _ctx.notify(
+            "webhook_verified",
+            payload={
+                "pipeline_type": event_payload.get("pipeline_type"),
+                "trigger": event_payload.get("trigger"),
+                "manual": event_payload.get("manual", False),
+                "service_name": event_payload.get("service_name"),
+                "host_name": event_payload.get("host_name"),
+            },
+            title="IaC webhook verified",
+            body=f"Pipeline '{event_payload.get('pipeline_type') or 'unknown'}' triggered.",
+            severity="info",
+        )
+    except Exception as exc:
+        _ctx.log.debug(f"NOTIFY: webhook_verified notify failed: {exc}")
+
+
 def _require_gitlab_token(x_gitlab_token: str | None):
     if not _ctx:
         raise HTTPException(status_code=500, detail="API Context not initialized")
@@ -130,14 +172,23 @@ def _emit_internal_notification(payload: dict):
         notif_type = _notification_type_from_pipeline_status(status)
         should_emit_outbound = notif_type in {"positive", "negative", "warning"}
 
-        _ctx.emit("system:notify", {
-            "id": f"gitlab:pipeline:{project_name}:{pipeline_id}",
-            "title": f"GitLab Pipeline #{pipeline_id}",
-            "message": f"{project_name} | {status.upper()} | ref={ref} | source={source}",
-            "type": notif_type,
-            "toast": notif_type != "ongoing",
-            "emit_outbound": should_emit_outbound,
-        })
+        if notif_type == "ongoing":
+            _ctx.emit("system:notify", {
+                "id": f"gitlab:pipeline:{project_name}:{pipeline_id}",
+                "title": f"GitLab Pipeline #{pipeline_id}",
+                "message": f"{project_name} | {status.upper()} | ref={ref} | source={source}",
+                "type": "ongoing",
+                "toast": False,
+                "emit_outbound": False,
+            })
+        else:
+            _notify_ctx(
+                _ctx,
+                f"GitLab Pipeline #{pipeline_id}",
+                f"{project_name} | {status.upper()} | ref={ref} | source={source}",
+                notif_type,
+                broadcast=should_emit_outbound,
+            )
         return
 
     if object_kind == "merge_request":
@@ -160,14 +211,7 @@ def _emit_internal_notification(payload: dict):
         if url:
             message = f"{message} | {url}"
 
-        _ctx.emit("system:notify", {
-            "id": f"gitlab:mr:{project_name}:{mr_iid}",
-            "title": f"GitLab MR !{mr_iid} Merged",
-            "message": message,
-            "type": "positive",
-            "toast": True,
-            "emit_outbound": True,
-        })
+        _notify_ctx(_ctx, f"GitLab MR !{mr_iid} Merged", message, "positive", broadcast=True)
         return
 
     # Ignore non-pipeline webhook kinds on the notification bus to avoid spam.
@@ -273,6 +317,7 @@ async def gitlab_webhook(request: Request, x_gitlab_token: str = Header(None)):
 
         # 3. Emit event to decouple request from execution
         _ctx.emit("iac:webhook_verified", event_payload)
+        _emit_webhook_verified(event_payload)
 
         return {
             "status": "accepted",
@@ -335,6 +380,7 @@ async def trigger_service_deployment(service_name: str, payload: DeployRequest):
         "manual": True,
     }
     _ctx.emit("iac:webhook_verified", event_payload)
+    _emit_webhook_verified(event_payload)
     return {"status": "accepted", "message": f"Deployment queued for {normalized_service}"}
 
 
@@ -453,6 +499,7 @@ async def trigger_test_host_deployment(host_name: str, payload: TestHostDeployRe
     }
 
     _ctx.emit("iac:webhook_verified", event_payload)
+    _emit_webhook_verified(event_payload)
     return {
         "status": "accepted",
         "message": f"Host provisioning queued for host '{host}'.",
@@ -532,6 +579,7 @@ async def trigger_host_bootstrap(host_name: str, payload: TestHostDeployRequest)
     }
 
     _ctx.emit("iac:webhook_verified", event_payload)
+    _emit_webhook_verified(event_payload)
     return {
         "status": "accepted",
         "message": f"Compliance bootstrap queued for host '{host}'.",
@@ -548,10 +596,9 @@ async def trigger_infra_plan():
     """
     if not _ctx:
         raise HTTPException(status_code=500, detail="Context offline")
-    _ctx.emit(
-        "iac:webhook_verified",
-        {"pipeline_type": "infra_plan", "manual": True, "trigger": "manual_infra_plan"},
-    )
+    infra_plan_payload = {"pipeline_type": "infra_plan", "manual": True, "trigger": "manual_infra_plan"}
+    _ctx.emit("iac:webhook_verified", infra_plan_payload)
+    _emit_webhook_verified(infra_plan_payload)
     return {"status": "accepted", "message": "Infrastructure plan (Check Env) queued."}
 
 
@@ -566,15 +613,14 @@ async def trigger_infra_apply():
     """
     if not _ctx:
         raise HTTPException(status_code=500, detail="Context offline")
-    _ctx.emit(
-        "iac:webhook_verified",
-        {
-            "pipeline_type": "infra_apply",
-            "approve": True,
-            "manual": True,
-            "trigger": "manual_infra_apply",
-        },
-    )
+    infra_apply_payload = {
+        "pipeline_type": "infra_apply",
+        "approve": True,
+        "manual": True,
+        "trigger": "manual_infra_apply",
+    }
+    _ctx.emit("iac:webhook_verified", infra_apply_payload)
+    _emit_webhook_verified(infra_apply_payload)
     return {"status": "accepted", "message": "Infrastructure deploy queued."}
 
 

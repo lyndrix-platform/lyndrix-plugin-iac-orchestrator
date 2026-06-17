@@ -1,6 +1,6 @@
 from nicegui import ui
 from ui.layout import main_layout
-from core.api import ModuleManifest, db_instance
+from core.api import ModuleManifest, NotificationEndpoint, db_instance
 
 from .app.controller.service import IaCService
 from .app.controller.api import iac_api_router, init_api
@@ -15,20 +15,62 @@ from .app.ui.widget import render_dashboard_widget as modular_widget
 manifest = ModuleManifest(
     id="lyndrix.plugin.iac_orchestrator",
     name="IaC Orchestrator",
-    version="0.3.1",
+    version="0.3.2",
     description="Standalone GitOps controller for executing Terraform and Ansible pipelines.",
     author="Lyndrix",
     icon="rocket_launch",
     type="PLUGIN",
-    min_core_version="0.1.0",
+    min_core_version="0.1.1",
     auto_enable_on_install=False,
     repo_url="https://github.com/lyndrix-platform/lyndrix-plugin-iac-orchestrator",
     ui_route="/iac",
     permissions={
         "subscribe": ["vault:ready_for_data", "iac:webhook_verified", "git:status_update", "db:connected", "socket:response"],
         "emit": ["iac:pipeline_started", "iac:webhook_verified", "git:sync", "git:commit_push",
-                 "system:notify", "user:notify", "monitoring:inventory_sync", "socket:request"],
+                 "system:notify", "user:notify", "monitoring:inventory_sync", "socket:request", "messaging:outbound"],
     },
+    notification_endpoints=[
+        NotificationEndpoint(
+            name="deployment_started",
+            description="Pipeline run has been queued or has begun.",
+            default_active=True,
+            internal_toast=False,
+            internal_persist=True,
+            external_default=True,
+        ),
+        NotificationEndpoint(
+            name="deployment_succeeded",
+            description="A pipeline finished successfully.",
+            default_active=True,
+            internal_toast=True,
+            internal_persist=True,
+            external_default=True,
+        ),
+        NotificationEndpoint(
+            name="deployment_failed",
+            description="A pipeline finished with errors.",
+            default_active=True,
+            internal_toast=True,
+            internal_persist=True,
+            external_default=True,
+        ),
+        NotificationEndpoint(
+            name="webhook_verified",
+            description="Incoming webhook accepted and dispatched to the engine.",
+            default_active=False,
+            internal_toast=False,
+            internal_persist=False,
+            external_default=False,
+        ),
+        NotificationEndpoint(
+            name="drift_detected",
+            description="Drift detection found differences during a rollout.",
+            default_active=True,
+            internal_toast=True,
+            internal_persist=True,
+            external_default=True,
+        ),
+    ],
 )
 
 _service: IaCService | None = None
