@@ -434,6 +434,25 @@ def render_settings_ui(ctx, service):
                 with ui.row().classes('items-center gap-2 mb-1'):
                     ui.icon('cleaning_services', size='18px').classes('text-rose-400')
                     ui.label('Maintenance').classes('text-sm font-bold uppercase tracking-widest text-slate-300')
+
+                with ui.row().classes('w-full items-center justify-between gap-4 flex-wrap'):
+                    with ui.column().classes('gap-0.5'):
+                        ui.label('Sync Core Repositories').classes('text-sm font-semibold text-zinc-200')
+                        ui.label(
+                            'Fetches the latest state from all four core Git repositories '
+                            '(IaC Controller, Inventory State, Config Engine, AaC Factory). '
+                            'Runs automatically on every deployment.'
+                        ).classes(UIStyles.TEXT_MUTED + ' text-xs max-w-lg')
+                    ui.button(
+                        'Resync Repositories', icon='sync',
+                        on_click=lambda: ctx.create_task(
+                            service.engine.sync_core_repos(), name='iac:sync_core_repos'
+                        ),
+                    ).props('unelevated rounded size=sm color=blue-6') \
+                     .bind_enabled_from(service.state, 'is_running', backward=lambda x: not x)
+
+                ui.separator().classes('bg-zinc-800/40 my-1')
+
                 ui.label('Clear all deployment statistics and job history. Running jobs are preserved.').classes(UIStyles.TEXT_MUTED)
                 with ui.row().classes('w-full justify-end mt-2'):
                     ui.button('Clear All Stats', on_click=clear_stats_dialog.open, icon='delete_sweep', color='negative').props('unelevated rounded size=sm')

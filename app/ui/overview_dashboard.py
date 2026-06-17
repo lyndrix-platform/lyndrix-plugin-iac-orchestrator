@@ -74,14 +74,19 @@ def render_overview_dashboard(ctx, service):
                 icon="account_tree", color="indigo",
             )
             phase_lookup = {p.phase: p for p in s.by_phase}
-            with ui.row().classes("w-full items-stretch gap-2 no-wrap overflow-x-auto"):
+            with ui.element("div").classes(
+                "w-full flex flex-col sm:flex-row items-stretch gap-2"
+            ):
                 phases = get_phases()
                 for idx, pdef in enumerate(phases):
                     ps = phase_lookup.get(pdef.id)
                     _phase_step(pdef, ps)
                     if idx < len(phases) - 1:
+                        ui.icon("arrow_downward", size="22px").classes(
+                            "text-slate-300 dark:text-zinc-700 self-center shrink-0 sm:hidden"
+                        )
                         ui.icon("chevron_right", size="22px").classes(
-                            "text-slate-300 dark:text-zinc-700 self-center shrink-0"
+                            "text-slate-300 dark:text-zinc-700 self-center shrink-0 hidden sm:block"
                         )
 
         # ---- Breakdown + recent feed --------------------------------------
@@ -94,7 +99,7 @@ def render_overview_dashboard(ctx, service):
         total = ps.total if ps else 0
         rate = ps.success_rate if ps else 0.0
         with c.tile(pdef.color, inner="w-full p-3 gap-2",
-                    card_extra="flex-1 min-w-[150px]"):
+                    card_extra="w-full sm:flex-1 sm:min-w-[150px]"):
             with ui.row().classes("w-full items-center justify-between no-wrap"):
                 with ui.row().classes("items-center gap-2 no-wrap"):
                     ui.icon(pdef.icon, size="18px").classes(text_c)

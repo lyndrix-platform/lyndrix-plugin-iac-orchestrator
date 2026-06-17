@@ -8,6 +8,7 @@ import shutil
 import time
 import uuid
 import yaml
+from datetime import datetime, timezone
 from hashlib import sha256
 from pathlib import Path
 
@@ -29,6 +30,78 @@ from ...stages.ansible import (
 )
 
 log = logging.getLogger("IaC:Engine")
+
+# --- PIPELINE NOTIFICATION HELPERS ---
+_PIPELINE_LABELS = {
+    "single_service":       "Service Deploy",
+    "host_provision":       "Host Provisioning",
+    "rollout":              "Full Rollout",
+    "infra_plan":           "Infrastructure Plan (Check Env)",
+    "infra_apply":          "Infrastructure Deploy",
+    "bootstrap_compliance": "Compliance Bootstrap",
+    "connectivity":         "Connectivity Test",
+}
+
+
+def _pipeline_label(pipeline_type: str) -> str:
+    return _PIPELINE_LABELS.get(pipeline_type, pipeline_type)
+
+
+def _fmt_duration(secs: int) -> str:
+    if secs < 60:
+        return f"{secs}s"
+    return f"{secs // 60}m {secs % 60}s"
+
+
+def _build_started_fields(job_id, pipeline_type, p, started_at) -> list[dict]:
+    fields = [
+        {"name": "Job",     "value": f"#{job_id}", "inline": True},
+        {"name": "Type",    "value": _pipeline_label(pipeline_type), "inline": True},
+        {"name": "Trigger", "value": "Manual" if p.get("manual") else "Webhook", "inline": True},
+    ]
+    if p.get("service_name"):
+        fields.append({"name": "Service", "value": str(p["service_name"]), "inline": True})
+    if p.get("service_branch"):
+        fields.append({"name": "Branch",  "value": str(p["service_branch"]), "inline": True})
+    if p.get("host_name"):
+        fields.append({"name": "Host",    "value": str(p["host_name"]), "inline": True})
+    fields.append({"name": "Status", "value": "🔄 Running…", "inline": False})
+    return fields
+
+
+def _build_success_fields(job_id, pipeline_type, p, duration_secs) -> list[dict]:
+    fields = [
+        {"name": "Job",      "value": f"#{job_id}", "inline": True},
+        {"name": "Type",     "value": _pipeline_label(pipeline_type), "inline": True},
+        {"name": "Duration", "value": _fmt_duration(duration_secs), "inline": True},
+    ]
+    if p.get("service_name"):
+        fields.append({"name": "Service", "value": str(p["service_name"]), "inline": True})
+    if p.get("service_branch"):
+        fields.append({"name": "Branch",  "value": str(p["service_branch"]), "inline": True})
+    if p.get("host_name"):
+        fields.append({"name": "Host",    "value": str(p["host_name"]), "inline": True})
+    fields.append({"name": "Status", "value": "✅ Completed successfully", "inline": False})
+    return fields
+
+
+def _build_failed_fields(job_id, pipeline_type, p, duration_secs, error_detail) -> list[dict]:
+    fields = [
+        {"name": "Job",      "value": f"#{job_id}", "inline": True},
+        {"name": "Type",     "value": _pipeline_label(pipeline_type), "inline": True},
+        {"name": "Duration", "value": _fmt_duration(duration_secs), "inline": True},
+    ]
+    if p.get("service_name"):
+        fields.append({"name": "Service", "value": str(p["service_name"]), "inline": True})
+    if p.get("service_branch"):
+        fields.append({"name": "Branch",  "value": str(p["service_branch"]), "inline": True})
+    if p.get("host_name"):
+        fields.append({"name": "Host",    "value": str(p["host_name"]), "inline": True})
+    fields.append({"name": "Status", "value": "❌ Failed", "inline": False})
+    if error_detail:
+        fields.append({"name": "Error", "value": f"```{str(error_detail)[:250]}```", "inline": False})
+    return fields
+
 
 # --- TASK CLASS FOR MULTI-TASK JOB TRACKING ---
 class PipelineTask:
@@ -546,14 +619,65 @@ class DeploymentEngine:
             if not inventory:
                 return
             payload = self._build_monitoring_inventory_payload(inventory)
-            if not payload["hosts"] and not payload["services"]:
-                return
             self.ctx.emit("monitoring:inventory_sync", payload)
             log.info(
                 f"MONITORING: Emitted generated inventory sync with {len(payload['hosts'])} hosts and {len(payload['services'])} services."
             )
         except Exception as exc:
             log.error(f"MONITORING: Failed to emit inventory sync: {exc}")
+
+    # ------------------------------------------------------------------
+    # Notification helpers — use messaging:outbound instead of system:notify
+    # ------------------------------------------------------------------
+
+    def _notify(
+        self,
+        title: str,
+        body: str,
+        severity: str,
+        *,
+        notification_id: str | None = None,
+        toast: bool = True,
+        persist: bool = True,
+        broadcast: bool = False,
+    ) -> None:
+        """Emit a notification via the Messaging Gateway.
+
+        ``broadcast=True`` routes to all registered adapters (e.g. Discord).
+        ``broadcast=False`` (default) targets only the internal UI bell.
+        """
+        from core.api import OutboundMessage, MessageSeverity
+        _sev = {
+            "positive": MessageSeverity.SUCCESS,
+            "negative": MessageSeverity.ERROR,
+            "warning":  MessageSeverity.WARNING,
+            "info":     MessageSeverity.INFO,
+        }
+        meta: dict = {"toast": toast, "persist": persist}
+        if notification_id:
+            meta["notification_id"] = notification_id
+        msg = OutboundMessage(
+            title=title,
+            body=body,
+            severity=_sev.get(severity, MessageSeverity.INFO),
+            source_plugin_id="lyndrix.plugin.iac_orchestrator",
+            target_provider=None if broadcast else "system",
+            metadata=meta,
+        )
+        self.ctx.emit("messaging:outbound", msg.model_dump(mode="json"))
+
+    def _notify_clear(self, notification_id: str) -> None:
+        """Remove a notification from the UI bell by ID."""
+        from core.api import OutboundMessage, MessageSeverity
+        msg = OutboundMessage(
+            title="",
+            body="",
+            severity=MessageSeverity.INFO,
+            source_plugin_id="lyndrix.plugin.iac_orchestrator",
+            target_provider="system",
+            metadata={"action": "clear", "notification_id": notification_id},
+        )
+        self.ctx.emit("messaging:outbound", msg.model_dump(mode="json"))
 
     async def run_pipeline(self, payload: dict):
         if not payload.get("pipeline_type") and payload.get("object_kind") == "push":
@@ -606,12 +730,7 @@ class DeploymentEngine:
                     single_key = f"single_service:{service_name}"
                     if single_key in self._active_single_service_keys:
                         log.warning(f"ENGINE: Duplicate single_service pipeline ignored for '{service_name}' (in-memory lock).")
-                        self.ctx.emit("system:notify", {
-                            "title": "Pipeline Ignored",
-                            "message": f"A deployment for {service_name} is already being started.",
-                            "type": "warning",
-                            "toast": True,
-                        })
+                        self._notify("Pipeline Ignored", f"A deployment for {service_name} is already being started.", "warning")
                         return
 
                     active_service_jobs = [
@@ -620,12 +739,7 @@ class DeploymentEngine:
                     ]
                     if active_service_jobs:
                         log.warning(f"ENGINE: Duplicate single_service pipeline ignored for '{service_name}'.")
-                        self.ctx.emit("system:notify", {
-                            "title": "Pipeline Ignored",
-                            "message": f"A deployment for {service_name} is already running.",
-                            "type": "warning",
-                            "toast": True,
-                        })
+                        self._notify("Pipeline Ignored", f"A deployment for {service_name} is already running.", "warning")
                         return
 
                     self._active_single_service_keys.add(single_key)
@@ -638,23 +752,13 @@ class DeploymentEngine:
                 ).strip().lower()
                 if not host_name:
                     log.warning(f"ENGINE: {pipeline_type} ignored (missing host_name).")
-                    self.ctx.emit("system:notify", {
-                        "title": "Pipeline Ignored",
-                        "message": f"{pipeline_type} requires host_name.",
-                        "type": "warning",
-                        "toast": True,
-                    })
+                    self._notify("Pipeline Ignored", f"{pipeline_type} requires host_name.", "warning")
                     return
                 payload["host_name"] = host_name
                 terraform_key = f"{pipeline_type}:{host_name}"
                 if terraform_key in self._active_terraform_host_keys:
                     log.warning(f"ENGINE: Duplicate {pipeline_type} ignored for '{host_name}' (in-memory lock).")
-                    self.ctx.emit("system:notify", {
-                        "title": "Pipeline Ignored",
-                        "message": f"A {pipeline_type} run for {host_name} is already being started.",
-                        "type": "warning",
-                        "toast": True,
-                    })
+                    self._notify("Pipeline Ignored", f"A {pipeline_type} run for {host_name} is already being started.", "warning")
                     return
 
                 active_tf_jobs = [
@@ -663,12 +767,7 @@ class DeploymentEngine:
                 ]
                 if active_tf_jobs:
                     log.warning(f"ENGINE: Duplicate {pipeline_type} ignored for '{host_name}'.")
-                    self.ctx.emit("system:notify", {
-                        "title": "Pipeline Ignored",
-                        "message": f"A {pipeline_type} run for {host_name} is already running.",
-                        "type": "warning",
-                        "toast": True,
-                    })
+                    self._notify("Pipeline Ignored", f"A {pipeline_type} run for {host_name} is already running.", "warning")
                     return
                 self._active_terraform_host_keys.add(terraform_key)
             if pipeline_type in ("infra_plan", "infra_apply"):
@@ -678,12 +777,7 @@ class DeploymentEngine:
                 ]
                 if active_infra_jobs:
                     log.warning("ENGINE: An infrastructure plan/apply is already in progress.")
-                    self.ctx.emit("system:notify", {
-                        "title": "Pipeline Ignored",
-                        "message": "An infrastructure plan/apply is already running.",
-                        "type": "warning",
-                        "toast": True,
-                    })
+                    self._notify("Pipeline Ignored", "An infrastructure plan/apply is already running.", "warning")
                     return
 
         # Safely increment running job counter
@@ -714,18 +808,36 @@ class DeploymentEngine:
         
         log.info("[SYSTEM] Pipeline Started")
         log.info(f"[SYSTEM] Job #{current_job_id} registered in database.")
-        
-        # Event-Driven Notification: Register a silent active task in the bell menu
-        self.ctx.emit(
-            "system:notify",
-            {
-                "id": f"job_{current_job_id}",
-                "title": f"Pipeline #{current_job_id}",
-                "message": f"Running: {pipeline_type}",
-                "type": "ongoing",
-                "toast": False,
-                "emit_outbound": False,
+
+        # Capture run timing so duration can be reported on success/failure and
+        # the "started_at" timestamp stays consistent across the three envelopes.
+        _run_start_mono = time.monotonic()
+        _run_start_ts = datetime.now(timezone.utc).isoformat()
+        pipeline_label = _pipeline_label(pipeline_type)
+
+        # Sticky "started" notification routed through the central router.
+        # The same notification_id will be upserted by later succeeded/failed
+        # envelopes so the bell entry updates in place.
+        self.ctx.notify(
+            "deployment_started",
+            payload={
+                "message":        f"Pipeline #{current_job_id} is starting…",
+                "job_id":         current_job_id,
+                "pipeline_type":  pipeline_type,
+                "pipeline_label": pipeline_label,
+                "service_name":   payload.get("service_name"),
+                "service_branch": payload.get("service_branch"),
+                "host_name":      payload.get("host_name"),
+                "trigger":        "Manual" if payload.get("manual") else "Webhook",
+                "started_at":     _run_start_ts,
+                "embed_fields":   _build_started_fields(
+                    current_job_id, pipeline_type, payload, _run_start_ts
+                ),
             },
+            notification_id=f"job_{current_job_id}",
+            title=f"🚀 Pipeline #{current_job_id} — {pipeline_label}",
+            body="Pipeline is starting…",
+            severity="info",
         )
 
         context = {"payload": payload, "job_id": current_job_id}
@@ -843,8 +955,7 @@ class DeploymentEngine:
             self.state["last_deployment"] = "SUCCESS"
             self.db.update_progress(current_job_id, progress=100, current_step="Completed Successfully")
             
-            # Clear the ongoing notification from the bell menu and send a standalone success toast
-            self.ctx.emit("system:notify", {"id": f"job_{current_job_id}", "action": "clear"})
+            # Upsert the sticky bell entry in-place with the success result.
             if pipeline_type == "single_service":
                 service_name = str(payload.get("service_name") or "unknown-service")
                 service_branch = str(payload.get("service_branch") or "main")
@@ -852,20 +963,29 @@ class DeploymentEngine:
                     f"Service '{service_name}' deployed successfully "
                     f"(branch: {service_branch}, job #{current_job_id})."
                 )
-                emit_outbound = True
             else:
                 success_message = "Completed successfully."
-                emit_outbound = False
-            self.ctx.emit(
-                "system:notify",
-                {
-                    "title": f"Pipeline #{current_job_id}",
-                    "message": success_message,
-                    "type": "positive",
-                    "toast": True,
-                    "persist": False,
-                    "emit_outbound": emit_outbound,
+            duration_secs = int(time.monotonic() - _run_start_mono)
+            self.ctx.notify(
+                "deployment_succeeded",
+                payload={
+                    "message":        success_message,
+                    "job_id":         current_job_id,
+                    "pipeline_type":  pipeline_type,
+                    "pipeline_label": pipeline_label,
+                    "service_name":   payload.get("service_name"),
+                    "service_branch": payload.get("service_branch"),
+                    "host_name":      payload.get("host_name"),
+                    "duration_secs":  duration_secs,
+                    "started_at":     _run_start_ts,
+                    "embed_fields":   _build_success_fields(
+                        current_job_id, pipeline_type, payload, duration_secs
+                    ),
                 },
+                notification_id=f"job_{current_job_id}",
+                title=f"✅ Pipeline #{current_job_id} — {pipeline_label}",
+                body=success_message,
+                severity="success",
             )
         except Exception as e:
             import traceback
@@ -875,7 +995,7 @@ class DeploymentEngine:
             self.state["last_deployment"] = "FAILED"
             self.db.update_progress(current_job_id, progress=None, current_step="Failed")
             
-            # Update the existing ongoing notification in-place to an Error state
+            # Upsert the sticky bell entry in-place with the failure result.
             if pipeline_type == "single_service":
                 service_name = str(payload.get("service_name") or "unknown-service")
                 service_branch = str(payload.get("service_branch") or "main")
@@ -883,20 +1003,30 @@ class DeploymentEngine:
                     f"Service '{service_name}' deployment failed "
                     f"(branch: {service_branch}, job #{current_job_id}): {error_detail}"
                 )
-                emit_outbound = True
             else:
                 fail_message = error_detail
-                emit_outbound = False
-            self.ctx.emit(
-                "system:notify",
-                {
-                    "id": f"job_{current_job_id}",
-                    "title": f"Pipeline #{current_job_id} Failed",
-                    "message": fail_message,
-                    "type": "negative",
-                    "toast": True,
-                    "emit_outbound": emit_outbound,
+            duration_secs = int(time.monotonic() - _run_start_mono)
+            self.ctx.notify(
+                "deployment_failed",
+                payload={
+                    "message":        fail_message,
+                    "job_id":         current_job_id,
+                    "pipeline_type":  pipeline_type,
+                    "pipeline_label": pipeline_label,
+                    "service_name":   payload.get("service_name"),
+                    "service_branch": payload.get("service_branch"),
+                    "host_name":      payload.get("host_name"),
+                    "error":          error_detail[:300],
+                    "duration_secs":  duration_secs,
+                    "started_at":     _run_start_ts,
+                    "embed_fields":   _build_failed_fields(
+                        current_job_id, pipeline_type, payload, duration_secs, error_detail
+                    ),
                 },
+                notification_id=f"job_{current_job_id}",
+                title=f"❌ Pipeline #{current_job_id} — {pipeline_label}",
+                body=fail_message,
+                severity="error",
             )
         finally:
             logging.getLogger("IaC:Engine").removeHandler(bridge)
@@ -943,37 +1073,20 @@ class DeploymentEngine:
             res = await stage.run(self, context)
             log.info("[SYSTEM] Resumed Pipeline completed.")
             self.state["last_deployment"] = "SUCCESS" if res.success else "FAILED"
-            if res.success: 
+            if res.success:
                 self.db.update_progress(job_id, progress=100, current_step="Resume Completed")
-                self.ctx.emit("system:notify", {"id": f"job_{job_id}", "action": "clear"})
-                self.ctx.emit(
-                    "system:notify",
-                    {
-                        "title": f"Pipeline #{job_id}",
-                        "message": "Resume completed successfully.",
-                        "type": "positive",
-                        "toast": True,
-                        "persist": False,
-                        "emit_outbound": False,
-                    },
-                )
+                self._notify_clear(f"job_{job_id}")
+                self._notify(f"Pipeline #{job_id}", "Resume completed successfully.", "positive", persist=False)
             else:
-                self.ctx.emit(
-                    "system:notify",
-                    {
-                        "id": f"job_{job_id}",
-                        "title": f"Pipeline #{job_id} Resume Failed",
-                        "message": "Stage failed.",
-                        "type": "negative",
-                        "toast": True,
-                        "emit_outbound": False,
-                    },
+                self._notify(
+                    f"Pipeline #{job_id} Resume Failed", "Stage failed.", "negative",
+                    notification_id=f"job_{job_id}",
                 )
         except Exception as e:
             log.error(f"!!! [FATAL] {str(e)}")
             self.state["last_deployment"] = "FAILED"
             self.db.update_progress(job_id, progress=None, current_step="Resume Failed")
-            self.ctx.emit("system:notify", {"id": f"job_{job_id}", "title": f"Pipeline #{job_id} Resume Failed", "message": str(e), "type": "negative", "toast": True})
+            self._notify(f"Pipeline #{job_id} Resume Failed", str(e), "negative", notification_id=f"job_{job_id}")
         finally:
             logging.getLogger("IaC:Engine").removeHandler(bridge)
             self.state["running_jobs"] = max(0, self.state.get("running_jobs", 0) - 1)
@@ -1141,8 +1254,8 @@ class DeploymentEngine:
                 self.state["last_deployment"] = final_status
                 self.db.update_progress(job_id, progress=100 if success else None, current_step="Reconciled & Completed" if success else "Reconciled & Failed")
                 self.db.update_job(job_id, final_status)
-                self.ctx.emit("system:notify", {"id": f"job_{job_id}", "action": "clear"})
-                self.ctx.emit("system:notify", {"title": f"Pipeline #{job_id}", "message": f"Recovered job finished.", "type": "positive" if success else "negative", "toast": True})
+                self._notify_clear(f"job_{job_id}")
+                self._notify(f"Pipeline #{job_id}", "Recovered job finished.", "positive" if success else "negative")
                 
         self.state["running_jobs"] = max(0, self.state.get("running_jobs", 0) - 1)
         self.state["is_running"] = self.state["running_jobs"] > 0

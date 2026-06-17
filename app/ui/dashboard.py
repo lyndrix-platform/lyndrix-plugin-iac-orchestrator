@@ -8,6 +8,8 @@ from ui.theme import UIStyles
 
 from .overview_dashboard import render_overview_dashboard
 from .terraform import render_terraform_panel
+from . import components as c
+from ..controller.pipeline_meta import classify
 
 DOCKER_ICON = 'svg:M6.1,10L0,10.1V13h6.1V10z M13.1,10H7v3h6.1V10z M20.1,10H14v3h6.1V10z M13.1,3H7v3h6.1V3z'
 
@@ -104,7 +106,16 @@ async def render_dashboard(ctx, service):
             job_id = recent[0]["id"]
             engine.db.update_job(job_id, "ABORTED")
             engine.db.update_progress(job_id, progress=None, current_step="Aborted by User")
-            ctx.emit("system:notify", {"id": f"job_{job_id}", "title": f"Pipeline #{job_id} Aborted", "message": "Execution aborted by user.", "type": "warning", "toast": True})
+            from core.api import OutboundMessage, MessageSeverity
+            _abort_msg = OutboundMessage(
+                title=f"Pipeline #{job_id} Aborted",
+                body="Execution aborted by user.",
+                severity=MessageSeverity.WARNING,
+                source_plugin_id="lyndrix.plugin.iac_orchestrator",
+                target_provider="system",
+                metadata={"notification_id": f"job_{job_id}", "toast": True, "persist": True},
+            )
+            ctx.emit("messaging:outbound", _abort_msg.model_dump(mode="json"))
             
         state["is_running"] = False
         state["active_tasks"] = {}
@@ -112,11 +123,11 @@ async def render_dashboard(ctx, service):
         
     active_log_job = {"id": None}
 
-    with ui.dialog() as log_viewer, ui.card().classes(f'w-full max-w-5xl h-[80vh] p-0 flex flex-col no-wrap !bg-black {UIStyles.MODAL_CONTAINER}'):
-        with ui.row().classes('w-full p-4 justify-between items-center border-b border-zinc-800 bg-zinc-900'):
-            with ui.row().classes('items-center gap-6'):
-                log_title = ui.label("Live Stream").classes('text-indigo-400 font-bold')
-                log_search = ui.input('Filter logs (grep)...').props('outlined dense clearable dark').classes('w-64')
+    with ui.dialog() as log_viewer, ui.card().classes(f'w-full max-w-5xl h-[90vh] sm:h-[80vh] p-0 flex flex-col no-wrap !bg-black {UIStyles.MODAL_CONTAINER}'):
+        with ui.row().classes('w-full p-3 sm:p-4 justify-between items-center gap-3 flex-wrap border-b border-zinc-800 bg-zinc-900'):
+            with ui.row().classes('items-center gap-3 flex-wrap flex-1 min-w-0'):
+                log_title = ui.label("Live Stream").classes('text-indigo-400 font-bold shrink-0')
+                log_search = ui.input('Filter logs (grep)...').props('outlined dense clearable dark').classes('w-full sm:w-64')
             ui.button(icon='close', on_click=log_viewer.close).props('flat round dense color=zinc-500')
         with ui.scroll_area().classes('w-full flex-grow bg-black p-4') as log_scroll:
             log_stream = ui.label().classes('whitespace-pre-wrap font-mono text-[11px] text-green-500 break-words')
@@ -159,11 +170,7 @@ async def render_dashboard(ctx, service):
         update_log_content()
 
     with ui.column().classes('w-full gap-6'):
-        with ui.row().classes('w-full items-center gap-4'):
-            ui.element('div').classes('h-12 w-1 bg-gradient-to-b from-indigo-400 to-violet-400')
-            with ui.column().classes('gap-0 flex-grow'):
-                ui.label('GitOps Dashboard').classes(UIStyles.TITLE_H2)
-            ui.button('Resync Repositories', on_click=lambda: engine.ctx.create_task(engine.sync_core_repos(), name='iac:sync_core_repos'), icon='sync', color='blue-6').props('unelevated rounded size=sm').bind_enabled_from(state, 'is_running', backward=lambda x: not x)
+        with ui.row().classes('w-full items-center justify-end'):
             ui.button('ABORT', on_click=abort_execution, icon='dangerous', color='red-6').props('unelevated rounded size=sm').bind_visibility_from(state, 'is_running')
 
         with ui.tabs().classes(UIStyles.TAB_BAR) as tabs:
@@ -355,23 +362,82 @@ async def render_dashboard(ctx, service):
                     
                 assignment_container()
 
-            with ui.tab_panel(history_tab).classes('p-4'):
-                with ui.row().classes('w-full justify-between items-center mb-4'):
+            with ui.tab_panel(history_tab).classes('p-3 sm:p-4'):
+                with ui.row().classes('w-full justify-between items-center mb-3 gap-2 flex-wrap'):
                     ui.label('Deployment History').classes(UIStyles.TITLE_H3)
-                    history_search = ui.input('Search Job ID, Type or Status...').props('outlined dense clearable').classes('w-64')
-
-                history_table = ui.table(columns=[
-                    {'name': 'id', 'label': 'ID', 'field': 'id', 'sortable': True, 'align': 'left'},
-                    {'name': 'pipeline_type', 'label': 'Pipeline Type', 'field': 'pipeline_type', 'align': 'left'},
-                    {'name': 'progress', 'label': 'Progress', 'field': 'progress', 'align': 'left'},
-                    {'name': 'status', 'label': 'Status', 'field': 'status', 'align': 'left'},
-                    {'name': 'action', 'label': 'Logs', 'field': 'action', 'align': 'center'}
-                ], rows=engine.db.get_recent_jobs(), row_key='id').classes(f'{UIStyles.CARD_BASE} w-full mt-2 text-slate-800 dark:text-zinc-200')
-                history_table.add_slot('body-cell-progress', '''<q-td :props="props"><q-linear-progress :value="(props.value || 0)/100" color="indigo" class="mt-2"/><div class="text-center text-[10px]">{{props.value || 0}}%</div></q-td>''')
-                history_table.add_slot('body-cell-status', '''<q-td :props="props"><q-badge :color="props.value === 'SUCCESS' ? 'positive' : (props.value === 'RUNNING' ? 'warning' : 'negative')">{{props.value}}</q-badge></q-td>''')
-                history_table.add_slot('body-cell-action', '''<q-td :props="props"><q-btn size="sm" color="zinc-700" icon="folder_open" @click="() => $parent.$emit('view', props.row)" /></q-td>''')
-                history_table.on('view', lambda e: open_live_logs(e.args['id']))
+                    history_search = ui.input('Search Job ID, Type or Status…') \
+                        .props('outlined dense clearable') \
+                        .classes('w-full sm:w-64')
+                history_grid = ui.element('div').classes(
+                    'grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3 w-full'
+                )
         
+        def _format_duration(start_str, end_str) -> str:
+            if not start_str:
+                return ''
+            try:
+                from datetime import datetime, timezone
+                start = datetime.fromisoformat(str(start_str)[:19]).replace(tzinfo=timezone.utc)
+                end   = datetime.fromisoformat(str(end_str)[:19]).replace(tzinfo=timezone.utc) \
+                        if end_str else datetime.now(timezone.utc)
+                secs = max(0, int((end - start).total_seconds()))
+                if secs < 60:   return f'{secs}s'
+                if secs < 3600: return f'{secs // 60}m {secs % 60}s'
+                return f'{secs // 3600}h {(secs % 3600) // 60}m'
+            except Exception:
+                return ''
+
+        def _render_job_card(job: dict) -> None:
+            status   = job.get('status') or 'UNKNOWN'
+            p_type   = job.get('pipeline_type') or 'unknown'
+            pdef     = classify(p_type)
+            progress = int(job.get('progress') or 0)
+
+            strip_color = (
+                'indigo'  if status == 'RUNNING'                        else
+                'rose'    if status in ('FAILED', 'ERROR', 'ABORTED')   else
+                'emerald' if status == 'SUCCESS'                         else
+                pdef.color
+            )
+            duration_str = _format_duration(job.get('start_time'), job.get('end_time'))
+
+            with c.tile(strip_color, inner='w-full p-3 gap-2', hover=False):
+                # Row 1: type label + status badge
+                with ui.row().classes('w-full items-center justify-between gap-2 flex-wrap'):
+                    with ui.row().classes('items-center gap-2 min-w-0 flex-1'):
+                        ui.icon(pdef.icon, size='16px').classes(c.accent_text(pdef.color))
+                        ui.label(pdef.label).classes(
+                            'text-sm font-bold text-slate-800 dark:text-zinc-100 truncate'
+                        )
+                    c.status_badge(status)
+
+                # Row 2: job ID · start time · duration
+                with ui.row().classes('w-full items-center justify-between gap-1 flex-wrap'):
+                    ui.label(f'#{job["id"]} · {job.get("start_time") or "—"}').classes(
+                        UIStyles.TEXT_MUTED + ' text-xs font-mono'
+                    )
+                    if duration_str:
+                        ui.label(f'in {duration_str}').classes(UIStyles.TEXT_MUTED + ' text-xs')
+
+                # Row 3: progress bar + log button
+                with ui.row().classes('w-full items-center gap-2'):
+                    with ui.column().classes('flex-1 gap-0.5'):
+                        c.progress_bar(progress, pdef.color)
+                        ui.label(f'{progress}%').classes(UIStyles.LABEL_MINI)
+                    ui.button(
+                        icon='terminal',
+                        on_click=lambda jid=job['id']: open_live_logs(jid),
+                    ).props('flat round dense size=sm color=zinc-500').tooltip('View Logs')
+
+                # Row 4: current step (only when present)
+                step = (job.get('current_step') or '').strip()
+                if step:
+                    ui.label(step).classes(
+                        UIStyles.TEXT_MUTED + ' text-[10px] font-mono truncate w-full'
+                    )
+
+        _history_hash: list = [None]
+
         def update_ui_loop():
             running_jobs = engine.db.get_jobs_by_status("RUNNING")
             active_ids = [j.id for j in running_jobs]
@@ -428,13 +494,30 @@ async def render_dashboard(ctx, service):
                                 ui.label("Waiting for pool...").classes('text-[10px] text-zinc-600 italic px-1')
 
             if tabs.value == 'History & Logs':
-                term = (history_search.value or "").lower()
-                # Fetch slightly more jobs if we are actively searching to ensure better coverage
-                all_jobs = engine.db.get_recent_jobs(100 if term else 20)
-                if term:
-                    history_table.rows = [j for j in all_jobs if term in str(j['id']).lower() or term in str(j['pipeline_type']).lower() or term in str(j['status']).lower()]
-                else:
-                    history_table.rows = all_jobs
-                history_table.update()
+                term     = (history_search.value or '').lower()
+                all_jobs = engine.db.get_recent_jobs(100 if term else 30)
+                filtered = [
+                    j for j in all_jobs
+                    if term in str(j['id']) or term in str(j['pipeline_type']).lower()
+                    or term in str(j['status']).lower()
+                ] if term else all_jobs
+
+                new_hash = hash(str([
+                    (j['id'], j['status'], j.get('progress'), j.get('current_step'))
+                    for j in filtered
+                ]))
+                if new_hash != _history_hash[0]:
+                    _history_hash[0] = new_hash
+                    history_grid.clear()
+                    with history_grid:
+                        if filtered:
+                            for job in filtered:
+                                _render_job_card(job)
+                        else:
+                            with ui.column().classes(
+                                'col-span-full w-full items-center py-12 gap-2 opacity-40'
+                            ):
+                                ui.icon('history', size='3em')
+                                ui.label('No deployments found.').classes(UIStyles.TEXT_MUTED)
 
         ui.timer(1.0, update_ui_loop)
