@@ -1,0 +1,28 @@
+site_name: Lyndrix IaC Orchestrator
+site_description: Documentation for the Lyndrix IaC Orchestrator plugin
+site_url: https://iac-orchestrator.docs.lyndrix.eu
+site_dir: .cache/site
+repo_url: https://github.com/lyndrix-platform/lyndrix-plugin-iac-orchestrator
+
+theme:
+  name: material
+  palette:
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: emerald
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: emerald
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+
+nav:
+  - Home: index.md
+  - Usage: usage.md
+  - Configuration: configuration.md

@@ -63,3 +63,6 @@ vendor
 .ruff_cache/
 htmlcov/
 .coverage
+
+# Generated docs build output
+.cache/
