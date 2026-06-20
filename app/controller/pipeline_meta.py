@@ -72,6 +72,9 @@ _KNOWN_TYPES: Dict[str, PipelineTypeDef] = {
     # alias so historical jobs still classify correctly.
     "host_provision":      PipelineTypeDef("Host Provisioning", PHASE_PROVISION, "dns", "violet"),
     "terraform_provision": PipelineTypeDef("Host Provisioning", PHASE_PROVISION, "dns", "violet"),
+    # adopt_host imports an existing CT into Terraform state (then plans to verify),
+    # bringing a manually-created container under management without recreating it.
+    "adopt_host":          PipelineTypeDef("Adopt Existing", PHASE_PROVISION, "move_to_inbox", "violet"),
     "terraform_plan":      PipelineTypeDef("Terraform Plan", PHASE_PROVISION, "preview", "violet"),
     "terraform_destroy":   PipelineTypeDef("Terraform Destroy", PHASE_PROVISION, "delete_forever", "rose"),
     # infra_plan / infra_apply are the whole-infrastructure operations driven from
