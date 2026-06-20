@@ -50,7 +50,7 @@ CONTAINER_PASSTHROUGH = (
     "arch", "cores", "memory", "swap", "unprivileged", "keyctl",
     "nesting", "fuse", "mount", "start_on_boot", "ostype",
     "disk_storage", "disk_size", "bridge", "mac", "nameserver",
-    "searchdomain", "tags",
+    "searchdomain", "tags", "mtu", "startup_order",
 )
 
 # Provider connection metadata that is safe to write to the generated state.
