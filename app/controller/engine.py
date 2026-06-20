@@ -185,6 +185,56 @@ class TerraformAdoptStage(BaseStage):
         return StageResult(success, msg, data=data)
 
 
+class TerraformAdoptScopeStage(BaseStage):
+    """Adopt every managed CT in a scope (a whole site, or 'all') into Terraform
+    state by importing each one in turn — the bulk counterpart of the per-host
+    Adopt. Imports are non-destructive; one host failing does not abort the rest."""
+
+    def __init__(self, limit: str):
+        self.limit = str(limit or "all").strip() or "all"
+        super().__init__(f"Adopt Existing: {self.limit}")
+
+    async def run(self, engine, context: dict) -> StageResult:
+        inv_root = engine.base_git_dir / "inventory_state"
+        hosts: list[str] = []
+        for tfvars_path in inv_root.glob("*/*/terraform/terraform.tfvars.json"):
+            try:
+                site = tfvars_path.parents[2].name
+            except IndexError:
+                continue
+            if self.limit != "all" and site != self.limit:
+                continue
+            try:
+                with open(tfvars_path, "r", encoding="utf-8") as fh:
+                    data = json.load(fh)
+            except Exception:  # noqa: BLE001
+                continue
+            hosts.extend((data.get("containers") or {}).keys())
+        hosts = sorted(set(h for h in hosts if h))
+        if not hosts:
+            return StageResult(True, f"Adopt scope '{self.limit}': no managed hosts to import.")
+        log.info("Adopt scope '%s': importing %d managed host(s): %s", self.limit, len(hosts), ", ".join(hosts))
+        ok, failed = 0, []
+        for h in hosts:
+            try:
+                success, _ = await engine.execute_terraform_provision(
+                    host_name=h, job_id=context.get("job_id", 0),
+                    mode="import", adopt_existing=True,
+                )
+            except Exception as exc:  # noqa: BLE001
+                success = False
+                log.error("Adopt: import failed for '%s': %s", h, exc)
+            if success:
+                ok += 1
+            else:
+                failed.append(h)
+        msg = f"Adopt scope '{self.limit}': {ok}/{len(hosts)} imported"
+        if failed:
+            msg += f" (failed: {', '.join(failed)})"
+        # Bulk import is best-effort: a single unreachable/absent CT shouldn't fail the job.
+        return StageResult(True, msg)
+
+
 class InfraPlanStage(BaseStage):
     """Whole-infrastructure read-only plan ("Check Env"): runs ``tofu plan``
     across every non-empty environment without applying anything."""
@@ -914,15 +964,34 @@ class DeploymentEngine:
                 pipeline.append(TriggerHostRolloutStage(host_name=host_name))
             pipeline.append(DynamicRuleExecutionStage(pipeline_type))
         elif pipeline_type == "adopt_host":
-            # Import an existing CT into Terraform state (then plan to verify) so a
-            # manually-created container comes under management without recreation.
-            # No bootstrap/deploy/apply — just adopt + plan.
+            # Import existing CT(s) into Terraform state (then plan to verify) so
+            # manually-created containers come under management without recreation.
+            # No bootstrap/deploy/apply — just adopt + plan. `host_name` adopts one
+            # host; `limit` ('all' or a site) adopts every managed host in scope.
             host_name = payload.get("host_name")
-            context["host_name"] = host_name
-            pipeline.append(TerraformAdoptStage(host_name=host_name))
+            if host_name:
+                context["host_name"] = host_name
+                pipeline.append(TerraformAdoptStage(host_name=host_name))
+            else:
+                pipeline.append(TerraformAdoptScopeStage(limit=payload.get("limit") or "all"))
         elif pipeline_type == "bootstrap_compliance":
+            # `host_name` bootstraps one host (waits for SSH first); `limit` ('all'
+            # or a site) runs the compliance playbook across that group in one pass.
+            host_name = payload.get("host_name")
+            if host_name:
+                bootstrap_stage = ComplianceBootstrapStage(host_name=host_name)
+            else:
+                _limit = payload.get("limit") or "all"
+                bootstrap_stage = AnsiblePlaybookStage(
+                    name_override=f"Compliance Bootstrap: {_limit}",
+                    playbook_path="playbooks/cd_playbooks/cd_compliance.yml",
+                    inventory_path="global/ansible/inventory.yml",
+                    limit=_limit,
+                    ssh_key_secret="iac_tf_ssh_private_key",
+                    remote_user="root",
+                )
             pipeline.extend([
-                ComplianceBootstrapStage(host_name=payload.get("host_name")),
+                bootstrap_stage,
                 DynamicRuleExecutionStage(pipeline_type),
             ])
         elif pipeline_type == "infra_plan":
