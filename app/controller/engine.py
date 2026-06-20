@@ -1261,6 +1261,7 @@ class DeploymentEngine:
         log_file = self.config.get_log_path(job_id)
         ansible_progress = 50.0  # Base progress for Ansible phase
         tf_already_running = False  # Proxmox "CT already running" is a non-fatal drift condition
+        no_hosts_matched = False  # Empty --limit intersection is a no-op skip, not a failure
         
         try:
             log_proc = await asyncio.create_subprocess_exec("docker", "logs", "-f", container_name, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
@@ -1308,11 +1309,26 @@ class DeploymentEngine:
                         with open(log_file, "a", encoding="utf-8") as f:
                             f.write(f"[{task_name}] [WARNING] State drift: container already running — desired state achieved, continuing.\n")
 
+                    # Ansible "no hosts to target": the --limit intersection matched zero
+                    # hosts (e.g. a service group not present on the limited host, or an
+                    # empty site/stage group). That is a no-op, not a failure — treat it
+                    # as a graceful skip so a scoped rollout or a rule targeting an empty
+                    # group does not abort the whole pipeline.
+                    if ("no hosts to target" in decoded
+                            or "Could not match supplied host pattern" in decoded):
+                        no_hosts_matched = True
+
             wait_proc = await asyncio.create_subprocess_exec("docker", "wait", container_name, stdout=asyncio.subprocess.PIPE)
             stdout, _ = await wait_proc.communicate()
             exit_code = int(stdout.decode().strip())
             # Override failure if the only Terraform error was "already running" (desired state IS achieved)
             success = exit_code == 0 or tf_already_running
+            # An empty --limit intersection exits non-zero with no PLAY RECAP on this
+            # ansible-core; treat it as a skip, but only when nothing actually ran or
+            # failed (so a real task failure is never masked).
+            if not success and no_hosts_matched and successful_hosts == 0 and failed_hosts == 0:
+                log.info("[Ansible] '%s' matched no hosts (empty --limit) — skipping (no-op).", task_name)
+                success = True
             
             if "active_tasks" in self.state and task_name in self.state["active_tasks"]:
                 self.state["active_tasks"][task_name]["status"] = "success" if success else "failed"
