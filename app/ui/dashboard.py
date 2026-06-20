@@ -297,6 +297,8 @@ async def render_dashboard(ctx, service):
                     with ui.row().classes('gap-2 items-center'):
                         search_input = ui.input('Search Host or Service...').props('outlined dense clearable').classes('w-64')
                         ui.button(icon='refresh', on_click=lambda: assignment_container.refresh()).props('flat round color=zinc-500')
+                        ui.button('Global Bootstrap', icon='verified_user', color='sky', on_click=lambda: ctx.emit("iac:webhook_verified", {"pipeline_type": "bootstrap_compliance", "limit": "all", "manual": True})).props('flat rounded size=sm').bind_enabled_from(state, 'is_running', backward=lambda x: not x).tooltip("Run compliance/baseline (as root) across ALL hosts")
+                        ui.button('Global Adopt', icon='move_to_inbox', color='amber-7', on_click=lambda: ctx.emit("iac:webhook_verified", {"pipeline_type": "adopt_host", "limit": "all", "manual": True})).props('flat rounded size=sm').bind_enabled_from(state, 'is_running', backward=lambda x: not x).tooltip("Import every managed container (all sites) into Terraform state")
                         ui.button('Global Rollout', icon='public', color='emerald', on_click=lambda: ctx.emit("iac:webhook_verified", {"pipeline_type": "rollout", "limit": "all", "manual": True})).props('unelevated rounded size=sm').bind_enabled_from(state, 'is_running', backward=lambda x: not x).tooltip("Trigger full infrastructure rollout")
 
                 @ui.refreshable
@@ -330,6 +332,8 @@ async def render_dashboard(ctx, service):
                                         ui.icon('domain', size='24px').classes('text-slate-400')
                                         ui.label(site.upper()).classes('text-xl font-black tracking-widest text-slate-800 dark:text-slate-200')
                                         ui.space()
+                                        ui.button('Site Bootstrap', icon='verified_user', on_click=lambda s=site: ctx.emit("iac:webhook_verified", {"pipeline_type": "bootstrap_compliance", "limit": s, "manual": True})).props('flat rounded size=sm color=sky').bind_enabled_from(state, 'is_running', backward=lambda x: not x).tooltip(f"Run compliance/baseline (as root) across all {site.upper()} hosts")
+                                        ui.button('Site Adopt', icon='move_to_inbox', on_click=lambda s=site: ctx.emit("iac:webhook_verified", {"pipeline_type": "adopt_host", "limit": s, "manual": True})).props('flat rounded size=sm color=amber-7').bind_enabled_from(state, 'is_running', backward=lambda x: not x).tooltip(f"Import all managed {site.upper()} containers into Terraform state")
                                         ui.button('Site Rollout', icon='rocket_launch', on_click=lambda s=site: ctx.emit("iac:webhook_verified", {"pipeline_type": "rollout", "limit": s, "manual": True})).props('flat rounded size=sm color=slate').bind_enabled_from(state, 'is_running', backward=lambda x: not x).tooltip(f"Rollout all hosts in {site.upper()}")
 
                                     for stage, items in sorted(stages.items()):
