@@ -39,13 +39,27 @@ _PIPELINE_LABELS = {
     "rollout":              "Full Rollout",
     "infra_plan":           "Infrastructure Plan (Check Env)",
     "infra_apply":          "Infrastructure Deploy",
-    "bootstrap_compliance": "Compliance Bootstrap",
+    "init_host":            "Host Init (Terraform)",
+    "bootstrap_compliance": "Compliance Bootstrap (root)",
+    "compliance":           "Compliance",
     "connectivity":         "Connectivity Test",
 }
 
 
 def _pipeline_label(pipeline_type: str) -> str:
     return _PIPELINE_LABELS.get(pipeline_type, pipeline_type)
+
+
+def _pipeline_label_with_target(pipeline_type: str, payload: dict) -> str:
+    """Base label plus the thing it acts on, e.g. 'Host Init docker-devops',
+    'Service Deploy aac-traefik', 'Full Rollout onprem'. Falls back to the bare
+    label when there is no specific target (e.g. a global rollout)."""
+    base = _pipeline_label(pipeline_type)
+    limit = str(payload.get("limit") or "").strip()
+    if limit.lower() == "all":
+        limit = ""
+    target = str(payload.get("host_name") or payload.get("service_name") or limit or "").strip()
+    return f"{base} {target}" if target else base
 
 
 def _fmt_duration(secs: int) -> str:
@@ -814,7 +828,7 @@ class DeploymentEngine:
                         return
 
                     self._active_single_service_keys.add(single_key)
-            if pipeline_type in ("host_provision", "bootstrap_compliance"):
+            if pipeline_type in ("host_provision", "bootstrap_compliance", "init_host", "compliance"):
                 host_name = str(
                     payload.get("host_name")
                     or payload.get("test_host")
@@ -861,8 +875,12 @@ class DeploymentEngine:
             db_type = f"single_service:{payload.get('service_name')}"
         elif pipeline_type == "host_provision":
             db_type = f"host_provision:{payload.get('host_name')}"
+        elif pipeline_type == "init_host":
+            db_type = f"init_host:{payload.get('host_name')}"
         elif pipeline_type == "bootstrap_compliance":
             db_type = f"bootstrap_compliance:{payload.get('host_name')}"
+        elif pipeline_type == "compliance":
+            db_type = f"compliance:{payload.get('host_name')}"
         elif pipeline_type == "rollout":
             # Host-scoped rollouts (e.g. the host_provision hand-off or the
             # Assignments 'Deploy Host' button) are tagged rollout:<host> so the
@@ -884,7 +902,7 @@ class DeploymentEngine:
         # the "started_at" timestamp stays consistent across the three envelopes.
         _run_start_mono = time.monotonic()
         _run_start_ts = datetime.now(timezone.utc).isoformat()
-        pipeline_label = _pipeline_label(pipeline_type)
+        pipeline_label = _pipeline_label_with_target(pipeline_type, payload)
 
         # Sticky "started" notification routed through the central router.
         # The same notification_id will be upserted by later succeeded/failed
@@ -919,7 +937,7 @@ class DeploymentEngine:
             SyncRepoStage("config_engine"),
             SyncRepoStage("aac_factory"),
         ]
-        if pipeline_type in ("host_provision", "adopt_host"):
+        if pipeline_type in ("host_provision", "adopt_host", "init_host"):
             pipeline.append(SyncRepoStage("infra_engine"))
         pipeline.extend([
             # Refresh inventory_state right before generation to minimize staleness windows.
@@ -963,6 +981,14 @@ class DeploymentEngine:
                 pipeline.append(InvalidateHostStateStage(host_name=host_name))
                 pipeline.append(TriggerHostRolloutStage(host_name=host_name))
             pipeline.append(DynamicRuleExecutionStage(pipeline_type))
+        elif pipeline_type == "init_host":
+            # Terraform-only: bring the bare container into existence. No Ansible
+            # bootstrap, no compliance, no service deploy — just provision the host
+            # (the "Init" step before Bootstrap in the Assignments tab).
+            host_name = payload.get("host_name")
+            context["host_name"] = host_name
+            pipeline.append(TerraformProvisionStage(host_name=host_name))
+            pipeline.append(DynamicRuleExecutionStage(pipeline_type))
         elif pipeline_type == "adopt_host":
             # Import existing CT(s) into Terraform state (then plan to verify) so
             # manually-created containers come under management without recreation.
@@ -992,6 +1018,24 @@ class DeploymentEngine:
                 )
             pipeline.extend([
                 bootstrap_stage,
+                DynamicRuleExecutionStage(pipeline_type),
+            ])
+        elif pipeline_type == "compliance":
+            # Same baseline compliance playbook as bootstrap, but run as the normal
+            # svc account (ansible-agent) over the standard inventory — no root, no
+            # service deployment. Used for recurring baseline/compliance enforcement
+            # once the host has already been bootstrapped. `host_name` targets one
+            # host; `limit` ('all' or a site) runs it across that group.
+            host_name = payload.get("host_name")
+            _limit = host_name or payload.get("limit") or "all"
+            pipeline.extend([
+                AnsiblePlaybookStage(
+                    name_override=f"Compliance: {_limit}",
+                    playbook_path="playbooks/cd_playbooks/cd_compliance.yml",
+                    inventory_path="global/ansible/inventory.yml",
+                    limit=_limit,
+                    # Defaults: remote_user="ansible-agent", ssh_key_secret="ansible_ssh_key".
+                ),
                 DynamicRuleExecutionStage(pipeline_type),
             ])
         elif pipeline_type == "infra_plan":

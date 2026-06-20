@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
-from .pipeline_meta import classify, get_phases, PHASE_OTHER, TASK_NAME_TO_PHASE, PHASE_PROVISION
+from .pipeline_meta import classify, describe, get_phases, PHASE_OTHER, TASK_NAME_TO_PHASE, PHASE_PROVISION
 
 _SUCCESS = {"SUCCESS"}
 _FAILURE = {"FAILED", "ERROR", "ABORTED"}
@@ -71,7 +71,7 @@ def _enrich(job: dict) -> dict:
     return {
         "id": job.get("id"),
         "pipeline_type": job.get("pipeline_type"),
-        "type_label": meta.label,
+        "type_label": describe(job.get("pipeline_type", "")),
         "phase": meta.phase,
         "icon": meta.icon,
         "color": meta.color,

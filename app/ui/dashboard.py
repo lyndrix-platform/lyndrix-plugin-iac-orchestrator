@@ -9,7 +9,7 @@ from ui.theme import UIStyles
 from .overview_dashboard import render_overview_dashboard
 from .terraform import render_terraform_panel
 from . import components as c
-from ..controller.pipeline_meta import classify
+from ..controller.pipeline_meta import classify, describe
 
 DOCKER_ICON = 'svg:M6.1,10L0,10.1V13h6.1V10z M13.1,10H7v3h6.1V10z M20.1,10H14v3h6.1V10z M13.1,3H7v3h6.1V3z'
 
@@ -353,9 +353,11 @@ async def render_dashboard(ctx, service):
                                                                     ui.icon('dns', size='18px').classes('text-slate-400')
                                                                     ui.label(host).classes('text-md font-bold text-slate-800 dark:text-slate-300 truncate max-w-[150px]').tooltip(host)
                                                                 with ui.row().classes('gap-1 items-center'):
-                                                                    ui.button('Bootstrap', icon='verified_user', on_click=lambda h=host: ctx.emit("iac:webhook_verified", {"pipeline_type": "bootstrap_compliance", "host_name": h, "manual": True})).props('unelevated rounded size=sm color=sky').tooltip(f"Run initial compliance/baseline as root on {host}").bind_enabled_from(state, 'is_running', backward=lambda x: not x)
-                                                                    ui.button('Deploy Host', icon='rocket', on_click=lambda h=host: ctx.emit("iac:webhook_verified", {"pipeline_type": "rollout", "limit": h, "manual": True})).props('unelevated rounded size=sm color=indigo').tooltip(f"Deploy to {host}").bind_enabled_from(state, 'is_running', backward=lambda x: not x)
-                                                                    ui.button('Adopt', icon='move_to_inbox', on_click=lambda h=host: ctx.emit("iac:webhook_verified", {"pipeline_type": "adopt_host", "host_name": h, "manual": True})).props('unelevated rounded size=sm color=amber-7').tooltip(f"Import the existing container for {host} into Terraform state (import + plan, no apply)").bind_enabled_from(state, 'is_running', backward=lambda x: not x)
+                                                                    ui.button('Adopt Host', icon='move_to_inbox', on_click=lambda h=host: ctx.emit("iac:webhook_verified", {"pipeline_type": "adopt_host", "host_name": h, "manual": True})).props('unelevated rounded size=sm color=amber-7').tooltip(f"Import the existing container for {host} into Terraform state (import + plan, no apply)").bind_enabled_from(state, 'is_running', backward=lambda x: not x)
+                                                                    ui.button('Init Host', icon='dns', on_click=lambda h=host: ctx.emit("iac:webhook_verified", {"pipeline_type": "init_host", "host_name": h, "manual": True})).props('unelevated rounded size=sm color=deep-purple').tooltip(f"Provision the container for {host} via Terraform only (no Ansible, no services)").bind_enabled_from(state, 'is_running', backward=lambda x: not x)
+                                                                    ui.button('Bootstrap Host', icon='verified_user', on_click=lambda h=host: ctx.emit("iac:webhook_verified", {"pipeline_type": "bootstrap_compliance", "host_name": h, "manual": True})).props('unelevated rounded size=sm color=sky').tooltip(f"Run the initial compliance/baseline playbook as root on {host} (creates the ansible-agent account)").bind_enabled_from(state, 'is_running', backward=lambda x: not x)
+                                                                    ui.button('Compliance Host', icon='fact_check', on_click=lambda h=host: ctx.emit("iac:webhook_verified", {"pipeline_type": "compliance", "host_name": h, "manual": True})).props('unelevated rounded size=sm color=teal').tooltip(f"Re-run the compliance baseline as the svc user (ansible-agent) on {host} — no service deployment").bind_enabled_from(state, 'is_running', backward=lambda x: not x)
+                                                                    ui.button('Deploy Services', icon='rocket', on_click=lambda h=host: ctx.emit("iac:webhook_verified", {"pipeline_type": "rollout", "limit": h, "manual": True})).props('unelevated rounded size=sm color=indigo').tooltip(f"Deploy this host's services to {host}").bind_enabled_from(state, 'is_running', backward=lambda x: not x)
 
                                                             with ui.row().classes('gap-1.5 pt-1'):
                                                                 for svc in svcs:
@@ -411,9 +413,9 @@ async def render_dashboard(ctx, service):
                 with ui.row().classes('w-full items-center justify-between gap-2 flex-wrap'):
                     with ui.row().classes('items-center gap-2 min-w-0 flex-1'):
                         ui.icon(pdef.icon, size='16px').classes(c.accent_text(pdef.color))
-                        ui.label(pdef.label).classes(
+                        ui.label(describe(p_type)).classes(
                             'text-sm font-bold text-slate-800 dark:text-zinc-100 truncate'
-                        )
+                        ).tooltip(describe(p_type))
                     c.status_badge(status)
 
                 # Row 2: job ID · start time · duration

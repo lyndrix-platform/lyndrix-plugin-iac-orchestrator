@@ -72,6 +72,9 @@ _KNOWN_TYPES: Dict[str, PipelineTypeDef] = {
     # alias so historical jobs still classify correctly.
     "host_provision":      PipelineTypeDef("Host Provisioning", PHASE_PROVISION, "dns", "violet"),
     "terraform_provision": PipelineTypeDef("Host Provisioning", PHASE_PROVISION, "dns", "violet"),
+    # init_host is the Terraform-only "create the container" step (no Ansible/services),
+    # surfaced as the per-host "Init" button in the Assignments tab.
+    "init_host":           PipelineTypeDef("Host Init", PHASE_PROVISION, "dns", "violet"),
     # adopt_host imports an existing CT into Terraform state (then plans to verify),
     # bringing a manually-created container under management without recreating it.
     "adopt_host":          PipelineTypeDef("Adopt Existing", PHASE_PROVISION, "move_to_inbox", "violet"),
@@ -86,6 +89,9 @@ _KNOWN_TYPES: Dict[str, PipelineTypeDef] = {
     "connectivity": PipelineTypeDef("Connectivity Check", PHASE_CONFIGURE, "lan", "sky"),
     "rollout":      PipelineTypeDef("Full Rollout", PHASE_CONFIGURE, "public", "sky"),
     "bootstrap_compliance": PipelineTypeDef("Compliance Bootstrap", PHASE_CONFIGURE, "verified_user", "sky"),
+    # compliance re-runs the baseline playbook as the svc user (ansible-agent), no
+    # service deploy — the per-host "Compliance" button in the Assignments tab.
+    "compliance":           PipelineTypeDef("Compliance", PHASE_CONFIGURE, "fact_check", "teal"),
     # --- Deploy (Services) ---
     "single_service": PipelineTypeDef("Service Deploy", PHASE_DEPLOY, "rocket", "emerald"),
 }
@@ -130,6 +136,21 @@ def classify(pipeline_type: str) -> PipelineTypeDef:
 def phase_of(pipeline_type: str) -> str:
     """Convenience: return just the phase id for a pipeline type."""
     return classify(pipeline_type).phase
+
+
+def describe(pipeline_type: str) -> str:
+    """Human-readable label *including the target*, for history/feeds.
+
+    The stored ``pipeline_type`` carries the target after a colon
+    (``init_host:docker-devops``, ``single_service:aac-traefik``,
+    ``rollout:onprem``). This returns e.g. ``"Host Init docker-devops"`` so the
+    UI shows *what* a run acted on, not just its category. Falls back to the bare
+    label when no target is present (e.g. a global ``rollout``).
+    """
+    raw = (pipeline_type or "").strip()
+    label = classify(raw).label
+    target = raw.split(":", 1)[1].strip() if ":" in raw else ""
+    return f"{label} {target}" if target else label
 
 
 # Maps IaCJobTask.task_name values (from host_provision sub-tasks) to lifecycle phases.
