@@ -159,6 +159,32 @@ class TerraformProvisionStage(BaseStage):
         return StageResult(success, msg, data=data)
 
 
+class TerraformAdoptStage(BaseStage):
+    """Adopt an already-existing CT into Terraform state: imports it (guarded) and
+    then plans to verify — never applies. Brings a live, manually-created container
+    under management so the next plan reconciles in place instead of proposing a
+    create. Runs in an ephemeral OpenTofu container (no host shell needed)."""
+
+    def __init__(self, host_name: str):
+        super().__init__(f"Terraform Adopt: {host_name or 'unknown-host'}")
+        self.host_name = str(host_name or "").strip()
+
+    async def run(self, engine, context: dict) -> StageResult:
+        if not self.host_name:
+            return StageResult(False, "Missing host_name for adopt_host pipeline.")
+        success, data = await engine.execute_terraform_provision(
+            host_name=self.host_name,
+            job_id=context.get("job_id", 0),
+            mode="import",
+            adopt_existing=True,
+        )
+        msg = (
+            f"Adopted '{self.host_name}' into Terraform state (imported + planned)."
+            if success else f"Adopt/import failed for '{self.host_name}'."
+        )
+        return StageResult(success, msg, data=data)
+
+
 class InfraPlanStage(BaseStage):
     """Whole-infrastructure read-only plan ("Check Env"): runs ``tofu plan``
     across every non-empty environment without applying anything."""
@@ -843,7 +869,7 @@ class DeploymentEngine:
             SyncRepoStage("config_engine"),
             SyncRepoStage("aac_factory"),
         ]
-        if pipeline_type == "host_provision":
+        if pipeline_type in ("host_provision", "adopt_host"):
             pipeline.append(SyncRepoStage("infra_engine"))
         pipeline.extend([
             # Refresh inventory_state right before generation to minimize staleness windows.
@@ -854,7 +880,7 @@ class DeploymentEngine:
         # For single_service runs we do not persist generated inventory back to inventory_state.
         # This avoids unnecessary commit/push contention and keeps service deploys focused.
         # infra_plan is read-only (Check Env) and likewise must not commit state.
-        if pipeline_type not in ("single_service", "infra_plan"):
+        if pipeline_type not in ("single_service", "infra_plan", "adopt_host"):
             pipeline.append(CommitPushStage("inventory_state", "ci: automated state update"))
         
         if pipeline_type == "single_service":
@@ -887,6 +913,13 @@ class DeploymentEngine:
                 pipeline.append(InvalidateHostStateStage(host_name=host_name))
                 pipeline.append(TriggerHostRolloutStage(host_name=host_name))
             pipeline.append(DynamicRuleExecutionStage(pipeline_type))
+        elif pipeline_type == "adopt_host":
+            # Import an existing CT into Terraform state (then plan to verify) so a
+            # manually-created container comes under management without recreation.
+            # No bootstrap/deploy/apply — just adopt + plan.
+            host_name = payload.get("host_name")
+            context["host_name"] = host_name
+            pipeline.append(TerraformAdoptStage(host_name=host_name))
         elif pipeline_type == "bootstrap_compliance":
             pipeline.extend([
                 ComplianceBootstrapStage(host_name=payload.get("host_name")),
@@ -1678,7 +1711,9 @@ class DeploymentEngine:
         target_flags = "".join(f" -target='{t}'" for t in (targets or []))
         run_dir = f"/data/storage/git_repos/{run_rel_dir}"
         do_apply = mode == "apply" and (force_apply or self.config.auto_apply)
-        if mode == "plan":
+        if mode in ("plan", "import"):
+            # 'import' adopts existing CTs into state (via import_cmd below), then
+            # plans to verify the result — it never applies.
             action_cmd = f"{tf_bin} plan -input=false -no-color{target_flags}"
         else:
             plan_cmd = (
@@ -1694,7 +1729,7 @@ class DeploymentEngine:
         # so it's reconciled in place, not destroyed/recreated. Guarded (skip if
         # already tracked) and non-fatal (a not-yet-existing CT falls through to apply).
         import_cmd = ""
-        if import_specs and do_apply:
+        if import_specs and (mode == "import" or do_apply):
             parts = []
             for spec in import_specs:
                 addr, ref = spec.get("addr", ""), spec.get("ref", "")
@@ -1848,9 +1883,9 @@ class DeploymentEngine:
         # reconciles it in place instead of destroy/recreate. Mirrors the logic of
         # import_existing_cts.sh, but inlined into the runner shell (the OpenTofu
         # image has sh+grep+tofu but not bash/jq/curl). Apply-path only — never
-        # mutate state on a read-only plan.
+        # mutate state on a read-only plan. mode 'import' adopts-then-plans (no apply).
         import_specs = None
-        if adopt_existing and mode == "apply":
+        if adopt_existing and mode in ("apply", "import"):
             try:
                 with open(ctx["tfvars_path"], "r", encoding="utf-8") as fh:
                     _tfvars = json.load(fh) or {}
