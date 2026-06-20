@@ -1,9 +1,7 @@
 import asyncio
 import fnmatch
 import json
-import re
 import yaml
-from pathlib import Path
 from core.logger import get_logger
 
 from .base import BaseStage
@@ -114,6 +112,66 @@ class DynamicRuleExecutionStage(BaseStage):
                 changed.append(host)
         return changed
 
+    @staticmethod
+    def _extract_host_baseline_roles(inventory: dict) -> dict:
+        """Walk a generated Ansible inventory and return ``{hostname: set(roles)}``
+        for every host that declares ``baseline_roles``, regardless of how deeply
+        the host is nested under ``all`` / ``children`` groups."""
+        result: dict[str, set] = {}
+
+        def _walk(node):
+            if not isinstance(node, dict):
+                return
+            hosts = node.get("hosts")
+            if isinstance(hosts, dict):
+                for host, hv in hosts.items():
+                    if isinstance(hv, dict) and isinstance(hv.get("baseline_roles"), list):
+                        result.setdefault(host, set()).update(
+                            str(r) for r in hv["baseline_roles"]
+                        )
+            children = node.get("children")
+            if isinstance(children, dict):
+                for child in children.values():
+                    _walk(child)
+
+        _walk(inventory)
+        if isinstance(inventory, dict):
+            for top in inventory.values():
+                _walk(top)
+        return result
+
+    async def _changed_baseline_roles(self, engine, inventory_file: str) -> dict:
+        """Diff per-host ``baseline_roles`` between HEAD~1 and HEAD of the generated
+        inventory. Returns ``{host: [added_roles]}`` for hosts that *gained* a role,
+        so a single newly-assigned role deploys only that role on only that host."""
+        rc_new, new_raw = await self._git(engine, "show", f"HEAD:{inventory_file}")
+        if rc_new != 0:
+            return {}
+        try:
+            new_inv = yaml.safe_load(new_raw) or {}
+        except Exception:
+            return {}
+        old_inv = {}
+        rc_old, old_raw = await self._git(engine, "show", f"HEAD~1:{inventory_file}")
+        if rc_old == 0:
+            try:
+                old_inv = yaml.safe_load(old_raw) or {}
+            except Exception:
+                old_inv = {}
+        new_map = self._extract_host_baseline_roles(new_inv)
+        old_map = self._extract_host_baseline_roles(old_inv)
+        changed: dict[str, list] = {}
+        for host, new_roles in new_map.items():
+            # Brand-new hosts (absent from the previous inventory) are provisioned by
+            # the host_provision pipeline — don't try to role-patch an unprovisioned,
+            # unreachable host here. Only patch hosts that already existed.
+            if host not in old_map:
+                continue
+            added = sorted(new_roles - old_map[host])
+            if added:
+                changed[host] = added
+        return changed
+
     # --------------------------------------------------------------- actions
     async def _run_legacy_action(self, engine, context, action, changed_services):
         target = action.get("playbook", "")
@@ -143,14 +201,23 @@ class DynamicRuleExecutionStage(BaseStage):
         if not hosts:
             log.info("Terraform rule matched but no host-level changes detected; nothing to provision.")
             return StageResult(True, "Terraform: no changed hosts.")
-        verb = "APPLY" if apply else "PLAN"
-        log.info(f"Terraform rule -> {verb} for changed host(s): {', '.join(hosts)}")
+        # Plan-by-default: a rule NEVER force-applies. mode:plan ALWAYS plans (a hard
+        # gate, e.g. prod). mode:apply is merely *eligible* to apply, and only does so
+        # when the operator has enabled the global auto_apply switch (or approves a
+        # per-run). So Terraform can never fire on a dev host without a deliberate
+        # opt-in — until then every change just yields a reviewable plan.
+        verb = "apply-eligible" if apply else "plan"
+        intent = "apply-eligible (gated by auto_apply)" if apply else "plan-only"
+        log.info(f"Terraform rule -> {intent} for changed host(s): {', '.join(hosts)}")
+        adopt = bool(action.get("adopt_existing", False))
         for host in hosts:
             try:
                 ok, _ = await engine.execute_terraform_provision(
                     host_name=host,
                     job_id=context.get("job_id", 0),
-                    force_apply=apply,  # plan-only unless the rule explicitly opts into apply
+                    mode=mode,            # 'plan' is a hard gate; 'apply' still needs auto_apply/approve
+                    force_apply=False,    # never bypass the auto_apply guard from a rule
+                    adopt_existing=adopt,
                 )
             except Exception as e:
                 return StageResult(False, f"Terraform {verb} failed for '{host}': {e}")
@@ -181,6 +248,43 @@ class DynamicRuleExecutionStage(BaseStage):
             context["_rules_deployed_services"] = list(already | set(target_services))
         return res
 
+    async def _run_baseline_role_action(self, engine, context, action, changed_files):
+        """Run ONLY the newly-added baseline role(s) on the host(s) that gained
+        them, via ``cd_single_role_rollout.yml`` (``-e role_to_run``, ``--limit <host>``).
+        Role names are passed through verbatim, exactly as ``cd_baseline_roles.yml``
+        feeds them to ``include_role``."""
+        inv_files = {f for f in changed_files if f.endswith("ansible/inventory.yml")}
+        if not inv_files:
+            inv_files = {"global/ansible/inventory.yml"}
+        host_roles: dict[str, list] = {}
+        for inv in inv_files:
+            for host, roles in (await self._changed_baseline_roles(engine, inv)).items():
+                bucket = host_roles.setdefault(host, [])
+                for r in roles:
+                    if r not in bucket:
+                        bucket.append(r)
+        if not host_roles:
+            return StageResult(True, "Baseline roles: no host gained a role.")
+        playbook = action.get("playbook", "playbooks/cd_playbooks/cd_single_role_rollout.yml")
+        inventory = action.get("inventory", "global/ansible/inventory.yml")
+        applied = 0
+        for host, roles in host_roles.items():
+            for role in roles:
+                stage = AnsiblePlaybookStage(
+                    name_override=f"Baseline role '{role}' -> {host}",
+                    playbook_path=playbook,
+                    inventory_path=inventory,
+                    limit=host,
+                    extra_vars={"role_to_run": role},
+                )
+                res = await stage.run(engine, context)
+                if not res.success:
+                    return res
+                applied += 1
+        return StageResult(
+            True, f"Baseline roles: applied {applied} role(s) across {len(host_roles)} host(s)."
+        )
+
     async def _run_action(self, engine, context, action, changed_files, changed_services, path_vars):
         atype = str(action.get("type", "")).strip().lower()
         if not atype:
@@ -189,6 +293,8 @@ class DynamicRuleExecutionStage(BaseStage):
             return await self._run_terraform_action(engine, context, action, changed_files, path_vars)
         if atype == "service_rollout":
             return await self._run_service_rollout_action(engine, context, action, changed_services, path_vars)
+        if atype == "baseline_role":
+            return await self._run_baseline_role_action(engine, context, action, changed_files)
         if atype in ("baseline", "connectivity"):
             playbook = action.get("playbook") or (
                 "playbooks/cd_playbooks/cd_baseline_roles.yml" if atype == "baseline"
@@ -240,24 +346,40 @@ class DynamicRuleExecutionStage(BaseStage):
         if changed_services:
             log.info(f"Differential deployment triggered for: {changed_services}")
 
-        matched_rule = None
-        path_vars: dict = {}
+        # Collect EVERY rule whose paths match the change set, not just the first.
+        # A single push (e.g. a new host) touches both terraform.tfvars.json and
+        # inventory.yml, so the terraform AND baseline_role rules must both fire.
+        matched_rules: list[tuple[dict, dict]] = []  # (rule, path_vars)
         for rule in rules_config.get("rules", []):
             patterns = rule.get("paths", [])
+            rule_path_vars: dict = {}
+            matched = False
             for f in changed_files:
                 if any(fnmatch.fnmatch(f, p) for p in patterns):
-                    matched_rule = rule
-                    path_vars = self._capture_path_vars(f)
-                    break
-            if matched_rule:
-                break
+                    matched = True
+                    if not rule_path_vars:
+                        rule_path_vars = self._capture_path_vars(f)
+            if matched:
+                matched_rules.append((rule, rule_path_vars))
 
-        actions = matched_rule.get("actions", []) if matched_rule else rules_config.get("default", [])
-        if not actions:
+        if matched_rules:
+            log.info(f"{len(matched_rules)} rule(s) matched the change set: "
+                     f"{', '.join(r.get('name', '?') for r, _ in matched_rules)}")
+        else:
+            default_actions = rules_config.get("default", [])
+            if not default_actions:
+                return StageResult(True, "No rules matched and no default actions.")
+            matched_rules = [({"name": "default", "actions": default_actions}, {})]
+
+        ran_any = False
+        for rule, path_vars in matched_rules:
+            for action in rule.get("actions", []):
+                ran_any = True
+                res = await self._run_action(
+                    engine, context, action, changed_files, changed_services, path_vars
+                )
+                if not res.success:
+                    return res
+        if not ran_any:
             return StageResult(True, "No actions performed.")
-
-        for action in actions:
-            res = await self._run_action(engine, context, action, changed_files, changed_services, path_vars)
-            if not res.success:
-                return res
         return StageResult(True, "Dynamic rule-based execution completed.")

@@ -28,6 +28,7 @@ from ...stages.ansible import (
     AsyncBulkRolloutStage,
     ServiceDeployStage
 )
+from ...stages.rules import DynamicRuleExecutionStage
 
 log = logging.getLogger("IaC:Engine")
 
@@ -148,6 +149,7 @@ class TerraformProvisionStage(BaseStage):
             host_name=self.host_name,
             job_id=context.get("job_id", 0),
             force_apply=force_apply,
+            adopt_existing=bool(payload.get("adopt_existing")),
         )
         # Tell downstream stages whether a fresh container was actually (re)created,
         # so a complete reinstall can invalidate stale per-host state before rollout.
@@ -293,13 +295,6 @@ class TriggerHostRolloutStage(BaseStage):
             "source": "host_provision_chain",
         })
         return StageResult(True, f"Host rollout queued for '{self.host_name}' (existing Deploy Host flow).")
-
-class DynamicRuleExecutionStage:
-    def __init__(self, pipeline_type: str):
-        self.name = f"Dynamic Rules: {pipeline_type}"
-        self.pipeline_type = pipeline_type
-    async def run(self, engine, context: dict) -> StageResult:
-        return StageResult(True, f"Dynamic rules evaluated for {self.pipeline_type}")
 
 class DetectDriftStage(BaseStage):
     def __init__(self):
@@ -1634,6 +1629,7 @@ class DeploymentEngine:
         mode: str = "apply",
         force_apply: bool = False,
         host_name: str = "",
+        import_specs: list[dict] | None = None,
     ) -> tuple[bool, dict]:
         """Run OpenTofu/Terraform in an ephemeral Docker container against a
         rendered run dir.
@@ -1678,10 +1674,29 @@ class DeploymentEngine:
                 else f"{tf_bin} show -no-color tfplan"
             )
             action_cmd = f"{plan_cmd}; {apply_cmd}"
+        # Optional adopt-existing step: import a live CT into state before plan/apply
+        # so it's reconciled in place, not destroyed/recreated. Guarded (skip if
+        # already tracked) and non-fatal (a not-yet-existing CT falls through to apply).
+        import_cmd = ""
+        if import_specs and do_apply:
+            parts = []
+            for spec in import_specs:
+                addr, ref = spec.get("addr", ""), spec.get("ref", "")
+                if not addr or not ref:
+                    continue
+                parts.append(
+                    f"if ! {tf_bin} state list 2>/dev/null | grep -qxF '{addr}'; then "
+                    f"echo '[adopt] importing {addr}'; "
+                    f"{tf_bin} import -input=false -no-color '{addr}' '{ref}' || "
+                    f"echo '[adopt] import skipped for {addr} (not present yet)'; "
+                    f"else echo '[adopt] {addr} already in state'; fi; "
+                )
+            import_cmd = "".join(parts)
         shell_cmd = (
             "set -euo pipefail; "
             f"cd '{run_dir}'; "
             f"{tf_bin} init -input=false -no-color; "
+            f"{import_cmd}"
             f"{action_cmd}"
         )
 
@@ -1752,7 +1767,8 @@ class DeploymentEngine:
         }
 
     async def execute_terraform_provision(
-        self, host_name: str, job_id: int, force_apply: bool = False
+        self, host_name: str, job_id: int, force_apply: bool = False,
+        mode: str = "apply", adopt_existing: bool = False,
     ) -> tuple[bool, dict]:
         host_name = str(host_name or "").strip().lower()
         if not host_name:
@@ -1811,14 +1827,38 @@ class DeploymentEngine:
             f'module.download.proxmox_virtual_environment_download_file.tpl["{node_name}"]',
             f'module.lxc_{node_name}.proxmox_virtual_environment_container.ct["{host_name}"]',
         ]
+
+        # Adopt an already-existing CT into state before apply, so Terraform
+        # reconciles it in place instead of destroy/recreate. Mirrors the logic of
+        # import_existing_cts.sh, but inlined into the runner shell (the OpenTofu
+        # image has sh+grep+tofu but not bash/jq/curl). Apply-path only — never
+        # mutate state on a read-only plan.
+        import_specs = None
+        if adopt_existing and mode == "apply":
+            try:
+                with open(ctx["tfvars_path"], "r", encoding="utf-8") as fh:
+                    _tfvars = json.load(fh) or {}
+                _cont = (_tfvars.get("containers") or {}).get(host_name) or {}
+                _vmid = _cont.get("vm_id")
+                if _vmid:
+                    import_specs = [{
+                        "addr": f'module.lxc_{node_name}.proxmox_virtual_environment_container.ct["{host_name}"]',
+                        "ref": f"{node_name}/{_vmid}",
+                    }]
+                else:
+                    log.warning("adopt_existing: no vm_id for host '%s' in tfvars; skipping import.", host_name)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("adopt_existing: could not build import spec for '%s': %s", host_name, exc)
+
         return await self.execute_terraform_docker(
             run_rel_dir=run_rel_dir,
             host_name=host_name,
             targets=targets,
-            mode="apply",
+            mode=mode,
             force_apply=force_apply,
             task_name=f"Terraform Provision: {host_name}",
             job_id=job_id,
+            import_specs=import_specs,
         )
 
     def _iter_terraform_environments(self) -> list[dict]:
