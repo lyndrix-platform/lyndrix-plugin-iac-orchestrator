@@ -27,6 +27,8 @@ class TerraformConfig(BaseModel):
     ip: Optional[str] = None
     gateway: Optional[str] = None
     nameserver: Optional[str] = None
+    mtu: Optional[int] = None
+    startup_order: Optional[int] = None
 
     # Allow all extra LXC container fields (cores, ram/memory, disk/disk_size,
     # bridge, vlan, arch, swap, unprivileged, nesting, etc.) to pass through
