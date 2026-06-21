@@ -34,7 +34,7 @@ CONTAINER_DEFAULTS = {
     "bridge": "vmbr0",
     "mac": "",
     "nameserver": "",
-    "searchdomain": "",
+    "searchdomain": "ad.fam-feser.de",
     "tags": [],
     "description": "",
 }
