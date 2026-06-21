@@ -36,11 +36,13 @@ log = logging.getLogger("IaC:Engine")
 _PIPELINE_LABELS = {
     "single_service":       "Service Deploy",
     "host_provision":       "Host Provisioning",
-    "rollout":              "Full Rollout",
+    "rollout":              "Full Service Rollout",
+    "adopt_host":           "Adopt Host",
     "infra_plan":           "Infrastructure Plan (Check Env)",
     "infra_apply":          "Infrastructure Deploy",
     "init_host":            "Host Init (Terraform)",
-    "bootstrap_compliance": "Compliance Bootstrap (root)",
+    "state_check":          "State Check",
+    "bootstrap_compliance": "Compliance Bootstrap",
     "compliance":           "Compliance",
     "connectivity":         "Connectivity Test",
 }
@@ -197,6 +199,48 @@ class TerraformAdoptStage(BaseStage):
             if success else f"Adopt/import failed for '{self.host_name}'."
         )
         return StageResult(success, msg, data=data)
+
+
+class TerraformStateCheckStage(BaseStage):
+    """Read-only live check: run ``tofu state list`` for the host's environment and
+    report whether its container resource is present in Terraform state. Never
+    plans, imports or applies — safe to run at any time."""
+
+    def __init__(self, host_name: str):
+        super().__init__(f"Terraform State Check: {host_name or 'unknown-host'}")
+        self.host_name = str(host_name or "").strip().lower()
+
+    async def run(self, engine, context: dict) -> StageResult:
+        if not self.host_name:
+            return StageResult(False, "Missing host_name for state check.")
+        try:
+            ctx = engine._find_terraform_context_for_host(self.host_name)
+        except Exception as exc:
+            return StageResult(False, f"State check: {exc}")
+        addr = (
+            f'module.lxc_{ctx["node_name"]}.proxmox_virtual_environment_container'
+            f'.ct["{self.host_name}"]'
+        )
+        success, data = await engine.execute_terraform_provision(
+            host_name=self.host_name,
+            job_id=context.get("job_id", 0),
+            mode="state_list",
+        )
+        present = False
+        try:
+            log_text = Path(
+                engine.config.get_log_path(context.get("job_id", 0))
+            ).read_text(encoding="utf-8", errors="replace")
+            present = addr in log_text
+        except Exception:
+            pass
+        verdict = "CREATED" if present else "NOT_CREATED"
+        context["tf_state_status"] = verdict
+        msg = f"Terraform state for '{self.host_name}': {verdict}."
+        return StageResult(
+            success, msg,
+            data={"status": verdict, "addr": addr, **(data if isinstance(data, dict) else {})},
+        )
 
 
 class TerraformAdoptScopeStage(BaseStage):
@@ -828,7 +872,7 @@ class DeploymentEngine:
                         return
 
                     self._active_single_service_keys.add(single_key)
-            if pipeline_type in ("host_provision", "bootstrap_compliance", "init_host", "compliance"):
+            if pipeline_type in ("host_provision", "bootstrap_compliance", "init_host", "compliance", "state_check"):
                 host_name = str(
                     payload.get("host_name")
                     or payload.get("test_host")
@@ -877,10 +921,17 @@ class DeploymentEngine:
             db_type = f"host_provision:{payload.get('host_name')}"
         elif pipeline_type == "init_host":
             db_type = f"init_host:{payload.get('host_name')}"
+        elif pipeline_type == "adopt_host":
+            # Host-scoped adopt is tagged adopt_host:<host> so History/feeds show the
+            # target (a scope/'all' adopt stays bare "adopt_host").
+            _h = str(payload.get("host_name") or "").strip()
+            db_type = f"adopt_host:{_h}" if _h else "adopt_host"
         elif pipeline_type == "bootstrap_compliance":
             db_type = f"bootstrap_compliance:{payload.get('host_name')}"
         elif pipeline_type == "compliance":
             db_type = f"compliance:{payload.get('host_name')}"
+        elif pipeline_type == "state_check":
+            db_type = f"state_check:{payload.get('host_name')}"
         elif pipeline_type == "rollout":
             # Host-scoped rollouts (e.g. the host_provision hand-off or the
             # Assignments 'Deploy Host' button) are tagged rollout:<host> so the
@@ -937,7 +988,7 @@ class DeploymentEngine:
             SyncRepoStage("config_engine"),
             SyncRepoStage("aac_factory"),
         ]
-        if pipeline_type in ("host_provision", "adopt_host", "init_host"):
+        if pipeline_type in ("host_provision", "adopt_host", "init_host", "state_check"):
             pipeline.append(SyncRepoStage("infra_engine"))
         pipeline.extend([
             # Refresh inventory_state right before generation to minimize staleness windows.
@@ -948,7 +999,7 @@ class DeploymentEngine:
         # For single_service runs we do not persist generated inventory back to inventory_state.
         # This avoids unnecessary commit/push contention and keeps service deploys focused.
         # infra_plan is read-only (Check Env) and likewise must not commit state.
-        if pipeline_type not in ("single_service", "infra_plan", "adopt_host"):
+        if pipeline_type not in ("single_service", "infra_plan", "adopt_host", "state_check"):
             pipeline.append(CommitPushStage("inventory_state", "ci: automated state update"))
         
         if pipeline_type == "single_service":
@@ -989,6 +1040,11 @@ class DeploymentEngine:
             context["host_name"] = host_name
             pipeline.append(TerraformProvisionStage(host_name=host_name))
             pipeline.append(DynamicRuleExecutionStage(pipeline_type))
+        elif pipeline_type == "state_check":
+            # Read-only: `tofu state list` for the host; reports CREATED/NOT_CREATED.
+            host_name = payload.get("host_name")
+            context["host_name"] = host_name
+            pipeline.append(TerraformStateCheckStage(host_name=host_name))
         elif pipeline_type == "adopt_host":
             # Import existing CT(s) into Terraform state (then plan to verify) so
             # manually-created containers come under management without recreation.
@@ -1824,7 +1880,10 @@ class DeploymentEngine:
         target_flags = "".join(f" -target='{t}'" for t in (targets or []))
         run_dir = f"/data/storage/git_repos/{run_rel_dir}"
         do_apply = mode == "apply" and (force_apply or self.config.auto_apply)
-        if mode in ("plan", "import"):
+        if mode == "state_list":
+            # Read-only: list the resources tracked in state. Never plans or applies.
+            action_cmd = f"{tf_bin} state list -no-color"
+        elif mode in ("plan", "import"):
             # 'import' adopts existing CTs into state (via import_cmd below), then
             # plans to verify the result — it never applies.
             action_cmd = f"{tf_bin} plan -input=false -no-color{target_flags}"

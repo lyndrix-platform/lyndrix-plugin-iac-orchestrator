@@ -25,11 +25,75 @@ mode is handled centrally.
 """
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import yaml
 from nicegui import ui
 from ui.theme import UIStyles
 
 from . import components as c
+
+# Provider is bpg/proxmox across all rendered environments (see terraform-templates).
+_TF_PROVIDER = "bpg/proxmox"
+
+# Map a host's most-recent terraform-type job status to a tile state.
+_TF_JOB_PREFIXES = ("init_host", "host_provision", "adopt_host")
+
+
+def _tfvars_host_index(config) -> dict:
+    """One-pass index of every host that appears in a rendered
+    ``inventory_state/<site>/<stage>/terraform/terraform.tfvars.json``.
+
+    Returns ``{host_name: {"node": <node_name>, "env": "<site>_<stage>"}}`` so the
+    provisioning tiles can show the real Terraform provider/resource without an
+    rglob per host. Provider/resource aren't in the source host YAML — they only
+    exist in the generated tfvars + module structure.
+    """
+    index: dict[str, dict] = {}
+    inv_root = config.git_repos_dir / "inventory_state"
+    if not inv_root.exists():
+        return index
+    for tfvars_path in inv_root.glob("*/*/terraform/terraform.tfvars.json"):
+        try:
+            with open(tfvars_path, "r", encoding="utf-8") as fh:
+                data = json.load(fh) or {}
+        except Exception:
+            continue
+        try:
+            stage = tfvars_path.parents[1].name
+            site = tfvars_path.parents[2].name
+        except IndexError:
+            continue
+        for host_name, cfg in (data.get("containers") or {}).items():
+            if not isinstance(cfg, dict):
+                continue
+            node = str(cfg.get("node_name") or "").strip()
+            index[host_name] = {"node": node, "env": f"{site}_{stage}"}
+    return index
+
+
+def _host_state_from_jobs(jobs: list, host: str) -> str:
+    """Derive a tile status from the most recent terraform-type job for ``host``.
+
+    ``jobs`` is ``db.get_jobs_for_stats()`` (newest first), whose ``pipeline_type``
+    is tagged ``<type>:<host>``. Returns one of: created / failed / provisioning /
+    not provisioned.
+    """
+    for job in jobs:  # newest-first
+        ptype = str(job.get("pipeline_type") or "")
+        base, _, target = ptype.partition(":")
+        if base not in _TF_JOB_PREFIXES or target.strip().lower() != host.lower():
+            continue
+        status = str(job.get("status") or "").upper()
+        if status == "SUCCESS":
+            return "created"
+        if status in ("FAILED", "ERROR", "ABORTED"):
+            return "failed"
+        if status == "RUNNING":
+            return "provisioning"
+        return "unknown"
+    return "not provisioned"
 
 
 def _scan_terraform_hosts(ctx, service) -> list:
@@ -43,6 +107,14 @@ def _scan_terraform_hosts(ctx, service) -> list:
     if not sites_dir.exists():
         return results
 
+    # Derive the real Terraform metadata once: provider/resource come from the
+    # generated tfvars (not the source host YAML), status from job history.
+    tf_index = _tfvars_host_index(config)
+    try:
+        recent_jobs = service.db.get_jobs_for_stats(500)
+    except Exception:
+        recent_jobs = []
+
     for yaml_file in sites_dir.rglob("*.yml"):
         parts = yaml_file.parts
         try:
@@ -54,18 +126,36 @@ def _scan_terraform_hosts(ctx, service) -> list:
             for host_name, host_data in all_hosts.items():
                 if not isinstance(host_data, dict):
                     continue
-                tf = host_data.get("terraform") or {}
-                managed = bool(tf)
+                tf = host_data.get("terraform") if isinstance(host_data.get("terraform"), dict) else {}
+                tf_meta = tf_index.get(host_name)
+                # A host is "managed" by Terraform when it has a terraform: block OR
+                # actually appears in the rendered tfvars containers.
+                managed = bool(tf) or tf_meta is not None
+
+                if tf_meta is not None:
+                    node = tf_meta.get("node") or ""
+                    provider = _TF_PROVIDER
+                    resource = (
+                        f'module.lxc_{node}.proxmox_virtual_environment_container.ct["{host_name}"]'
+                        if node else 'proxmox_virtual_environment_container.ct'
+                    )
+                    state = _host_state_from_jobs(recent_jobs, host_name)
+                else:
+                    # Fall back to whatever the host YAML carried (usually nothing).
+                    provider = tf.get("provider", "—")
+                    resource = tf.get("resource", tf.get("type", "—"))
+                    state = tf.get("state", "unknown")
+
                 results.append({
                     "site": site,
                     "stage": stage,
                     "host": host_name,
                     "ansible_host": host_data.get("ansible_host") or host_data.get("address") or "—",
                     "managed": managed,
-                    "provider": tf.get("provider", "—") if isinstance(tf, dict) else "—",
-                    "resource": tf.get("resource", tf.get("type", "—")) if isinstance(tf, dict) else "—",
-                    "workspace": tf.get("workspace", "default") if isinstance(tf, dict) else "default",
-                    "state": tf.get("state", "unknown") if isinstance(tf, dict) else "unknown",
+                    "provider": provider,
+                    "resource": resource,
+                    "workspace": tf.get("workspace", "default"),
+                    "state": state,
                 })
         except (ValueError, IndexError):
             continue
@@ -221,7 +311,18 @@ def render_terraform_panel(ctx, service):
             ui.separator().classes("mt-1 opacity-20")
             with ui.row().classes("w-full justify-between items-center gap-2"):
                 if managed:
-                    c.status_badge("UNKNOWN" if h["state"] == "unknown" else h["state"].upper())
+                    with ui.row().classes("items-center gap-1"):
+                        c.status_badge("UNKNOWN" if h["state"] == "unknown" else h["state"].upper())
+                        verify_btn = ui.button(
+                            icon="sync",
+                            on_click=lambda hn=h["host"]: (
+                                _emit({"pipeline_type": "state_check", "host_name": hn, "manual": True}),
+                                ui.notify(f"Checking live Terraform state for '{hn}'…", type="info"),
+                            ),
+                        ).props("flat round dense size=sm color=violet").tooltip(
+                            "Verify live Terraform state (tofu state list) — result in History/notifications"
+                        )
+                        verify_btn.bind_enabled_from(state, "is_running", backward=lambda x: not x)
                 else:
                     ui.label("No terraform block").classes(
                         "text-[10px] italic text-slate-400 dark:text-zinc-500"

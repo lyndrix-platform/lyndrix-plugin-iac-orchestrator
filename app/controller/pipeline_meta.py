@@ -75,9 +75,11 @@ _KNOWN_TYPES: Dict[str, PipelineTypeDef] = {
     # init_host is the Terraform-only "create the container" step (no Ansible/services),
     # surfaced as the per-host "Init" button in the Assignments tab.
     "init_host":           PipelineTypeDef("Host Init", PHASE_PROVISION, "dns", "violet"),
+    # state_check is a read-only `tofu state list` for one host (per-tile "Verify state").
+    "state_check":         PipelineTypeDef("State Check", PHASE_PROVISION, "fact_check", "violet"),
     # adopt_host imports an existing CT into Terraform state (then plans to verify),
     # bringing a manually-created container under management without recreating it.
-    "adopt_host":          PipelineTypeDef("Adopt Existing", PHASE_PROVISION, "move_to_inbox", "violet"),
+    "adopt_host":          PipelineTypeDef("Adopt Host", PHASE_PROVISION, "move_to_inbox", "violet"),
     "terraform_plan":      PipelineTypeDef("Terraform Plan", PHASE_PROVISION, "preview", "violet"),
     "terraform_destroy":   PipelineTypeDef("Terraform Destroy", PHASE_PROVISION, "delete_forever", "rose"),
     # infra_plan / infra_apply are the whole-infrastructure operations driven from
@@ -87,7 +89,7 @@ _KNOWN_TYPES: Dict[str, PipelineTypeDef] = {
     "infra_apply":         PipelineTypeDef("Infra Deploy", PHASE_PROVISION, "dns", "violet"),
     # --- Configure (Ansible) ---
     "connectivity": PipelineTypeDef("Connectivity Check", PHASE_CONFIGURE, "lan", "sky"),
-    "rollout":      PipelineTypeDef("Full Rollout", PHASE_CONFIGURE, "public", "sky"),
+    "rollout":      PipelineTypeDef("Full Service Rollout", PHASE_CONFIGURE, "public", "sky"),
     "bootstrap_compliance": PipelineTypeDef("Compliance Bootstrap", PHASE_CONFIGURE, "verified_user", "sky"),
     # compliance re-runs the baseline playbook as the svc user (ansible-agent), no
     # service deploy — the per-host "Compliance" button in the Assignments tab.
