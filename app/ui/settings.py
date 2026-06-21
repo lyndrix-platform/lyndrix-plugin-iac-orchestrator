@@ -5,6 +5,14 @@ from nicegui import ui
 from ui.theme import UIStyles
 from ..controller.gitlab_webhooks import sync_group_webhooks_from_ctx, WebhookConfigError
 
+
+def _safe_int(value, default: int) -> int:
+    try:
+        return int(float(str(value).strip()))
+    except (TypeError, ValueError):
+        return default
+
+
 def render_settings_ui(ctx, service):
     """Renders the settings interface for the IaC Orchestrator."""
     state = service.state
@@ -17,6 +25,8 @@ def render_settings_ui(ctx, service):
         "group_id": ctx.get_secret("iac_gitlab_group_id") or "",
         "lyndrix_base_url": ctx.get_secret("iac_lyndrix_base_url") or "http://10.1.10.31:8081",
         "gitlab_token_key": ctx.get_secret("iac_gitlab_api_token_key") or "",
+        "autosync_enabled": (ctx.get_secret("iac_webhook_autosync_enabled") or "true").lower() != "false",
+        "sync_interval": _safe_int(ctx.get_secret("iac_webhook_sync_interval_seconds"), 1800),
     }
     token_display = {"value": "********************************"}
 
@@ -34,6 +44,14 @@ def render_settings_ui(ctx, service):
         ctx.set_secret("iac_gitlab_group_id", str(gitlab_webhook_config["group_id"] or "").strip())
         ctx.set_secret("iac_lyndrix_base_url", str(gitlab_webhook_config["lyndrix_base_url"] or "").strip())
         ctx.set_secret("iac_gitlab_api_token_key", str(gitlab_webhook_config["gitlab_token_key"] or "").strip())
+        ctx.set_secret(
+            "iac_webhook_autosync_enabled",
+            "true" if gitlab_webhook_config["autosync_enabled"] else "false",
+        )
+        # Clamp to the same floor the background loop enforces (min 300s).
+        interval = max(300, _safe_int(gitlab_webhook_config["sync_interval"], 1800))
+        gitlab_webhook_config["sync_interval"] = interval
+        ctx.set_secret("iac_webhook_sync_interval_seconds", str(interval))
         ui.notify("GitLab webhook settings saved.", type="positive")
 
     def generate_token():
@@ -340,6 +358,22 @@ def render_settings_ui(ctx, service):
                     gitlab_webhook_config, 'gitlab_token_key'
                 )
                 token_dropdowns.append(token_select_webhook)
+
+                with ui.row().classes('w-full items-center gap-4 mt-1'):
+                    ui.switch('Auto-sync new repos').bind_value(
+                        gitlab_webhook_config, 'autosync_enabled'
+                    )
+                    ui.number(
+                        'Auto-sync interval (seconds)', min=300, step=60, format='%d',
+                    ).props('outlined dense').classes('flex-grow').bind_value(
+                        gitlab_webhook_config, 'sync_interval'
+                    )
+                ui.label(
+                    'When enabled, the orchestrator re-registers the group webhooks ~30s '
+                    'after boot and every interval (min 300s) so newly created service repos '
+                    'get their hook without a manual upsert. Also exposed as '
+                    'POST /api/iac/webhook/sync for iac-controller CI.'
+                ).classes('text-xs text-slate-400')
 
                 webhook_preview = ui.input(
                     'Webhook Endpoint Preview',
