@@ -15,7 +15,7 @@ from .app.ui.widget import render_dashboard_widget as modular_widget
 manifest = ModuleManifest(
     id="lyndrix.plugin.iac_orchestrator",
     name="IaC Orchestrator",
-    version="0.5.5",
+    version="0.6.0",
     description="Standalone GitOps controller for executing Terraform and Ansible pipelines.",
     author="Lyndrix",
     icon="rocket_launch",
@@ -119,6 +119,7 @@ def setup(ctx):
     # Startup tasks
     ctx.create_task(_service.run_startup_reconciliation(), name="iac:startup_reconciliation")
     ctx.create_task(_service.emit_monitoring_inventory_sync(), name="iac:monitoring_inventory_seed")
+    ctx.create_task(_service.run_webhook_sync_loop(), name="iac:webhook_sync_loop")
 
     # UI route
     @ui.page('/iac')

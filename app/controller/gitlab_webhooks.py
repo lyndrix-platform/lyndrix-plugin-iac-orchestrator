@@ -130,3 +130,38 @@ def upsert_gitlab_group_webhooks(
         "failed": failed,
         "errors": errors,
     }
+
+
+class WebhookConfigError(ValueError):
+    """Raised when GitLab webhook sync is not (fully) configured in Vault."""
+
+
+def sync_group_webhooks_from_ctx(ctx) -> dict:
+    """Read the GitLab webhook config from Vault and run the idempotent group
+    upsert. Shared by the Settings UI, the ``/webhook/sync`` endpoint, and the
+    self-healing background loop so they can never diverge.
+
+    Raises WebhookConfigError when not fully configured (callers may skip/400);
+    propagates RuntimeError from the API layer on transport failure.
+    """
+    gitlab_url = (ctx.get_secret("iac_gitlab_url") or "https://gitlab.int.fam-feser.de").strip()
+    group_id_raw = (ctx.get_secret("iac_gitlab_group_id") or "").strip()
+    lyndrix_base_url = (ctx.get_secret("iac_lyndrix_base_url") or "").strip()
+    token_key = (ctx.get_secret("iac_gitlab_api_token_key") or "").strip()
+    webhook_token = ctx.get_secret("gitlab_webhook_token")
+
+    if not group_id_raw.isdigit():
+        raise WebhookConfigError("GitLab Group ID is not set or not numeric.")
+    if not lyndrix_base_url:
+        raise WebhookConfigError("Lyndrix Base URL is not set.")
+    if not token_key:
+        raise WebhookConfigError("No GitLab API credential (Vault key) selected.")
+    gitlab_token = ctx.get_secret(token_key)
+    if not gitlab_token:
+        raise WebhookConfigError(f"Vault key '{token_key}' has no secret value.")
+    if not webhook_token:
+        raise WebhookConfigError("No GitLab webhook token generated yet.")
+
+    return upsert_gitlab_group_webhooks(
+        gitlab_url, gitlab_token, int(group_id_raw), lyndrix_base_url, webhook_token
+    )

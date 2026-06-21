@@ -3,7 +3,7 @@ import json
 import asyncio
 from nicegui import ui
 from ui.theme import UIStyles
-from ..controller.gitlab_webhooks import upsert_gitlab_group_webhooks
+from ..controller.gitlab_webhooks import sync_group_webhooks_from_ctx, WebhookConfigError
 
 def render_settings_ui(ctx, service):
     """Renders the settings interface for the IaC Orchestrator."""
@@ -356,35 +356,12 @@ def render_settings_ui(ctx, service):
                     _refresh_webhook_preview()
                     save_gitlab_webhook_settings()
 
-                    group_id_raw = str(gitlab_webhook_config.get('group_id') or '').strip()
-                    if not group_id_raw.isdigit():
-                        ui.notify("GitLab Group ID must be a number.", type="negative")
-                        return
-
-                    token_key = str(gitlab_webhook_config.get('gitlab_token_key') or '').strip()
-                    if not token_key:
-                        ui.notify("Select a GitLab API credential Vault key.", type="negative")
-                        return
-                    gitlab_token = ctx.get_secret(token_key)
-                    if not gitlab_token:
-                        ui.notify(f"Vault key '{token_key}' has no secret value.", type="negative")
-                        return
-
-                    webhook_token = ctx.get_secret("gitlab_webhook_token")
-                    if not webhook_token:
-                        ui.notify("Generate a GitLab webhook token first in Security Configuration.", type="negative")
-                        return
-
                     ui.notify("Configuring GitLab webhooks…", type="info")
                     try:
-                        result = await asyncio.to_thread(
-                            upsert_gitlab_group_webhooks,
-                            str(gitlab_webhook_config.get('gitlab_url') or '').strip(),
-                            gitlab_token,
-                            int(group_id_raw),
-                            str(gitlab_webhook_config.get('lyndrix_base_url') or '').strip(),
-                            webhook_token,
-                        )
+                        result = await asyncio.to_thread(sync_group_webhooks_from_ctx, ctx)
+                    except WebhookConfigError as exc:
+                        ui.notify(str(exc), type="negative")
+                        return
                     except Exception as exc:
                         ui.notify(f"Webhook upsert failed: {exc}", type="negative")
                         return

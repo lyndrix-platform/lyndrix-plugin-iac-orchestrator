@@ -2,8 +2,11 @@ import hmac
 import yaml
 import time
 import re
+import asyncio
 from fastapi import APIRouter, Request, Header, HTTPException
 from pydantic import BaseModel, Field
+
+from .gitlab_webhooks import sync_group_webhooks_from_ctx, WebhookConfigError
 
 iac_api_router = APIRouter(prefix="/api/iac", tags=["IaC Orchestrator"])
 
@@ -327,6 +330,31 @@ async def gitlab_webhook(request: Request, x_gitlab_token: str = Header(None)):
     except Exception as e:
         _ctx.log.error(f"WEBHOOK ERROR: {str(e)}")
         raise HTTPException(status_code=400, detail="Malformed JSON payload")
+
+
+@iac_api_router.post("/webhook/sync")
+async def sync_webhooks(x_gitlab_token: str = Header(None)):
+    """Token-protected, idempotent re-registration of the group webhooks.
+
+    Lets iac-controller CI onboard newly created service repos (registers the
+    merge-request hook) without a manual Settings-UI click. Scans the whole
+    group, so it does not need to know which repo is new.
+    """
+    if not _ctx:
+        raise HTTPException(status_code=500, detail="API Context not initialized")
+    _require_gitlab_token(x_gitlab_token)
+    try:
+        result = await asyncio.to_thread(sync_group_webhooks_from_ctx, _ctx)
+    except WebhookConfigError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        _ctx.log.error(f"WEBHOOK SYNC ERROR: {exc}")
+        raise HTTPException(status_code=502, detail=f"Webhook sync failed: {exc}")
+    _ctx.log.info(
+        f"WEBHOOK SYNC: projects={result['projects_total']} "
+        f"created={result['created']} updated={result['updated']} failed={result['failed']}"
+    )
+    return {"status": "ok", **result}
 
 
 # --- NEW EXPOSED CONTROL ENDPOINTS ---

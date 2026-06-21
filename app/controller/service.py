@@ -13,6 +13,7 @@ from ..model.database import JobDatabase
 from .config import IaCConfig
 from .engine import DeploymentEngine
 from .socket_client import SocketBusClient
+from .gitlab_webhooks import sync_group_webhooks_from_ctx, WebhookConfigError
 
 log = logging.getLogger("IaC:Service")
 
@@ -140,6 +141,39 @@ class IaCService:
     async def emit_monitoring_inventory_sync(self):
         """Delegate to the engine."""
         await self.engine.emit_monitoring_inventory_sync()
+
+    async def run_webhook_sync_loop(self):
+        """Self-healing GitLab webhook registration.
+
+        Runs the idempotent group upsert shortly after boot and then on a fixed
+        interval, so a newly created service repo gets its merge-request hook
+        without anyone clicking "Webhooks registrieren" in Settings. iac-controller
+        CI can additionally hit POST /api/iac/webhook/sync for an immediate run.
+        """
+        if str(self.ctx.get_secret("iac_webhook_autosync_enabled") or "true").lower() == "false":
+            self.ctx.log.info("IaC Orchestrator: webhook auto-sync disabled.")
+            return
+
+        raw_interval = self.ctx.get_secret("iac_webhook_sync_interval_seconds") or ""
+        try:
+            interval = max(300, int(str(raw_interval).strip() or "1800"))
+        except ValueError:
+            interval = 1800
+
+        await asyncio.sleep(30)  # let Vault hydrate and boot settle
+        while True:
+            try:
+                result = await asyncio.to_thread(sync_group_webhooks_from_ctx, self.ctx)
+                self.ctx.log.info(
+                    f"IaC Orchestrator: webhook auto-sync ok "
+                    f"(projects={result['projects_total']}, created={result['created']}, "
+                    f"updated={result['updated']}, failed={result['failed']})."
+                )
+            except WebhookConfigError as exc:
+                self.ctx.log.debug(f"IaC Orchestrator: webhook auto-sync skipped — {exc}")
+            except Exception as exc:
+                self.ctx.log.warning(f"IaC Orchestrator: webhook auto-sync failed — {exc}")
+            await asyncio.sleep(interval)
 
     async def ensure_runtime_paths(self):
         """Resolve host bind mounts from the core socket manager once per boot."""
