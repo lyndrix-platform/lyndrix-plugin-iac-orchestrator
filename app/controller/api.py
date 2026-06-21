@@ -652,6 +652,29 @@ async def trigger_infra_apply():
     return {"status": "accepted", "message": "Infrastructure deploy queued."}
 
 
+@iac_api_router.post("/infra/plan/gitlab")
+async def trigger_infra_plan_gitlab(x_gitlab_token: str = Header(None)):
+    """GitLab-token-protected infra plan trigger for CI (e.g. iac-controller).
+
+    Same read-only whole-infra plan as /infra/plan, but authenticated so it can
+    be called over the network from a pipeline.
+    """
+    _require_gitlab_token(x_gitlab_token)
+    return await trigger_infra_plan()
+
+
+@iac_api_router.post("/infra/apply/gitlab")
+async def trigger_infra_apply_gitlab(x_gitlab_token: str = Header(None)):
+    """GitLab-token-protected infra apply trigger for CI (e.g. iac-controller).
+
+    Lets an iac-controller (SSoT) push reconcile infrastructure: rule-driven, so
+    dev/test apply while prod stays plan-gated via pipeline_rules. Authenticated
+    variant of /infra/apply for network/CI callers.
+    """
+    _require_gitlab_token(x_gitlab_token)
+    return await trigger_infra_apply()
+
+
 @iac_api_router.get("/jobs")
 async def list_orchestrator_jobs(limit: int = 20):
     """Returns a list of recent and active jobs."""
