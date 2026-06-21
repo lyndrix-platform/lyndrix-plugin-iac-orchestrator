@@ -3,9 +3,10 @@ import yaml
 import time
 import re
 import asyncio
-from fastapi import APIRouter, Request, Header, HTTPException
+from fastapi import APIRouter, Request, Header, HTTPException, Depends
 from pydantic import BaseModel, Field
 
+from core.api import require_api_auth
 from .gitlab_webhooks import sync_group_webhooks_from_ctx, WebhookConfigError
 
 iac_api_router = APIRouter(prefix="/api/iac", tags=["IaC Orchestrator"])
@@ -359,7 +360,7 @@ async def sync_webhooks(x_gitlab_token: str = Header(None)):
 
 # --- NEW EXPOSED CONTROL ENDPOINTS ---
 
-@iac_api_router.get("/catalog")
+@iac_api_router.get("/catalog", dependencies=[Depends(require_api_auth)])
 async def get_service_catalog():
     """Returns the parsed global service catalog."""
     if not _engine: raise HTTPException(status_code=500, detail="Engine offline")
@@ -394,7 +395,7 @@ def _load_generated_inventory_hosts() -> set[str]:
         return set()
     return set(((inv.get("all") or {}).get("hosts") or {}).keys())
 
-@iac_api_router.post("/deploy/service/{service_name}")
+@iac_api_router.post("/deploy/service/{service_name}", dependencies=[Depends(require_api_auth)])
 async def trigger_service_deployment(service_name: str, payload: DeployRequest):
     """Triggers a targeted single-service deployment."""
     if not _ctx:
@@ -423,7 +424,7 @@ async def trigger_service_deployment_gitlab(
     return await trigger_service_deployment(service_name, payload)
 
 
-@iac_api_router.get("/deploy/service/{service_name}/status")
+@iac_api_router.get("/deploy/service/{service_name}/status", dependencies=[Depends(require_api_auth)])
 async def get_service_deployment_status(service_name: str, since_epoch: int = 0):
     """Returns the latest deployment status for a service, optionally after an epoch timestamp."""
     if not _engine:
@@ -473,7 +474,7 @@ async def get_service_deployment_status_gitlab(
     return await get_service_deployment_status(service_name, since_epoch=since_epoch)
 
 
-@iac_api_router.post("/deploy/test-host/{host_name}")
+@iac_api_router.post("/deploy/test-host/{host_name}", dependencies=[Depends(require_api_auth)])
 async def trigger_test_host_deployment(host_name: str, payload: TestHostDeployRequest):
     """
     Triggers a guarded host_provision run (Terraform + Ansible bootstrap +
@@ -554,7 +555,7 @@ async def gitlab_test_host_webhook(
     return await trigger_test_host_deployment(host_name, payload)
 
 
-@iac_api_router.post("/bootstrap/{host_name}")
+@iac_api_router.post("/bootstrap/{host_name}", dependencies=[Depends(require_api_auth)])
 async def trigger_host_bootstrap(host_name: str, payload: TestHostDeployRequest):
     """
     Triggers a guarded compliance/bootstrap run (cd_compliance.yml) for exactly
@@ -614,7 +615,7 @@ async def trigger_host_bootstrap(host_name: str, payload: TestHostDeployRequest)
         "host_name": host,
     }
 
-@iac_api_router.post("/infra/plan")
+@iac_api_router.post("/infra/plan", dependencies=[Depends(require_api_auth)])
 async def trigger_infra_plan():
     """Triggers a read-only whole-infrastructure Terraform plan ("Check Env").
 
@@ -630,7 +631,7 @@ async def trigger_infra_plan():
     return {"status": "accepted", "message": "Infrastructure plan (Check Env) queued."}
 
 
-@iac_api_router.post("/infra/apply")
+@iac_api_router.post("/infra/apply", dependencies=[Depends(require_api_auth)])
 async def trigger_infra_apply():
     """Triggers a whole-infrastructure Terraform apply ("Deploy Infra").
 
@@ -675,7 +676,7 @@ async def trigger_infra_apply_gitlab(x_gitlab_token: str = Header(None)):
     return await trigger_infra_apply()
 
 
-@iac_api_router.get("/jobs")
+@iac_api_router.get("/jobs", dependencies=[Depends(require_api_auth)])
 async def list_orchestrator_jobs(limit: int = 20):
     """Returns a list of recent and active jobs."""
     if not _engine: raise HTTPException(status_code=500, detail="Engine offline")
