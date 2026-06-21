@@ -70,7 +70,7 @@ def upsert_gitlab_group_webhooks(
         "confidential_issues_events": False,
         "merge_requests_events": True,
         "job_events": False,
-        "pipeline_events": False,
+        "pipeline_events": True,
         "wiki_page_events": False,
         "enable_ssl_verification": True,
     }
