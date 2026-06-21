@@ -235,8 +235,13 @@ def render_settings_ui(ctx, service):
             with ui.column().classes('w-full flex-grow p-5 gap-3'):
                 with ui.row().classes('items-center gap-2 mb-1'):
                     ui.icon('dns', size='18px').classes('text-purple-400')
-                    ui.label('Terraform Provisioning Secrets').classes('text-sm font-bold uppercase tracking-widest text-slate-300')
-                ui.label('Sensitive root credentials injected into provisioned hosts. Stored in Vault, never in the repo.').classes(UIStyles.TEXT_MUTED)
+                    ui.label('Terraform Runner & Secrets').classes('text-sm font-bold uppercase tracking-widest text-slate-300')
+                ui.label('OpenTofu runner image plus the sensitive root credentials injected into provisioned hosts. Stored in Vault, never in the repo.').classes(UIStyles.TEXT_MUTED)
+
+                default_tf_img = "registry.gitlab.int.fam-feser.de/iac-environment/iac-platform-assets/opentofu-ci-image:latest"
+                tf_img_input = ui.input('OpenTofu Runner Image', value=ctx.get_secret("iac_terraform_docker_image") or default_tf_img).props('outlined dense').classes('w-full')
+                ui.label('Image used for every `tofu init/plan/apply`. Use the baked-mirror image so per-host init resolves bpg/proxmox locally (faster; no "context deadline exceeded" from registry.opentofu.org). Leave blank to fall back to ghcr.io/opentofu/opentofu:latest.').classes('text-xs text-slate-400')
+                ui.separator().classes('w-full my-2 opacity-30')
 
                 tf_key_exists = bool(ctx.get_secret("iac_tf_ssh_key"))
                 tf_key_input = ui.textarea('Root SSH Public Key (injected into new hosts)', value="********************************\n(Key is set. Overwrite to change)" if tf_key_exists else "").props('outlined dense').classes('w-full')
@@ -254,15 +259,22 @@ def render_settings_ui(ctx, service):
 
                 ui.label('These take precedence only when not set in terraform_vars; keeping them here keeps the repo free of private credentials.').classes('text-xs text-slate-400')
 
-                def save_terraform_secrets(ssh_key, priv_key, root_pw, backend_secret):
+                def save_terraform_secrets(tf_img, ssh_key, priv_key, root_pw, backend_secret):
+                    # Runner image is not a secret. Coalesce blank to the upstream
+                    # default — storing "" would make config._get return an empty
+                    # image (it only falls through on None, not "").
+                    ctx.set_secret(
+                        "iac_terraform_docker_image",
+                        (tf_img or "").strip() or "ghcr.io/opentofu/opentofu:latest",
+                    )
                     if ssh_key and "********" not in ssh_key: ctx.set_secret("iac_tf_ssh_key", ssh_key.strip())
                     if priv_key and "********" not in priv_key: ctx.set_secret("iac_tf_ssh_private_key", priv_key.strip())
                     if root_pw and "********" not in root_pw: ctx.set_secret("iac_tf_root_password", root_pw.strip())
                     if backend_secret and "********" not in backend_secret: ctx.set_secret("iac_tf_backend_secret_key", backend_secret.strip())
-                    ui.notify("Terraform provisioning secrets saved to Vault.", type="positive")
+                    ui.notify("Terraform runner image & secrets saved to Vault.", type="positive")
 
                 with ui.row().classes('w-full justify-end mt-2'):
-                    ui.button('Save Terraform Secrets', on_click=lambda: save_terraform_secrets(tf_key_input.value, tf_priv_key_input.value, tf_root_pw_input.value, tf_backend_secret_input.value), icon='dns', color='purple').props('unelevated rounded size=sm')
+                    ui.button('Save Terraform Settings', on_click=lambda: save_terraform_secrets(tf_img_input.value, tf_key_input.value, tf_priv_key_input.value, tf_root_pw_input.value, tf_backend_secret_input.value), icon='dns', color='purple').props('unelevated rounded size=sm')
 
         # --- [SECTION 4: SECURITY CONFIG] ---
         with ui.card().classes(f'{UIStyles.CARD_GLASS} w-full').style('padding: 0; flex-wrap: nowrap'):
