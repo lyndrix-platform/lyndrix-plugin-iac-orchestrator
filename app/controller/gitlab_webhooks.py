@@ -70,7 +70,11 @@ def upsert_gitlab_group_webhooks(
         "confidential_issues_events": False,
         "merge_requests_events": True,
         "job_events": False,
-        "pipeline_events": True,
+        # Deployments are triggered by the service CI's prod-trigger-orchestrator
+        # job (LYNDRIX_DIRECT_TRIGGER_ENABLED). Enabling pipeline_events here would
+        # double-trigger (and fire on dev/test too — no branch filter). Keep off;
+        # this hook only carries merge_request events for notifications.
+        "pipeline_events": False,
         "wiki_page_events": False,
         "enable_ssl_verification": True,
     }
