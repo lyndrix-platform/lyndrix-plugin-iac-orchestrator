@@ -66,3 +66,6 @@ htmlcov/
 
 # Generated docs build output
 .cache/
+
+# --- Node / React UI build ---
+node_modules/

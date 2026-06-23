@@ -3,7 +3,9 @@ from ui.layout import main_layout
 from core.api import ModuleManifest, NotificationEndpoint, db_instance
 
 from .app.controller.service import IaCService
-from .app.controller.api import iac_api_router, init_api
+from .app.controller.api import init_api
+from .app.controller.webhook_router import build_webhook_router
+from .app.api import build_plugin_router, build_stream_router
 from .app.model.models import Base
 from .app.ui.dashboard import render_dashboard
 from .app.ui.settings import render_settings_ui as modular_settings_ui
@@ -24,6 +26,15 @@ manifest = ModuleManifest(
     auto_enable_on_install=False,
     repo_url="https://github.com/lyndrix-platform/lyndrix-plugin-iac-orchestrator",
     ui_route="/iac",
+    react_ui=True,
+    react_routes=[
+        {
+            "path": "/iac",
+            "label": "IaC Orchestrator",
+            "icon": "rocket_launch",
+            "sidebar_visible": True,
+        },
+    ],
     permissions={
         "subscribe": ["vault:ready_for_data", "iac:webhook_verified", "git:status_update", "db:connected", "socket:response"],
         "emit": ["iac:pipeline_started", "iac:webhook_verified", "git:sync", "git:commit_push",
@@ -102,7 +113,26 @@ def setup(ctx):
     # API wiring
     init_api(ctx, _service)
     from main import app as fastapi_app
-    _service.register_api_routes(fastapi_app, iac_api_router)
+    from core.api.route_order import move_routes_before_catchall
+
+    # Public webhook router (/api/iac) — mounted DIRECTLY on the app. It must NOT
+    # go through ctx.register_routes(): the registry wraps every route with
+    # require_api_auth, which would reject external GitLab/CI callers that carry no
+    # Lyndrix user token. Each handler validates the x_gitlab_token itself.
+    fastapi_app.include_router(build_webhook_router(_service))
+    move_routes_before_catchall(fastapi_app, "/api/iac")
+
+    # Live SSE job stream — also mounted directly, because EventSource cannot send
+    # an Authorization header. The handler validates the ?token= query param. (The
+    # registry's header auth would otherwise break the stream.)
+    fastapi_app.include_router(build_stream_router(_service))
+    move_routes_before_catchall(
+        fastapi_app, "/api/plugins/lyndrix.plugin.iac_orchestrator/stream"
+    )
+
+    # Auth'd plugin router — mounted via the registry, which adds require_api_auth
+    # automatically. Routes add require_permission(api:read|api:write) themselves.
+    ctx.register_routes(build_plugin_router(_service))
 
     # DB bootstrap
     _service.bootstrap_db(Base)
