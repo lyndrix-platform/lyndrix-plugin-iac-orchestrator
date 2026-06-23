@@ -68,7 +68,73 @@ def build_plugin_router(service) -> APIRouter:
     ):
         return await _api.do_get_service_status(service_name, since_epoch=since_epoch)
 
+    @router.get("/stats")
+    async def stats(identity: ApiIdentity = Depends(require_permission("api:read"))):
+        return await _api.do_get_stats()
+
+    @router.get("/infrastructure/assignments")
+    async def infra_assignments(
+        identity: ApiIdentity = Depends(require_permission("api:read")),
+    ):
+        return await _api.do_load_assignments()
+
+    @router.get("/infrastructure/terraform-hosts")
+    async def infra_terraform_hosts(
+        identity: ApiIdentity = Depends(require_permission("api:read")),
+    ):
+        return await _api.do_terraform_hosts()
+
+    @router.get("/service/{service_name}/history")
+    async def service_history(
+        service_name: str,
+        identity: ApiIdentity = Depends(require_permission("api:read")),
+    ):
+        return await _api.do_service_history(service_name)
+
+    # NB: core auto-registers a generic ``/settings`` schema endpoint on every plugin
+    # router, which would shadow an exact ``/settings`` route here. We therefore expose
+    # the orchestrator settings surface under ``/settings/general`` (sub-paths do not
+    # collide with core's exact-path route).
+    @router.get("/settings/general")
+    async def get_settings(identity: ApiIdentity = Depends(require_permission("api:read"))):
+        return await _api.do_get_settings()
+
+    @router.get("/settings/webhook-token")
+    async def get_webhook_token(
+        identity: ApiIdentity = Depends(require_permission("api:read")),
+    ):
+        return await _api.do_get_webhook_token()
+
     # ── Actions (api:write) ──────────────────────────────────────────────────
+    @router.post("/pipeline")
+    async def run_pipeline(
+        payload: _api.PipelineRequest,
+        identity: ApiIdentity = Depends(require_permission("api:write")),
+    ):
+        return await _api.do_run_pipeline(payload)
+
+    @router.post("/abort")
+    async def abort(identity: ApiIdentity = Depends(require_permission("api:write"))):
+        return await _api.do_abort()
+
+    @router.post("/settings/general")
+    async def save_settings(
+        payload: _api.SettingsRequest,
+        identity: ApiIdentity = Depends(require_permission("api:write")),
+    ):
+        return await _api.do_save_settings(payload)
+
+    @router.post("/settings/webhook-token/generate")
+    async def generate_webhook_token(
+        identity: ApiIdentity = Depends(require_permission("api:write")),
+    ):
+        return await _api.do_generate_webhook_token()
+
+    @router.post("/settings/webhooks/sync")
+    async def sync_webhooks(
+        identity: ApiIdentity = Depends(require_permission("api:write")),
+    ):
+        return await _api.do_sync_webhooks_authed()
     @router.post("/deploy/service/{service_name}")
     async def deploy_service(
         service_name: str,

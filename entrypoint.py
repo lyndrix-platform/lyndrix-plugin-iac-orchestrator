@@ -34,7 +34,14 @@ manifest = ModuleManifest(
             "icon": "rocket_launch",
             "sidebar_visible": True,
         },
+        {
+            "path": "/iac/settings",
+            "label": "IaC Orchestrator Settings",
+            "icon": "settings",
+            "sidebar_visible": False,
+        },
     ],
+    settings_ui_route="/iac/settings",
     permissions={
         "subscribe": ["vault:ready_for_data", "iac:webhook_verified", "git:status_update", "db:connected", "socket:response"],
         "emit": ["iac:pipeline_started", "iac:webhook_verified", "git:sync", "git:commit_push",

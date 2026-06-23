@@ -88,6 +88,99 @@ export interface JobLogsResponse {
   grep: string | null
 }
 
+export interface StatsPhase {
+  phase: string
+  label: string
+  icon: string
+  color: string
+  total: number
+  success: number
+  failed: number
+  running: number
+  success_rate: number
+}
+
+export interface StatsRecent {
+  id: number
+  pipeline_type: string
+  type_label: string
+  phase: string
+  icon: string
+  color: string
+  status: string
+  progress: number
+  duration_s: number | null
+  duration_human: string
+  start_label: string
+}
+
+export interface OrchestratorStats {
+  total: number
+  success: number
+  failed: number
+  running: number
+  finished: number
+  success_rate: number
+  avg_duration_s: number | null
+  avg_duration_human: string
+  last_deployment_status: string | null
+  last_deployment_at: string | null
+  by_status: Record<string, number>
+  by_phase: StatsPhase[]
+  recent: StatsRecent[]
+}
+
+export interface Assignment {
+  site: string
+  stage: string
+  host: string
+  services: string[]
+}
+
+export interface TerraformHost {
+  site: string
+  stage: string
+  host: string
+  ansible_host: string
+  managed: boolean
+  provider: string
+  resource: string
+  workspace: string
+  state: string
+}
+
+export interface ServiceHistoryRow {
+  id: number
+  pipeline_type: string
+  status: string
+  progress: number
+  start_time: string
+}
+
+export interface IaCSettings {
+  auto_apply: boolean
+  test_deploy_allowed_hosts: string
+  gitlab_url: string
+  group_id: string
+  lyndrix_base_url: string
+  gitlab_token_key: string
+  autosync_enabled: boolean
+  sync_interval: number
+  webhook_endpoint: string
+}
+
+export interface PipelinePayload {
+  pipeline_type: 'bootstrap_compliance' | 'adopt_host' | 'rollout' | 'init_host' | 'compliance'
+  limit?: string
+  host_name?: string
+}
+
+export interface AcceptedResponse {
+  status: string
+  message?: string
+  [k: string]: unknown
+}
+
 // ─── Typed endpoint helpers ─────────────────────────────────────────────────
 
 export const iacApi = {
@@ -101,6 +194,25 @@ export const iacApi = {
     pluginApi.get<{ job_id: number; runners: Record<string, RunnerTask> }>(`jobs/${id}/runners`),
   deployService: (name: string, branch = 'main') =>
     pluginApi.post<{ status: string; message: string }>(`deploy/service/${name}`, { branch }),
-  infraPlan: () => pluginApi.post<{ status: string; message: string }>('infra/plan'),
-  infraApply: () => pluginApi.post<{ status: string; message: string }>('infra/apply'),
+  infraPlan: () => pluginApi.post<AcceptedResponse>('infra/plan'),
+  infraApply: () => pluginApi.post<AcceptedResponse>('infra/apply'),
+
+  // ── Parity additions ──────────────────────────────────────────────────────
+  stats: () => pluginApi.get<OrchestratorStats>('stats'),
+  assignments: () => pluginApi.get<Assignment[]>('infrastructure/assignments'),
+  terraformHosts: () => pluginApi.get<TerraformHost[]>('infrastructure/terraform-hosts'),
+  serviceHistory: (name: string) =>
+    pluginApi.get<ServiceHistoryRow[]>(`service/${encodeURIComponent(name)}/history`),
+  runPipeline: (payload: PipelinePayload) => pluginApi.post<AcceptedResponse>('pipeline', payload),
+  abort: () => pluginApi.post<AcceptedResponse>('abort'),
+  getSettings: () => pluginApi.get<IaCSettings>('settings/general'),
+  saveSettings: (payload: Partial<IaCSettings>) => pluginApi.post<IaCSettings>('settings/general', payload),
+  getWebhookToken: () =>
+    pluginApi.get<{ configured: boolean; masked: string }>('settings/webhook-token'),
+  generateWebhookToken: () =>
+    pluginApi.post<{ status: string; token: string }>('settings/webhook-token/generate'),
+  syncWebhooks: () =>
+    pluginApi.post<AcceptedResponse & { projects_total?: number; created?: number; updated?: number; failed?: number }>(
+      'settings/webhooks/sync',
+    ),
 }

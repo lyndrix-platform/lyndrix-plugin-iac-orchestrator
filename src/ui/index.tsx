@@ -7,5 +7,6 @@ import PluginApp from './PluginApp'
   PluginApp,
   pluginRoutes: [
     { path: '/iac', label: 'IaC Orchestrator', icon: 'rocket_launch', sidebar_visible: true },
+    { path: '/iac/settings', label: 'IaC Orchestrator Settings', icon: 'settings', sidebar_visible: false },
   ],
 }

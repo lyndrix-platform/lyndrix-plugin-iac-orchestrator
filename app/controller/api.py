@@ -23,6 +23,7 @@ import json
 import yaml
 import time
 import re
+import secrets
 import asyncio
 from pathlib import Path
 
@@ -313,6 +314,35 @@ class DeployRequest(BaseModel):
 
 class TestHostDeployRequest(BaseModel):
     services: list[str] = Field(default_factory=list)
+
+
+# Generic operation trigger. Mirrors the NiceGUI Assignments-tab buttons, which
+# all run ``ctx.emit("iac:webhook_verified", {pipeline_type, limit|host_name, ...})``.
+_PIPELINE_TYPES = {"bootstrap_compliance", "adopt_host", "rollout", "init_host", "compliance"}
+
+
+class PipelineRequest(BaseModel):
+    pipeline_type: str
+    limit: str | None = None       # "all" | "<site>" | "<host>"
+    host_name: str | None = None   # exact host token for host-scoped actions
+
+
+class SettingsRequest(BaseModel):
+    auto_apply: bool | None = None
+    test_deploy_allowed_hosts: str | None = None
+    gitlab_url: str | None = None
+    group_id: str | None = None
+    lyndrix_base_url: str | None = None
+    gitlab_token_key: str | None = None
+    autosync_enabled: bool | None = None
+    sync_interval: int | None = None
+
+
+def _safe_int(value, default: int) -> int:
+    try:
+        return int(float(str(value).strip()))
+    except (TypeError, ValueError):
+        return default
 
 
 _HOST_LIMIT_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
@@ -649,6 +679,451 @@ async def do_job_runners(job_id: int):
         if isinstance(data, dict) and data.get("job_id") == job_id
     }
     return {"job_id": job_id, "runners": runners}
+
+
+# ── Generic operation trigger / abort ───────────────────────────────────────
+
+async def do_run_pipeline(payload: PipelineRequest):
+    """Generic operation trigger replacing the ~10 NiceGUI global/site/host buttons.
+
+    Ports the exact path those handlers use: emit ``iac:webhook_verified`` with the
+    same payload shape (``pipeline_type`` plus ``limit`` and/or ``host_name``).
+    """
+    if not _ctx:
+        raise HTTPException(status_code=500, detail="Context offline")
+
+    pipeline_type = str(payload.pipeline_type or "").strip()
+    if pipeline_type not in _PIPELINE_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported pipeline_type. Allowed: {sorted(_PIPELINE_TYPES)}",
+        )
+
+    limit = str(payload.limit or "").strip()
+    host = str(payload.host_name or "").strip()
+    if not limit and not host:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide either 'limit' (all|<site>|<host>) or 'host_name'.",
+        )
+    if host and not _HOST_LIMIT_PATTERN.fullmatch(host):
+        raise HTTPException(status_code=400, detail="Invalid host_name token.")
+    if limit and not _HOST_LIMIT_PATTERN.fullmatch(limit):
+        raise HTTPException(status_code=400, detail="Invalid limit token.")
+
+    event_payload: dict = {"pipeline_type": pipeline_type, "manual": True, "trigger": "ui_pipeline"}
+    if limit:
+        event_payload["limit"] = limit
+    if host:
+        event_payload["host_name"] = host
+
+    _ctx.emit("iac:webhook_verified", event_payload)
+    _emit_webhook_verified(event_payload)
+    target = host or limit
+    return {
+        "status": "accepted",
+        "message": f"Pipeline '{pipeline_type}' queued for '{target}'.",
+        "pipeline_type": pipeline_type,
+        "limit": limit or None,
+        "host_name": host or None,
+    }
+
+
+async def do_abort():
+    """Abort the running execution: kill runner containers, mark RUNNING jobs ABORTED.
+
+    Ports the NiceGUI ``abort_execution`` handler (dashboard.py).
+    """
+    if not _ctx or not _engine or not _service:
+        raise HTTPException(status_code=503, detail="Orchestrator not initialized")
+
+    state = _service.state
+    _ctx.log.warning("API: ABORT SEQUENCE INITIATED BY USER.")
+
+    for task_name in list((state.get("active_tasks", {}) or {}).keys()):
+        safe_task_name = "".join(
+            ch if ch.isalnum() or ch in ".-_" else "-" for ch in task_name
+        ).strip("-")
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "docker", "rm", "-f", f"aac-runner-{safe_task_name}",
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await proc.wait()
+        except Exception:
+            pass
+
+    aborted: list[int] = []
+    try:
+        running_jobs = _engine.db.get_jobs_by_status("RUNNING")
+    except Exception:
+        running_jobs = []
+    for job in running_jobs:
+        job_id = getattr(job, "id", None)
+        if job_id is None:
+            continue
+        _engine.db.update_job(job_id, "ABORTED")
+        _engine.db.update_progress(job_id, progress=None, current_step="Aborted by User")
+        aborted.append(job_id)
+
+    if aborted:
+        try:
+            from core.api import OutboundMessage, MessageSeverity
+            ids = ", ".join(f"#{j}" for j in aborted)
+            abort_msg = OutboundMessage(
+                title="Pipeline Aborted",
+                body=f"Execution aborted by user (jobs {ids}).",
+                severity=MessageSeverity.WARNING,
+                source_plugin_id="lyndrix.plugin.iac_orchestrator",
+                target_provider="system",
+                metadata={"toast": True, "persist": True},
+            )
+            _ctx.emit("messaging:outbound", abort_msg.model_dump(mode="json"))
+        except Exception as exc:
+            _ctx.log.debug(f"ABORT: notification failed: {exc}")
+
+    state["is_running"] = False
+    state["active_tasks"] = {}
+    return {"status": "ok", "aborted_jobs": aborted}
+
+
+# ── Infrastructure inventory (assignments + terraform hosts) ─────────────────
+
+def _load_assignments() -> list:
+    """Flatten site→stage→host service assignments. Ports dashboard.load_assignments."""
+    if not _engine:
+        return []
+    config = _engine.config
+    assignments: list[dict] = []
+    base_dir = config.git_repos_dir / "iac_controller" / "environments"
+    sites_dir = base_dir / "sites"
+    profiles_file = base_dir / "global" / "03_profiles.yml"
+
+    profiles: dict = {}
+    if profiles_file.exists():
+        try:
+            with open(profiles_file, "r", encoding="utf-8") as f:
+                p_data = yaml.safe_load(f) or {}
+                profiles = p_data.get("profiles") or {}
+        except Exception as exc:
+            _ctx and _ctx.log.error(f"API: Failed to parse profiles YAML: {exc}")
+
+    if not sites_dir.exists():
+        return []
+
+    for yaml_file in sites_dir.rglob("*.yml"):
+        parts = yaml_file.parts
+        try:
+            site = parts[parts.index("sites") + 1]
+            stage = parts[parts.index("stages") + 1] if "stages" in parts else "common"
+            with open(yaml_file, "r", encoding="utf-8") as f:
+                data = yaml.safe_load(f) or {}
+            all_hosts = {**(data.get("hosts") or {}), **(data.get("hardware_hosts") or {})}
+            for host_name, host_data in all_hosts.items():
+                if not isinstance(host_data, dict):
+                    continue
+                host_svcs: set = set()
+                direct_services = host_data.get("services") or []
+                if isinstance(direct_services, list):
+                    for s in direct_services:
+                        if isinstance(s, dict) and s.get("name"):
+                            host_svcs.add(s.get("name"))
+                host_profiles = host_data.get("profiles") or []
+                if isinstance(host_profiles, list):
+                    for p in host_profiles:
+                        profile_services = profiles.get(p, {}).get("services") or []
+                        if isinstance(profile_services, list):
+                            for s in profile_services:
+                                if isinstance(s, dict) and s.get("name"):
+                                    host_svcs.add(s.get("name"))
+                if host_svcs:
+                    assignments.append({
+                        "site": site, "stage": stage, "host": host_name,
+                        "services": sorted(host_svcs),
+                    })
+        except (ValueError, IndexError):
+            continue
+        except Exception as exc:
+            _ctx and _ctx.log.error(f"API: Failed to parse assignment YAML {yaml_file}: {exc}")
+
+    unique = {f"{a['site']}-{a['stage']}-{a['host']}": a for a in assignments}
+    return sorted(unique.values(), key=lambda x: (x["site"], x["stage"], x["host"]))
+
+
+async def do_load_assignments():
+    """Return the flat site→stage→host service assignment list."""
+    if not _engine:
+        raise HTTPException(status_code=500, detail="Engine offline")
+    return _load_assignments()
+
+
+_TF_PROVIDER = "bpg/proxmox"
+_TF_JOB_PREFIXES = ("init_host", "host_provision", "adopt_host")
+
+
+def _tfvars_host_index(config) -> dict:
+    """Index hosts from rendered terraform.tfvars.json. Ports terraform._tfvars_host_index."""
+    index: dict[str, dict] = {}
+    inv_root = config.git_repos_dir / "inventory_state"
+    if not inv_root.exists():
+        return index
+    for tfvars_path in inv_root.glob("*/*/terraform/terraform.tfvars.json"):
+        try:
+            with open(tfvars_path, "r", encoding="utf-8") as fh:
+                data = json.load(fh) or {}
+        except Exception:
+            continue
+        try:
+            stage = tfvars_path.parents[1].name
+            site = tfvars_path.parents[2].name
+        except IndexError:
+            continue
+        for host_name, cfg in (data.get("containers") or {}).items():
+            if not isinstance(cfg, dict):
+                continue
+            node = str(cfg.get("node_name") or "").strip()
+            index[host_name] = {"node": node, "env": f"{site}_{stage}"}
+    return index
+
+
+def _host_state_from_jobs(jobs: list, host: str) -> str:
+    """Derive a tile status from the most recent terraform-type job for ``host``."""
+    for job in jobs:  # newest-first
+        ptype = str(job.get("pipeline_type") or "")
+        base, _, target = ptype.partition(":")
+        if base not in _TF_JOB_PREFIXES or target.strip().lower() != host.lower():
+            continue
+        status = str(job.get("status") or "").upper()
+        if status == "SUCCESS":
+            return "created"
+        if status in ("FAILED", "ERROR", "ABORTED"):
+            return "failed"
+        if status == "RUNNING":
+            return "provisioning"
+        return "unknown"
+    return "not provisioned"
+
+
+def _scan_terraform_hosts() -> list:
+    """Parse site host YAML → per-host terraform metadata. Ports terraform._scan_terraform_hosts."""
+    config = _engine.config
+    base_dir = config.git_repos_dir / "iac_controller" / "environments"
+    sites_dir = base_dir / "sites"
+    results: list[dict] = []
+    if not sites_dir.exists():
+        return results
+
+    tf_index = _tfvars_host_index(config)
+    try:
+        recent_jobs = _engine.db.get_jobs_for_stats(500)
+    except Exception:
+        recent_jobs = []
+
+    for yaml_file in sites_dir.rglob("*.yml"):
+        parts = yaml_file.parts
+        try:
+            site = parts[parts.index("sites") + 1]
+            stage = parts[parts.index("stages") + 1] if "stages" in parts else "common"
+            with open(yaml_file, "r", encoding="utf-8") as f:
+                data = yaml.safe_load(f) or {}
+            all_hosts = {**(data.get("hosts") or {}), **(data.get("hardware_hosts") or {})}
+            for host_name, host_data in all_hosts.items():
+                if not isinstance(host_data, dict):
+                    continue
+                tf = host_data.get("terraform") if isinstance(host_data.get("terraform"), dict) else {}
+                tf_meta = tf_index.get(host_name)
+                managed = bool(tf) or tf_meta is not None
+                if tf_meta is not None:
+                    node = tf_meta.get("node") or ""
+                    provider = _TF_PROVIDER
+                    resource = (
+                        f'module.lxc_{node}.proxmox_virtual_environment_container.ct["{host_name}"]'
+                        if node else 'proxmox_virtual_environment_container.ct'
+                    )
+                    state = _host_state_from_jobs(recent_jobs, host_name)
+                else:
+                    provider = tf.get("provider", "—")
+                    resource = tf.get("resource", tf.get("type", "—"))
+                    state = tf.get("state", "unknown")
+                results.append({
+                    "site": site, "stage": stage, "host": host_name,
+                    "ansible_host": host_data.get("ansible_host") or host_data.get("address") or "—",
+                    "managed": managed, "provider": provider, "resource": resource,
+                    "workspace": tf.get("workspace", "default"), "state": state,
+                })
+        except (ValueError, IndexError):
+            continue
+        except Exception as exc:
+            _ctx and _ctx.log.error(f"API: Terraform scan failed for {yaml_file}: {exc}")
+
+    return sorted(results, key=lambda x: (not x["managed"], x["site"], x["stage"], x["host"]))
+
+
+async def do_terraform_hosts():
+    """Return per-host Terraform metadata + status (tfvars index + job-derived state)."""
+    if not _engine:
+        raise HTTPException(status_code=500, detail="Engine offline")
+    try:
+        return _scan_terraform_hosts()
+    except Exception as exc:
+        _ctx and _ctx.log.error(f"API: terraform host scan failed: {exc}")
+        raise HTTPException(status_code=500, detail="Terraform host scan failed")
+
+
+# ── Aggregated overview stats ────────────────────────────────────────────────
+
+async def do_get_stats():
+    """Aggregated Overview stats (KPIs, host-lifecycle phases, status breakdown)."""
+    if not _engine:
+        raise HTTPException(status_code=500, detail="Engine offline")
+    from . import stats as _stats
+    try:
+        jobs = _engine.db.get_jobs_for_stats(500)
+    except Exception:
+        jobs = []
+    try:
+        tasks = _engine.db.get_job_tasks_for_stats(1500)
+    except Exception:
+        tasks = []
+    s = _stats.compute(jobs, tasks)
+
+    def _ser_recent(j: dict) -> dict:
+        return {
+            "id": j.get("id"),
+            "pipeline_type": j.get("pipeline_type"),
+            "type_label": j.get("type_label"),
+            "phase": j.get("phase"),
+            "icon": j.get("icon"),
+            "color": j.get("color"),
+            "status": j.get("status"),
+            "progress": j.get("progress", 0),
+            "duration_s": j.get("duration_s"),
+            "duration_human": _stats.humanize_duration(j.get("duration_s")),
+            "start_label": j.get("start_label"),
+        }
+
+    return {
+        "total": s.total,
+        "success": s.success,
+        "failed": s.failed,
+        "running": s.running,
+        "finished": s.finished,
+        "success_rate": s.success_rate,
+        "avg_duration_s": s.avg_duration_s,
+        "avg_duration_human": _stats.humanize_duration(s.avg_duration_s),
+        "last_deployment_status": s.last_deployment_status,
+        "last_deployment_at": s.last_deployment_at.isoformat() if s.last_deployment_at else None,
+        "by_status": s.by_status,
+        "by_phase": [
+            {
+                "phase": p.phase, "label": p.label, "icon": p.icon, "color": p.color,
+                "total": p.total, "success": p.success, "failed": p.failed,
+                "running": p.running, "success_rate": p.success_rate,
+            }
+            for p in s.by_phase
+        ],
+        "recent": [_ser_recent(j) for j in s.recent],
+    }
+
+
+async def do_service_history(service_name: str):
+    """Recent jobs touching a service. Ports db.get_service_history."""
+    if not _engine:
+        raise HTTPException(status_code=500, detail="Engine offline")
+    name = str(service_name or "").strip()
+    return _engine.db.get_service_history(name)
+
+
+# ── Settings (Vault-backed) ──────────────────────────────────────────────────
+
+async def do_get_settings():
+    """Return the orchestrator settings surface. Ports settings.py reads."""
+    if not _ctx or not _service:
+        raise HTTPException(status_code=503, detail="Orchestrator not initialized")
+    return {
+        "auto_apply": bool(_service.state.get("auto_apply_enabled", False)),
+        "test_deploy_allowed_hosts": _ctx.get_secret("iac_test_deploy_allowed_hosts") or "",
+        "gitlab_url": _ctx.get_secret("iac_gitlab_url") or "https://gitlab.int.fam-feser.de",
+        "group_id": _ctx.get_secret("iac_gitlab_group_id") or "",
+        "lyndrix_base_url": _ctx.get_secret("iac_lyndrix_base_url") or "http://10.1.10.31:8081",
+        "gitlab_token_key": _ctx.get_secret("iac_gitlab_api_token_key") or "",
+        "autosync_enabled": (_ctx.get_secret("iac_webhook_autosync_enabled") or "true").lower() != "false",
+        "sync_interval": _safe_int(_ctx.get_secret("iac_webhook_sync_interval_seconds"), 1800),
+        "webhook_endpoint": (
+            f"{str(_ctx.get_secret('iac_lyndrix_base_url') or 'http://10.1.10.31:8081').rstrip('/')}"
+            "/api/iac/webhook/gitlab"
+        ),
+    }
+
+
+async def do_save_settings(payload: SettingsRequest):
+    """Persist the orchestrator settings to Vault. Ports settings.py writes."""
+    if not _ctx or not _service:
+        raise HTTPException(status_code=503, detail="Orchestrator not initialized")
+
+    if payload.auto_apply is not None:
+        _service.state["auto_apply_enabled"] = bool(payload.auto_apply)
+        _ctx.set_secret("iac_auto_apply", str(bool(payload.auto_apply)))
+    if payload.test_deploy_allowed_hosts is not None:
+        _ctx.set_secret(
+            "iac_test_deploy_allowed_hosts",
+            str(payload.test_deploy_allowed_hosts or "").strip(),
+        )
+    if payload.gitlab_url is not None:
+        _ctx.set_secret("iac_gitlab_url", str(payload.gitlab_url or "").strip())
+    if payload.group_id is not None:
+        _ctx.set_secret("iac_gitlab_group_id", str(payload.group_id or "").strip())
+    if payload.lyndrix_base_url is not None:
+        _ctx.set_secret("iac_lyndrix_base_url", str(payload.lyndrix_base_url or "").strip())
+    if payload.gitlab_token_key is not None:
+        _ctx.set_secret("iac_gitlab_api_token_key", str(payload.gitlab_token_key or "").strip())
+    if payload.autosync_enabled is not None:
+        _ctx.set_secret(
+            "iac_webhook_autosync_enabled",
+            "true" if payload.autosync_enabled else "false",
+        )
+    if payload.sync_interval is not None:
+        interval = max(300, _safe_int(payload.sync_interval, 1800))
+        _ctx.set_secret("iac_webhook_sync_interval_seconds", str(interval))
+
+    return await do_get_settings()
+
+
+async def do_get_webhook_token():
+    """Return whether the webhook token is set, masked (never the raw value)."""
+    if not _ctx:
+        raise HTTPException(status_code=503, detail="Context offline")
+    token = _ctx.get_secret("gitlab_webhook_token")
+    return {
+        "configured": bool(token),
+        "masked": "•" * 32 if token else "",
+    }
+
+
+async def do_generate_webhook_token():
+    """Generate + store a new GitLab webhook token. Returns the raw value once."""
+    if not _ctx:
+        raise HTTPException(status_code=503, detail="Context offline")
+    new_token = secrets.token_urlsafe(32)
+    _ctx.set_secret("gitlab_webhook_token", new_token)
+    _ctx.log.info("API: New GitLab webhook token generated and stored in Vault.")
+    return {"status": "ok", "token": new_token}
+
+
+async def do_sync_webhooks_authed():
+    """Auth'd, idempotent re-registration of the group webhooks (Settings button)."""
+    if not _ctx:
+        raise HTTPException(status_code=500, detail="API Context not initialized")
+    from .gitlab_webhooks import sync_group_webhooks_from_ctx, WebhookConfigError
+    try:
+        result = await asyncio.to_thread(sync_group_webhooks_from_ctx, _ctx)
+    except WebhookConfigError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        _ctx.log.error(f"WEBHOOK SYNC ERROR: {exc}")
+        raise HTTPException(status_code=502, detail=f"Webhook sync failed: {exc}")
+    return {"status": "ok", **result}
 
 
 def _job_stream_snapshot() -> dict:
