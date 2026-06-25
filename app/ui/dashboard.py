@@ -121,51 +121,112 @@ async def render_dashboard(ctx, service):
         state["active_tasks"] = {}
         ui.notify("Execution Aborted Successfully.", type="info")
         
-    active_log_job = {"id": None}
+    # Live viewer state. ``offset`` is the byte position we have already streamed,
+    # so each poll reads ONLY the new bytes (append-only log) instead of re-reading
+    # and re-rendering the whole file. ``grep`` tracks the active filter term.
+    active_log_job = {"id": None, "offset": 0, "grep": ""}
+    # How much trailing log to seed the viewer with when it opens (recent context
+    # without loading a huge file), and how far back grep scans for matches.
+    LOG_SEED_BYTES = 200_000
+    LOG_GREP_SCAN_BYTES = 1_000_000
 
     with ui.dialog() as log_viewer, ui.card().classes(f'w-full max-w-5xl h-[90vh] sm:h-[80vh] p-0 flex flex-col no-wrap !bg-black {UIStyles.MODAL_CONTAINER}'):
         with ui.row().classes('w-full p-3 sm:p-4 justify-between items-center gap-3 flex-wrap border-b border-zinc-800 bg-zinc-900'):
             with ui.row().classes('items-center gap-3 flex-wrap flex-1 min-w-0'):
                 log_title = ui.label("Live Stream").classes('text-indigo-400 font-bold shrink-0')
                 log_search = ui.input('Filter logs (grep)...').props('outlined dense clearable dark').classes('w-full sm:w-64')
-            ui.button(icon='close', on_click=log_viewer.close).props('flat round dense color=zinc-500')
-        with ui.scroll_area().classes('w-full flex-grow bg-black p-4') as log_scroll:
-            log_stream = ui.label().classes('whitespace-pre-wrap font-mono text-[11px] text-green-500 break-words')
+            with ui.row().classes('items-center gap-1 shrink-0'):
+                ui.button(icon='download', on_click=lambda: download_full_log()).props('flat round dense color=zinc-500').tooltip('Download full log')
+                ui.button(icon='close', on_click=log_viewer.close).props('flat round dense color=zinc-500')
+        # ui.log is an append-only, DOM-bounded element (older lines past max_lines are
+        # dropped from the DOM) with built-in autoscroll — the right tool for streaming.
+        log_stream = ui.log(max_lines=4000).classes('w-full flex-grow min-h-0 bg-black font-mono text-[11px] text-green-500')
+
+    def download_full_log():
+        jid = active_log_job["id"]
+        if not jid:
+            return
+        p = config.get_log_path(jid)
+        if p.exists():
+            ui.download(str(p), filename=f"job_{jid}.log")
+        else:
+            ui.notify("No log file on disk for this job.", type='warning')
+
+    def _push_lines(lines):
+        for ln in lines:
+            log_stream.push(ln)
 
     def update_log_content():
         if not log_viewer.value or not active_log_job["id"]:
             return
         log_path = config.get_log_path(active_log_job["id"])
-        if log_path.exists():
+        if not log_path.exists():
+            return
+        term = (log_search.value or "").lower()
+
+        # Grep mode: re-render a bounded, filtered tail (scans only the last ~1MB).
+        # Full-history search is available via the downloadable raw log.
+        if term:
+            try:
+                size = log_path.stat().st_size
+                with open(log_path, 'r', encoding='utf-8', errors='replace') as f:
+                    f.seek(max(0, size - LOG_GREP_SCAN_BYTES))
+                    chunk = f.read()
+            except Exception:
+                return
+            matched = [ln for ln in chunk.split('\n') if term in ln.lower()]
+            log_stream.clear()
+            _push_lines(matched[-4000:])
+            active_log_job["grep"] = term
+            return
+
+        # Just left grep mode -> reset back to incremental tailing from scratch.
+        if active_log_job["grep"]:
+            active_log_job["grep"] = ""
+            active_log_job["offset"] = 0
+            log_stream.clear()
+
+        # Incremental mode: read only bytes appended since the stored offset.
+        try:
+            size = log_path.stat().st_size
+            off = active_log_job["offset"]
+            if off and off == size:
+                return  # nothing new
+            reset = False
+            drop_partial = False
+            if off == 0 or off > size:  # seed, or file shrank/rotated -> re-seed
+                start = max(0, size - LOG_SEED_BYTES)
+                drop_partial = start > 0
+                reset = True
+            else:
+                start = off
             with open(log_path, 'r', encoding='utf-8', errors='replace') as f:
-                f.seek(0, 2)
-                file_size = f.tell()
-                if file_size > 1048576:
-                    f.seek(file_size - 100000)
-                    new_text = "[TRUNCATED] Showing last 100kb of logs...\n\n" + f.read()
-                else:
-                    f.seek(0)
-                    new_text = f.read()
-                
-                # Apply grep-style filtering if a search term is provided
-                term = (log_search.value or "").lower()
-                if term:
-                    filtered_lines = [line for line in new_text.split('\n') if term in line.lower()]
-                    new_text = f"[FILTERED FOR: '{term}']\n" + '\n'.join(filtered_lines)
-                
-                if log_stream.text != new_text:
-                    log_stream.set_text(new_text)
-                    log_scroll.scroll_to(percent=1.0)
-        elif log_stream.text == "Loading...":
-            log_stream.set_text("No log file found on disk. (Legacy job or delayed write)")
+                f.seek(start)
+                chunk = f.read()
+            active_log_job["offset"] = size
+        except Exception:
+            return
+
+        lines = chunk.split('\n')
+        if lines and lines[-1] == '':
+            lines.pop()
+        if drop_partial and lines:
+            lines = lines[1:]
+        if reset:
+            log_stream.clear()
+        if lines:
+            _push_lines(lines)
 
     log_search.on('update:model-value', update_log_content)
     ui.timer(1.0, update_log_content)
 
     def open_live_logs(job_id):
         active_log_job["id"] = job_id
+        active_log_job["offset"] = 0
+        active_log_job["grep"] = ""
+        log_search.value = ""
         log_title.set_text(f"Live Pipeline Logs: Job #{job_id}")
-        log_stream.set_text("Loading...")
+        log_stream.clear()
         log_viewer.open()
         update_log_content()
 

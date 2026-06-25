@@ -1,15 +1,34 @@
+"""Shared IaC Orchestrator API logic.
+
+This module holds the plugin's API *state* (the ctx/engine/service handles set
+via :func:`init_api`), all helper functions, request models, and the concrete
+handler logic (the ``do_*`` coroutines). The actual routers are assembled
+elsewhere:
+
+  * ``app/controller/webhook_router.py`` — the PUBLIC ``/api/iac`` router, mounted
+    DIRECTLY on the FastAPI app (never via the plugin registry, which would force
+    header auth and break external GitLab callers). Its handlers validate the
+    ``x_gitlab_token`` themselves.
+  * ``app/api.py`` — the AUTH'D plugin router (mounted via ``ctx.register_routes``;
+    the registry already wraps every route with ``require_api_auth``) plus the SSE
+    stream router (mounted directly so ``EventSource`` can authenticate via a
+    ``?token=`` query parameter instead of a Bearer header).
+
+Keeping the logic here means both routers share one implementation and one set of
+helpers — there is exactly one place that knows how to verify a webhook token,
+build an orchestrator event, or read a job log file.
+"""
 import hmac
+import json
 import yaml
 import time
 import re
+import secrets
 import asyncio
-from fastapi import APIRouter, Request, Header, HTTPException, Depends
+from pathlib import Path
+
+from fastapi import Request, Header, HTTPException
 from pydantic import BaseModel, Field
-
-from core.api import require_api_auth
-from .gitlab_webhooks import sync_group_webhooks_from_ctx, WebhookConfigError
-
-iac_api_router = APIRouter(prefix="/api/iac", tags=["IaC Orchestrator"])
 
 # Internal references to be set by init_api
 _ctx = None
@@ -17,6 +36,7 @@ _engine = None
 _service = None
 _recent_events = {}
 _EVENT_TTL_SECONDS = 90
+
 
 def init_api(ctx, service):
     """Initializes the API module with the required context and execution engine."""
@@ -79,6 +99,32 @@ def _require_gitlab_token(x_gitlab_token: str | None):
         _ctx.log.warning("SECURITY REJECTION: Unauthorized webhook attempt.")
         raise HTTPException(status_code=401, detail="Unauthorized")
 
+
+def _validate_stream_token(token: str | None) -> bool:
+    """Validate an SSE ``?token=`` against the same credentials core's API accepts.
+
+    EventSource cannot send an Authorization header, so the live job stream takes
+    the bearer token (the ``lyk_...`` value the React app stores as
+    ``lyndrix_token``) as a query parameter and validates it here in-handler. We
+    accept either the master system API key or a valid per-user API key — the same
+    two key mechanisms core's ``authenticate_request`` honours for bearer tokens.
+    """
+    if not token:
+        return False
+    try:
+        from core.api import resolve_system_api_key
+        sys_key = resolve_system_api_key()
+        if sys_key and hmac.compare_digest(token.strip(), sys_key):
+            return True
+    except Exception:
+        pass
+    try:
+        from core.components.auth.logic.api_key_service import api_key_service
+        return api_key_service.verify(token.strip()) is not None
+    except Exception as exc:
+        if _ctx:
+            _ctx.log.debug(f"STREAM: token verification failed: {exc}")
+        return False
 
 
 def _prune_recent_events(now: float):
@@ -260,116 +306,7 @@ def _build_orchestrator_event(payload: dict) -> tuple[dict | None, str]:
     }, "single_service pipeline event"
 
 
-@iac_api_router.get("/health")
-async def health_check():
-    """Returns a lightweight health snapshot for the orchestrator plugin."""
-    if not _ctx or not _engine:
-        raise HTTPException(status_code=503, detail="Orchestrator not initialized")
-
-    return {
-        "status": "healthy",
-        "version": getattr(_ctx.manifest, "version", "unknown"),
-        "db_connected": bool(getattr(_engine.db, "engine", None)),
-        "vault_ready": _ctx.get_secret("iac_auto_apply") is not None,
-        "active_workers": len((_engine.state or {}).get("active_tasks", {})),
-    }
-
-@iac_api_router.post("/webhook/gitlab")
-async def gitlab_webhook(request: Request, x_gitlab_token: str = Header(None)):
-    """
-    Endpoint for GitLab webhooks. Validates security tokens and triggers
-    the internal event bus for processing.
-    """
-    if not _ctx:
-        raise HTTPException(status_code=500, detail="API Context not initialized")
-
-    # 1. Security Check
-    _require_gitlab_token(x_gitlab_token)
-
-    # 2. Payload Processing
-    try:
-        payload = await request.json()
-        project_name = payload.get("project", {}).get("name", "unknown")
-        _ctx.log.info(f"WEBHOOK: Verified push for project '{project_name}'.")
-
-        now = time.time()
-        _prune_recent_events(now)
-        ev_key = _event_key(payload)
-        if ev_key in _recent_events:
-            _ctx.log.info(f"WEBHOOK: Duplicate delivery ignored ({ev_key}).")
-            return {"status": "ignored", "reason": "duplicate", "event_key": ev_key}
-        _recent_events[ev_key] = now
-
-        # Bridge into the central notification engine via the internal event bus.
-        _emit_internal_notification(payload)
-
-        should_trigger, reason = _should_trigger_orchestrator(payload)
-        if not should_trigger:
-            _ctx.log.info(f"WEBHOOK: Accepted but did not trigger orchestrator ({reason}).")
-            return {"status": "accepted", "triggered": False, "reason": reason}
-
-        event_payload, event_reason = _build_orchestrator_event(payload)
-        if not event_payload:
-            _ctx.log.info(
-                f"WEBHOOK: Accepted but did not trigger orchestrator ({event_reason})."
-            )
-            return {
-                "status": "accepted",
-                "triggered": False,
-                "reason": event_reason,
-            }
-
-        # 3. Emit event to decouple request from execution
-        _ctx.emit("iac:webhook_verified", event_payload)
-        _emit_webhook_verified(event_payload)
-
-        return {
-            "status": "accepted",
-            "triggered": True,
-            "reason": f"{reason}; {event_reason}",
-        }
-    except Exception as e:
-        _ctx.log.error(f"WEBHOOK ERROR: {str(e)}")
-        raise HTTPException(status_code=400, detail="Malformed JSON payload")
-
-
-@iac_api_router.post("/webhook/sync")
-async def sync_webhooks(x_gitlab_token: str = Header(None)):
-    """Token-protected, idempotent re-registration of the group webhooks.
-
-    Lets iac-controller CI onboard newly created service repos (registers the
-    merge-request hook) without a manual Settings-UI click. Scans the whole
-    group, so it does not need to know which repo is new.
-    """
-    if not _ctx:
-        raise HTTPException(status_code=500, detail="API Context not initialized")
-    _require_gitlab_token(x_gitlab_token)
-    try:
-        result = await asyncio.to_thread(sync_group_webhooks_from_ctx, _ctx)
-    except WebhookConfigError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    except Exception as exc:
-        _ctx.log.error(f"WEBHOOK SYNC ERROR: {exc}")
-        raise HTTPException(status_code=502, detail=f"Webhook sync failed: {exc}")
-    _ctx.log.info(
-        f"WEBHOOK SYNC: projects={result['projects_total']} "
-        f"created={result['created']} updated={result['updated']} failed={result['failed']}"
-    )
-    return {"status": "ok", **result}
-
-
-# --- NEW EXPOSED CONTROL ENDPOINTS ---
-
-@iac_api_router.get("/catalog", dependencies=[Depends(require_api_auth)])
-async def get_service_catalog():
-    """Returns the parsed global service catalog."""
-    if not _engine: raise HTTPException(status_code=500, detail="Engine offline")
-    catalog_file = _engine.config.git_repos_dir / "iac_controller" / "environments" / "global" / "02_service_catalog.yml"
-    if catalog_file.exists():
-        with open(catalog_file, 'r') as f:
-            data = yaml.safe_load(f) or {}
-            return data.get("service_catalog", {}).get("services", [])
-    return []
+# ── Request models ──────────────────────────────────────────────────────────
 
 class DeployRequest(BaseModel):
     branch: str = "main"
@@ -377,6 +314,35 @@ class DeployRequest(BaseModel):
 
 class TestHostDeployRequest(BaseModel):
     services: list[str] = Field(default_factory=list)
+
+
+# Generic operation trigger. Mirrors the NiceGUI Assignments-tab buttons, which
+# all run ``ctx.emit("iac:webhook_verified", {pipeline_type, limit|host_name, ...})``.
+_PIPELINE_TYPES = {"bootstrap_compliance", "adopt_host", "rollout", "init_host", "compliance"}
+
+
+class PipelineRequest(BaseModel):
+    pipeline_type: str
+    limit: str | None = None       # "all" | "<site>" | "<host>"
+    host_name: str | None = None   # exact host token for host-scoped actions
+
+
+class SettingsRequest(BaseModel):
+    auto_apply: bool | None = None
+    test_deploy_allowed_hosts: str | None = None
+    gitlab_url: str | None = None
+    group_id: str | None = None
+    lyndrix_base_url: str | None = None
+    gitlab_token_key: str | None = None
+    autosync_enabled: bool | None = None
+    sync_interval: int | None = None
+
+
+def _safe_int(value, default: int) -> int:
+    try:
+        return int(float(str(value).strip()))
+    except (TypeError, ValueError):
+        return default
 
 
 _HOST_LIMIT_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
@@ -395,8 +361,100 @@ def _load_generated_inventory_hosts() -> set[str]:
         return set()
     return set(((inv.get("all") or {}).get("hosts") or {}).keys())
 
-@iac_api_router.post("/deploy/service/{service_name}", dependencies=[Depends(require_api_auth)])
-async def trigger_service_deployment(service_name: str, payload: DeployRequest):
+
+# ── Handler logic (router-agnostic) ─────────────────────────────────────────
+
+async def do_health():
+    """Returns a lightweight health snapshot for the orchestrator plugin."""
+    if not _ctx or not _engine:
+        raise HTTPException(status_code=503, detail="Orchestrator not initialized")
+    return {
+        "status": "healthy",
+        "version": getattr(_ctx.manifest, "version", "unknown"),
+        "db_connected": bool(getattr(_engine.db, "engine", None)),
+        "vault_ready": _ctx.get_secret("iac_auto_apply") is not None,
+        "active_workers": len((_engine.state or {}).get("active_tasks", {})),
+    }
+
+
+async def do_gitlab_webhook(request: Request, x_gitlab_token: str | None):
+    """Verify a GitLab webhook and bridge it into the internal event bus."""
+    if not _ctx:
+        raise HTTPException(status_code=500, detail="API Context not initialized")
+
+    _require_gitlab_token(x_gitlab_token)
+
+    try:
+        payload = await request.json()
+        project_name = payload.get("project", {}).get("name", "unknown")
+        _ctx.log.info(f"WEBHOOK: Verified push for project '{project_name}'.")
+
+        now = time.time()
+        _prune_recent_events(now)
+        ev_key = _event_key(payload)
+        if ev_key in _recent_events:
+            _ctx.log.info(f"WEBHOOK: Duplicate delivery ignored ({ev_key}).")
+            return {"status": "ignored", "reason": "duplicate", "event_key": ev_key}
+        _recent_events[ev_key] = now
+
+        _emit_internal_notification(payload)
+
+        should_trigger, reason = _should_trigger_orchestrator(payload)
+        if not should_trigger:
+            _ctx.log.info(f"WEBHOOK: Accepted but did not trigger orchestrator ({reason}).")
+            return {"status": "accepted", "triggered": False, "reason": reason}
+
+        event_payload, event_reason = _build_orchestrator_event(payload)
+        if not event_payload:
+            _ctx.log.info(
+                f"WEBHOOK: Accepted but did not trigger orchestrator ({event_reason})."
+            )
+            return {"status": "accepted", "triggered": False, "reason": event_reason}
+
+        _ctx.emit("iac:webhook_verified", event_payload)
+        _emit_webhook_verified(event_payload)
+
+        return {"status": "accepted", "triggered": True, "reason": f"{reason}; {event_reason}"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        _ctx.log.error(f"WEBHOOK ERROR: {str(e)}")
+        raise HTTPException(status_code=400, detail="Malformed JSON payload")
+
+
+async def do_sync_webhooks(x_gitlab_token: str | None):
+    """Token-protected, idempotent re-registration of the group webhooks."""
+    if not _ctx:
+        raise HTTPException(status_code=500, detail="API Context not initialized")
+    _require_gitlab_token(x_gitlab_token)
+    from .gitlab_webhooks import sync_group_webhooks_from_ctx, WebhookConfigError
+    try:
+        result = await asyncio.to_thread(sync_group_webhooks_from_ctx, _ctx)
+    except WebhookConfigError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        _ctx.log.error(f"WEBHOOK SYNC ERROR: {exc}")
+        raise HTTPException(status_code=502, detail=f"Webhook sync failed: {exc}")
+    _ctx.log.info(
+        f"WEBHOOK SYNC: projects={result['projects_total']} "
+        f"created={result['created']} updated={result['updated']} failed={result['failed']}"
+    )
+    return {"status": "ok", **result}
+
+
+async def do_get_catalog():
+    """Returns the parsed global service catalog."""
+    if not _engine:
+        raise HTTPException(status_code=500, detail="Engine offline")
+    catalog_file = _engine.config.git_repos_dir / "iac_controller" / "environments" / "global" / "02_service_catalog.yml"
+    if catalog_file.exists():
+        with open(catalog_file, 'r') as f:
+            data = yaml.safe_load(f) or {}
+            return data.get("service_catalog", {}).get("services", [])
+    return []
+
+
+async def do_trigger_service_deployment(service_name: str, payload: DeployRequest):
     """Triggers a targeted single-service deployment."""
     if not _ctx:
         raise HTTPException(status_code=500, detail="Context offline")
@@ -413,19 +471,7 @@ async def trigger_service_deployment(service_name: str, payload: DeployRequest):
     return {"status": "accepted", "message": f"Deployment queued for {normalized_service}"}
 
 
-@iac_api_router.post("/deploy/service/{service_name}/gitlab")
-async def trigger_service_deployment_gitlab(
-    service_name: str,
-    payload: DeployRequest,
-    x_gitlab_token: str = Header(None),
-):
-    """GitLab-token-protected single-service trigger endpoint for CI pipelines."""
-    _require_gitlab_token(x_gitlab_token)
-    return await trigger_service_deployment(service_name, payload)
-
-
-@iac_api_router.get("/deploy/service/{service_name}/status", dependencies=[Depends(require_api_auth)])
-async def get_service_deployment_status(service_name: str, since_epoch: int = 0):
+async def do_get_service_status(service_name: str, since_epoch: int = 0):
     """Returns the latest deployment status for a service, optionally after an epoch timestamp."""
     if not _engine:
         raise HTTPException(status_code=500, detail="Engine offline")
@@ -463,29 +509,8 @@ async def get_service_deployment_status(service_name: str, since_epoch: int = 0)
     }
 
 
-@iac_api_router.get("/deploy/service/{service_name}/gitlab/status")
-async def get_service_deployment_status_gitlab(
-    service_name: str,
-    since_epoch: int = 0,
-    x_gitlab_token: str = Header(None),
-):
-    """GitLab-token-protected deployment status endpoint for CI wait loops."""
-    _require_gitlab_token(x_gitlab_token)
-    return await get_service_deployment_status(service_name, since_epoch=since_epoch)
-
-
-@iac_api_router.post("/deploy/test-host/{host_name}", dependencies=[Depends(require_api_auth)])
-async def trigger_test_host_deployment(host_name: str, payload: TestHostDeployRequest):
-    """
-    Triggers a guarded host_provision run (Terraform + Ansible bootstrap +
-    host rollout hand-off) for exactly one host.
-
-    Safety constraints:
-    - host must be an exact hostname token (no Ansible patterns/wildcards),
-    - host must be listed in `PLUGIN_IAC_ORCHESTRATOR_TEST_DEPLOY_ALLOWED_HOSTS`
-      (or Vault key `iac_test_deploy_allowed_hosts`),
-    - host must exist in the generated inventory.
-    """
+async def do_trigger_test_host_deployment(host_name: str, payload: TestHostDeployRequest):
+    """Triggers a guarded host_provision run for exactly one allow-listed host."""
     if not _ctx or not _engine:
         raise HTTPException(status_code=500, detail="Orchestrator offline")
 
@@ -507,10 +532,7 @@ async def trigger_test_host_deployment(host_name: str, payload: TestHostDeployRe
             ),
         )
     if host not in allowed_hosts:
-        raise HTTPException(
-            status_code=403,
-            detail=f"Host '{host}' is not in test-deploy allowlist.",
-        )
+        raise HTTPException(status_code=403, detail=f"Host '{host}' is not in test-deploy allowlist.")
 
     known_hosts = _load_generated_inventory_hosts()
     if host not in known_hosts:
@@ -526,7 +548,6 @@ async def trigger_test_host_deployment(host_name: str, payload: TestHostDeployRe
         "trigger": "manual_test_host",
         "test_host": host,
     }
-
     _ctx.emit("iac:webhook_verified", event_payload)
     _emit_webhook_verified(event_payload)
     return {
@@ -537,36 +558,8 @@ async def trigger_test_host_deployment(host_name: str, payload: TestHostDeployRe
     }
 
 
-@iac_api_router.post("/webhook/gitlab/test-host/{host_name}")
-async def gitlab_test_host_webhook(
-    host_name: str,
-    payload: TestHostDeployRequest,
-    x_gitlab_token: str = Header(None),
-):
-    """
-    GitLab-token-protected webhook variant for test-host rollout triggering.
-    Useful when CI should only call a Lyndrix webhook endpoint.
-    """
-    if not _ctx:
-        raise HTTPException(status_code=500, detail="API Context not initialized")
-
-    _require_gitlab_token(x_gitlab_token)
-
-    return await trigger_test_host_deployment(host_name, payload)
-
-
-@iac_api_router.post("/bootstrap/{host_name}", dependencies=[Depends(require_api_auth)])
-async def trigger_host_bootstrap(host_name: str, payload: TestHostDeployRequest):
-    """
-    Triggers a guarded compliance/bootstrap run (cd_compliance.yml) for exactly
-    one host, connecting as root with the Terraform-injected key
-    (Vault: iac_tf_ssh_private_key).
-
-    Safety constraints mirror the test-host deploy:
-    - host must be an exact hostname token (no Ansible patterns/wildcards),
-    - host must be listed in the test-deploy allowlist,
-    - host must exist in the generated inventory.
-    """
+async def do_trigger_host_bootstrap(host_name: str, payload: TestHostDeployRequest):
+    """Triggers a guarded compliance/bootstrap run for exactly one allow-listed host."""
     if not _ctx or not _engine:
         raise HTTPException(status_code=500, detail="Orchestrator offline")
 
@@ -588,10 +581,7 @@ async def trigger_host_bootstrap(host_name: str, payload: TestHostDeployRequest)
             ),
         )
     if host not in allowed_hosts:
-        raise HTTPException(
-            status_code=403,
-            detail=f"Host '{host}' is not in the allowlist.",
-        )
+        raise HTTPException(status_code=403, detail=f"Host '{host}' is not in the allowlist.")
 
     known_hosts = _load_generated_inventory_hosts()
     if host not in known_hosts:
@@ -606,7 +596,6 @@ async def trigger_host_bootstrap(host_name: str, payload: TestHostDeployRequest)
         "manual": True,
         "trigger": "manual_bootstrap",
     }
-
     _ctx.emit("iac:webhook_verified", event_payload)
     _emit_webhook_verified(event_payload)
     return {
@@ -615,14 +604,9 @@ async def trigger_host_bootstrap(host_name: str, payload: TestHostDeployRequest)
         "host_name": host,
     }
 
-@iac_api_router.post("/infra/plan", dependencies=[Depends(require_api_auth)])
-async def trigger_infra_plan():
-    """Triggers a read-only whole-infrastructure Terraform plan ("Check Env").
 
-    Renders and runs ``tofu plan`` across every non-empty environment without
-    applying anything, so the operator can compare the live infrastructure
-    against the desired Terraform plan.
-    """
+async def do_trigger_infra_plan():
+    """Triggers a read-only whole-infrastructure Terraform plan ("Check Env")."""
     if not _ctx:
         raise HTTPException(status_code=500, detail="Context offline")
     infra_plan_payload = {"pipeline_type": "infra_plan", "manual": True, "trigger": "manual_infra_plan"}
@@ -631,15 +615,8 @@ async def trigger_infra_plan():
     return {"status": "accepted", "message": "Infrastructure plan (Check Env) queued."}
 
 
-@iac_api_router.post("/infra/apply", dependencies=[Depends(require_api_auth)])
-async def trigger_infra_apply():
-    """Triggers a whole-infrastructure Terraform apply ("Deploy Infra").
-
-    Runs ``tofu apply`` across every non-empty environment. The explicit
-    ``approve`` flag forces the apply regardless of the ``auto_apply`` config so
-    this manual, operator-initiated action always applies — while the automatic
-    webhook path stays gated by ``auto_apply``.
-    """
+async def do_trigger_infra_apply():
+    """Triggers a whole-infrastructure Terraform apply ("Deploy Infra")."""
     if not _ctx:
         raise HTTPException(status_code=500, detail="Context offline")
     infra_apply_payload = {
@@ -653,34 +630,662 @@ async def trigger_infra_apply():
     return {"status": "accepted", "message": "Infrastructure deploy queued."}
 
 
-@iac_api_router.post("/infra/plan/gitlab")
-async def trigger_infra_plan_gitlab(x_gitlab_token: str = Header(None)):
-    """GitLab-token-protected infra plan trigger for CI (e.g. iac-controller).
-
-    Same read-only whole-infra plan as /infra/plan, but authenticated so it can
-    be called over the network from a pipeline.
-    """
-    _require_gitlab_token(x_gitlab_token)
-    return await trigger_infra_plan()
-
-
-@iac_api_router.post("/infra/apply/gitlab")
-async def trigger_infra_apply_gitlab(x_gitlab_token: str = Header(None)):
-    """GitLab-token-protected infra apply trigger for CI (e.g. iac-controller).
-
-    Lets an iac-controller (SSoT) push reconcile infrastructure: rule-driven, so
-    dev/test apply while prod stays plan-gated via pipeline_rules. Authenticated
-    variant of /infra/apply for network/CI callers.
-    """
-    _require_gitlab_token(x_gitlab_token)
-    return await trigger_infra_apply()
-
-
-@iac_api_router.get("/jobs", dependencies=[Depends(require_api_auth)])
-async def list_orchestrator_jobs(limit: int = 20):
+async def do_list_jobs(limit: int = 20):
     """Returns a list of recent and active jobs."""
-    if not _engine: raise HTTPException(status_code=500, detail="Engine offline")
+    if not _engine:
+        raise HTTPException(status_code=500, detail="Engine offline")
     return _engine.db.get_recent_jobs(limit)
 
-    
-    
+
+# Default amount of trailing log to seed an offset=0 tail request with, so the UI
+# gets recent context without ever reading a multi-hundred-MB file into memory.
+_LOG_TAIL_BYTES = 256 * 1024
+# Hard cap on grep matches returned in one response (grep streams the file line by
+# line, so memory stays flat regardless of file size; this just bounds the payload).
+_LOG_GREP_MAX = 5000
+
+
+async def do_job_logs(
+    job_id: int,
+    tail: int = 200,
+    grep: str | None = None,
+    offset: int = 0,
+):
+    """Incrementally tail a job's on-disk log file (memory-bounded).
+
+    The log file is append-only, so callers track a byte ``offset`` and fetch only
+    the new bytes since their last poll — O(new data) instead of re-reading the
+    whole file. Behaviour:
+
+    * ``offset > 0`` (and within the file): return only the bytes after ``offset``.
+    * ``offset > size`` (file rotated / new job / truncated): reset and tail.
+    * ``offset == 0``: seed with the last ``_LOG_TAIL_BYTES`` (drop the partial
+      first line) so the viewer opens with recent context.
+    * ``grep``: stream the file line by line (never loaded whole) and return up to
+      ``_LOG_GREP_MAX`` matching lines from the end.
+
+    Always returns the new ``offset`` (== current file size) and ``size`` so the
+    caller can resume. The full, unbounded log is served separately by
+    :func:`do_job_log_raw`.
+    """
+    if not _engine:
+        raise HTTPException(status_code=500, detail="Engine offline")
+
+    log_path = _engine.config.get_log_path(job_id)
+    if not log_path or not Path(log_path).exists():
+        # Fall back to any legacy logs stored in the DB row.
+        return {
+            "job_id": job_id,
+            "lines": _engine.db.get_job_logs(job_id),
+            "source": "db",
+            "offset": 0,
+            "size": 0,
+            "tail": tail,
+            "grep": grep,
+        }
+
+    try:
+        size = log_path.stat().st_size
+
+        # grep: stream-scan the whole file line by line, keep only the last N matches.
+        if grep:
+            term = grep.lower()
+            from collections import deque
+            matches: deque = deque(maxlen=_LOG_GREP_MAX)
+            with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+                for ln in f:
+                    if term in ln.lower():
+                        matches.append(ln.rstrip("\n"))
+            return {
+                "job_id": job_id,
+                "lines": list(matches),
+                "source": "file",
+                "offset": size,
+                "size": size,
+                "tail": tail,
+                "grep": grep,
+            }
+
+        # Incremental / tail read (no whole-file load).
+        start = 0
+        drop_partial = False
+        if offset and 0 < offset <= size:
+            start = offset
+        elif offset > size:
+            start = max(0, size - _LOG_TAIL_BYTES)
+            drop_partial = start > 0
+        else:  # offset == 0
+            start = max(0, size - _LOG_TAIL_BYTES)
+            drop_partial = start > 0
+
+        with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+            f.seek(start)
+            chunk = f.read()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Failed to read log: {exc}")
+
+    lines = chunk.split("\n")
+    # Drop a trailing empty element from a chunk that ended on a newline.
+    if lines and lines[-1] == "":
+        lines.pop()
+    # When we seeked into the middle of the file, the first line is partial.
+    if drop_partial and lines:
+        lines = lines[1:]
+
+    return {
+        "job_id": job_id,
+        "lines": lines,
+        "source": "file",
+        "offset": size,
+        "size": size,
+        "tail": tail,
+        "grep": grep,
+    }
+
+
+async def do_job_log_raw(job_id: int, download: bool = False):
+    """Stream the ENTIRE job log file to the browser without loading it into memory.
+
+    Backs the "Open full log" / "Download" actions. ``FileResponse`` streams the
+    file in chunks, so a 100 MB+ log costs ~constant server memory. Served from the
+    stream router with ``?token=`` auth because the browser opens this URL directly
+    (a new tab / download) and cannot send a Bearer header.
+    """
+    from fastapi.responses import FileResponse
+
+    if not _engine:
+        raise HTTPException(status_code=500, detail="Engine offline")
+
+    log_path = _engine.config.get_log_path(job_id)
+    if not log_path or not Path(log_path).exists():
+        raise HTTPException(status_code=404, detail="Log file not found")
+
+    disposition = "attachment" if download else "inline"
+    return FileResponse(
+        str(log_path),
+        media_type="text/plain; charset=utf-8",
+        headers={
+            "Content-Disposition": f'{disposition}; filename="job_{job_id}.log"',
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+async def do_job_runners(job_id: int):
+    """Return the in-memory active runner tasks attributed to a job."""
+    if not _engine:
+        raise HTTPException(status_code=500, detail="Engine offline")
+    active = (_engine.state or {}).get("active_tasks", {}) or {}
+    runners = {
+        name: data
+        for name, data in active.items()
+        if isinstance(data, dict) and data.get("job_id") == job_id
+    }
+    return {"job_id": job_id, "runners": runners}
+
+
+# ── Generic operation trigger / abort ───────────────────────────────────────
+
+async def do_run_pipeline(payload: PipelineRequest):
+    """Generic operation trigger replacing the ~10 NiceGUI global/site/host buttons.
+
+    Ports the exact path those handlers use: emit ``iac:webhook_verified`` with the
+    same payload shape (``pipeline_type`` plus ``limit`` and/or ``host_name``).
+    """
+    if not _ctx:
+        raise HTTPException(status_code=500, detail="Context offline")
+
+    pipeline_type = str(payload.pipeline_type or "").strip()
+    if pipeline_type not in _PIPELINE_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported pipeline_type. Allowed: {sorted(_PIPELINE_TYPES)}",
+        )
+
+    limit = str(payload.limit or "").strip()
+    host = str(payload.host_name or "").strip()
+    if not limit and not host:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide either 'limit' (all|<site>|<host>) or 'host_name'.",
+        )
+    if host and not _HOST_LIMIT_PATTERN.fullmatch(host):
+        raise HTTPException(status_code=400, detail="Invalid host_name token.")
+    if limit and not _HOST_LIMIT_PATTERN.fullmatch(limit):
+        raise HTTPException(status_code=400, detail="Invalid limit token.")
+
+    event_payload: dict = {"pipeline_type": pipeline_type, "manual": True, "trigger": "ui_pipeline"}
+    if limit:
+        event_payload["limit"] = limit
+    if host:
+        event_payload["host_name"] = host
+
+    _ctx.emit("iac:webhook_verified", event_payload)
+    _emit_webhook_verified(event_payload)
+    target = host or limit
+    return {
+        "status": "accepted",
+        "message": f"Pipeline '{pipeline_type}' queued for '{target}'.",
+        "pipeline_type": pipeline_type,
+        "limit": limit or None,
+        "host_name": host or None,
+    }
+
+
+async def do_abort():
+    """Abort the running execution: kill runner containers, mark RUNNING jobs ABORTED.
+
+    Ports the NiceGUI ``abort_execution`` handler (dashboard.py).
+    """
+    if not _ctx or not _engine or not _service:
+        raise HTTPException(status_code=503, detail="Orchestrator not initialized")
+
+    state = _service.state
+    _ctx.log.warning("API: ABORT SEQUENCE INITIATED BY USER.")
+
+    for task_name in list((state.get("active_tasks", {}) or {}).keys()):
+        safe_task_name = "".join(
+            ch if ch.isalnum() or ch in ".-_" else "-" for ch in task_name
+        ).strip("-")
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "docker", "rm", "-f", f"aac-runner-{safe_task_name}",
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await proc.wait()
+        except Exception:
+            pass
+
+    aborted: list[int] = []
+    try:
+        running_jobs = _engine.db.get_jobs_by_status("RUNNING")
+    except Exception:
+        running_jobs = []
+    for job in running_jobs:
+        job_id = getattr(job, "id", None)
+        if job_id is None:
+            continue
+        _engine.db.update_job(job_id, "ABORTED")
+        _engine.db.update_progress(job_id, progress=None, current_step="Aborted by User")
+        aborted.append(job_id)
+
+    if aborted:
+        try:
+            from core.api import OutboundMessage, MessageSeverity
+            ids = ", ".join(f"#{j}" for j in aborted)
+            abort_msg = OutboundMessage(
+                title="Pipeline Aborted",
+                body=f"Execution aborted by user (jobs {ids}).",
+                severity=MessageSeverity.WARNING,
+                source_plugin_id="lyndrix.plugin.iac_orchestrator",
+                target_provider="system",
+                metadata={"toast": True, "persist": True},
+            )
+            _ctx.emit("messaging:outbound", abort_msg.model_dump(mode="json"))
+        except Exception as exc:
+            _ctx.log.debug(f"ABORT: notification failed: {exc}")
+
+    state["is_running"] = False
+    state["active_tasks"] = {}
+    return {"status": "ok", "aborted_jobs": aborted}
+
+
+# ── Infrastructure inventory (assignments + terraform hosts) ─────────────────
+
+def _load_assignments() -> list:
+    """Flatten site→stage→host service assignments. Ports dashboard.load_assignments."""
+    if not _engine:
+        return []
+    config = _engine.config
+    assignments: list[dict] = []
+    base_dir = config.git_repos_dir / "iac_controller" / "environments"
+    sites_dir = base_dir / "sites"
+    profiles_file = base_dir / "global" / "03_profiles.yml"
+
+    profiles: dict = {}
+    if profiles_file.exists():
+        try:
+            with open(profiles_file, "r", encoding="utf-8") as f:
+                p_data = yaml.safe_load(f) or {}
+                profiles = p_data.get("profiles") or {}
+        except Exception as exc:
+            _ctx and _ctx.log.error(f"API: Failed to parse profiles YAML: {exc}")
+
+    if not sites_dir.exists():
+        return []
+
+    for yaml_file in sites_dir.rglob("*.yml"):
+        parts = yaml_file.parts
+        try:
+            site = parts[parts.index("sites") + 1]
+            stage = parts[parts.index("stages") + 1] if "stages" in parts else "common"
+            with open(yaml_file, "r", encoding="utf-8") as f:
+                data = yaml.safe_load(f) or {}
+            all_hosts = {**(data.get("hosts") or {}), **(data.get("hardware_hosts") or {})}
+            for host_name, host_data in all_hosts.items():
+                if not isinstance(host_data, dict):
+                    continue
+                host_svcs: set = set()
+                direct_services = host_data.get("services") or []
+                if isinstance(direct_services, list):
+                    for s in direct_services:
+                        if isinstance(s, dict) and s.get("name"):
+                            host_svcs.add(s.get("name"))
+                host_profiles = host_data.get("profiles") or []
+                if isinstance(host_profiles, list):
+                    for p in host_profiles:
+                        profile_services = profiles.get(p, {}).get("services") or []
+                        if isinstance(profile_services, list):
+                            for s in profile_services:
+                                if isinstance(s, dict) and s.get("name"):
+                                    host_svcs.add(s.get("name"))
+                if host_svcs:
+                    assignments.append({
+                        "site": site, "stage": stage, "host": host_name,
+                        "services": sorted(host_svcs),
+                    })
+        except (ValueError, IndexError):
+            continue
+        except Exception as exc:
+            _ctx and _ctx.log.error(f"API: Failed to parse assignment YAML {yaml_file}: {exc}")
+
+    unique = {f"{a['site']}-{a['stage']}-{a['host']}": a for a in assignments}
+    return sorted(unique.values(), key=lambda x: (x["site"], x["stage"], x["host"]))
+
+
+async def do_load_assignments():
+    """Return the flat site→stage→host service assignment list."""
+    if not _engine:
+        raise HTTPException(status_code=500, detail="Engine offline")
+    return _load_assignments()
+
+
+_TF_PROVIDER = "bpg/proxmox"
+_TF_JOB_PREFIXES = ("init_host", "host_provision", "adopt_host")
+
+
+def _tfvars_host_index(config) -> dict:
+    """Index hosts from rendered terraform.tfvars.json. Ports terraform._tfvars_host_index."""
+    index: dict[str, dict] = {}
+    inv_root = config.git_repos_dir / "inventory_state"
+    if not inv_root.exists():
+        return index
+    for tfvars_path in inv_root.glob("*/*/terraform/terraform.tfvars.json"):
+        try:
+            with open(tfvars_path, "r", encoding="utf-8") as fh:
+                data = json.load(fh) or {}
+        except Exception:
+            continue
+        try:
+            stage = tfvars_path.parents[1].name
+            site = tfvars_path.parents[2].name
+        except IndexError:
+            continue
+        for host_name, cfg in (data.get("containers") or {}).items():
+            if not isinstance(cfg, dict):
+                continue
+            node = str(cfg.get("node_name") or "").strip()
+            index[host_name] = {"node": node, "env": f"{site}_{stage}"}
+    return index
+
+
+def _host_state_from_jobs(jobs: list, host: str) -> str:
+    """Derive a tile status from the most recent terraform-type job for ``host``."""
+    for job in jobs:  # newest-first
+        ptype = str(job.get("pipeline_type") or "")
+        base, _, target = ptype.partition(":")
+        if base not in _TF_JOB_PREFIXES or target.strip().lower() != host.lower():
+            continue
+        status = str(job.get("status") or "").upper()
+        if status == "SUCCESS":
+            return "created"
+        if status in ("FAILED", "ERROR", "ABORTED"):
+            return "failed"
+        if status == "RUNNING":
+            return "provisioning"
+        return "unknown"
+    return "not provisioned"
+
+
+def _scan_terraform_hosts() -> list:
+    """Parse site host YAML → per-host terraform metadata. Ports terraform._scan_terraform_hosts."""
+    config = _engine.config
+    base_dir = config.git_repos_dir / "iac_controller" / "environments"
+    sites_dir = base_dir / "sites"
+    results: list[dict] = []
+    if not sites_dir.exists():
+        return results
+
+    tf_index = _tfvars_host_index(config)
+    try:
+        recent_jobs = _engine.db.get_jobs_for_stats(500)
+    except Exception:
+        recent_jobs = []
+
+    for yaml_file in sites_dir.rglob("*.yml"):
+        parts = yaml_file.parts
+        try:
+            site = parts[parts.index("sites") + 1]
+            stage = parts[parts.index("stages") + 1] if "stages" in parts else "common"
+            with open(yaml_file, "r", encoding="utf-8") as f:
+                data = yaml.safe_load(f) or {}
+            all_hosts = {**(data.get("hosts") or {}), **(data.get("hardware_hosts") or {})}
+            for host_name, host_data in all_hosts.items():
+                if not isinstance(host_data, dict):
+                    continue
+                tf = host_data.get("terraform") if isinstance(host_data.get("terraform"), dict) else {}
+                tf_meta = tf_index.get(host_name)
+                managed = bool(tf) or tf_meta is not None
+                if tf_meta is not None:
+                    node = tf_meta.get("node") or ""
+                    provider = _TF_PROVIDER
+                    resource = (
+                        f'module.lxc_{node}.proxmox_virtual_environment_container.ct["{host_name}"]'
+                        if node else 'proxmox_virtual_environment_container.ct'
+                    )
+                    state = _host_state_from_jobs(recent_jobs, host_name)
+                else:
+                    provider = tf.get("provider", "—")
+                    resource = tf.get("resource", tf.get("type", "—"))
+                    state = tf.get("state", "unknown")
+                results.append({
+                    "site": site, "stage": stage, "host": host_name,
+                    "ansible_host": host_data.get("ansible_host") or host_data.get("address") or "—",
+                    "managed": managed, "provider": provider, "resource": resource,
+                    "workspace": tf.get("workspace", "default"), "state": state,
+                })
+        except (ValueError, IndexError):
+            continue
+        except Exception as exc:
+            _ctx and _ctx.log.error(f"API: Terraform scan failed for {yaml_file}: {exc}")
+
+    return sorted(results, key=lambda x: (not x["managed"], x["site"], x["stage"], x["host"]))
+
+
+async def do_terraform_hosts():
+    """Return per-host Terraform metadata + status (tfvars index + job-derived state)."""
+    if not _engine:
+        raise HTTPException(status_code=500, detail="Engine offline")
+    try:
+        return _scan_terraform_hosts()
+    except Exception as exc:
+        _ctx and _ctx.log.error(f"API: terraform host scan failed: {exc}")
+        raise HTTPException(status_code=500, detail="Terraform host scan failed")
+
+
+# ── Aggregated overview stats ────────────────────────────────────────────────
+
+async def do_get_stats():
+    """Aggregated Overview stats (KPIs, host-lifecycle phases, status breakdown)."""
+    if not _engine:
+        raise HTTPException(status_code=500, detail="Engine offline")
+    from . import stats as _stats
+    try:
+        jobs = _engine.db.get_jobs_for_stats(500)
+    except Exception:
+        jobs = []
+    try:
+        tasks = _engine.db.get_job_tasks_for_stats(1500)
+    except Exception:
+        tasks = []
+    s = _stats.compute(jobs, tasks)
+
+    def _ser_recent(j: dict) -> dict:
+        return {
+            "id": j.get("id"),
+            "pipeline_type": j.get("pipeline_type"),
+            "type_label": j.get("type_label"),
+            "phase": j.get("phase"),
+            "icon": j.get("icon"),
+            "color": j.get("color"),
+            "status": j.get("status"),
+            "progress": j.get("progress", 0),
+            "duration_s": j.get("duration_s"),
+            "duration_human": _stats.humanize_duration(j.get("duration_s")),
+            "start_label": j.get("start_label"),
+        }
+
+    return {
+        "total": s.total,
+        "success": s.success,
+        "failed": s.failed,
+        "running": s.running,
+        "finished": s.finished,
+        "success_rate": s.success_rate,
+        "avg_duration_s": s.avg_duration_s,
+        "avg_duration_human": _stats.humanize_duration(s.avg_duration_s),
+        "last_deployment_status": s.last_deployment_status,
+        "last_deployment_at": s.last_deployment_at.isoformat() if s.last_deployment_at else None,
+        "by_status": s.by_status,
+        "by_phase": [
+            {
+                "phase": p.phase, "label": p.label, "icon": p.icon, "color": p.color,
+                "total": p.total, "success": p.success, "failed": p.failed,
+                "running": p.running, "success_rate": p.success_rate,
+            }
+            for p in s.by_phase
+        ],
+        "recent": [_ser_recent(j) for j in s.recent],
+    }
+
+
+async def do_service_history(service_name: str):
+    """Recent jobs touching a service. Ports db.get_service_history."""
+    if not _engine:
+        raise HTTPException(status_code=500, detail="Engine offline")
+    name = str(service_name or "").strip()
+    return _engine.db.get_service_history(name)
+
+
+# ── Settings (Vault-backed) ──────────────────────────────────────────────────
+
+async def do_get_settings():
+    """Return the orchestrator settings surface. Ports settings.py reads."""
+    if not _ctx or not _service:
+        raise HTTPException(status_code=503, detail="Orchestrator not initialized")
+    return {
+        "auto_apply": bool(_service.state.get("auto_apply_enabled", False)),
+        "test_deploy_allowed_hosts": _ctx.get_secret("iac_test_deploy_allowed_hosts") or "",
+        "gitlab_url": _ctx.get_secret("iac_gitlab_url") or "https://gitlab.int.fam-feser.de",
+        "group_id": _ctx.get_secret("iac_gitlab_group_id") or "",
+        "lyndrix_base_url": _ctx.get_secret("iac_lyndrix_base_url") or "http://10.1.10.31:8081",
+        "gitlab_token_key": _ctx.get_secret("iac_gitlab_api_token_key") or "",
+        "autosync_enabled": (_ctx.get_secret("iac_webhook_autosync_enabled") or "true").lower() != "false",
+        "sync_interval": _safe_int(_ctx.get_secret("iac_webhook_sync_interval_seconds"), 1800),
+        "webhook_endpoint": (
+            f"{str(_ctx.get_secret('iac_lyndrix_base_url') or 'http://10.1.10.31:8081').rstrip('/')}"
+            "/api/iac/webhook/gitlab"
+        ),
+    }
+
+
+async def do_save_settings(payload: SettingsRequest):
+    """Persist the orchestrator settings to Vault. Ports settings.py writes."""
+    if not _ctx or not _service:
+        raise HTTPException(status_code=503, detail="Orchestrator not initialized")
+
+    if payload.auto_apply is not None:
+        _service.state["auto_apply_enabled"] = bool(payload.auto_apply)
+        _ctx.set_secret("iac_auto_apply", str(bool(payload.auto_apply)))
+    if payload.test_deploy_allowed_hosts is not None:
+        _ctx.set_secret(
+            "iac_test_deploy_allowed_hosts",
+            str(payload.test_deploy_allowed_hosts or "").strip(),
+        )
+    if payload.gitlab_url is not None:
+        _ctx.set_secret("iac_gitlab_url", str(payload.gitlab_url or "").strip())
+    if payload.group_id is not None:
+        _ctx.set_secret("iac_gitlab_group_id", str(payload.group_id or "").strip())
+    if payload.lyndrix_base_url is not None:
+        _ctx.set_secret("iac_lyndrix_base_url", str(payload.lyndrix_base_url or "").strip())
+    if payload.gitlab_token_key is not None:
+        _ctx.set_secret("iac_gitlab_api_token_key", str(payload.gitlab_token_key or "").strip())
+    if payload.autosync_enabled is not None:
+        _ctx.set_secret(
+            "iac_webhook_autosync_enabled",
+            "true" if payload.autosync_enabled else "false",
+        )
+    if payload.sync_interval is not None:
+        interval = max(300, _safe_int(payload.sync_interval, 1800))
+        _ctx.set_secret("iac_webhook_sync_interval_seconds", str(interval))
+
+    return await do_get_settings()
+
+
+async def do_get_webhook_token():
+    """Return whether the webhook token is set, masked (never the raw value)."""
+    if not _ctx:
+        raise HTTPException(status_code=503, detail="Context offline")
+    token = _ctx.get_secret("gitlab_webhook_token")
+    return {
+        "configured": bool(token),
+        "masked": "•" * 32 if token else "",
+    }
+
+
+async def do_generate_webhook_token():
+    """Generate + store a new GitLab webhook token. Returns the raw value once."""
+    if not _ctx:
+        raise HTTPException(status_code=503, detail="Context offline")
+    new_token = secrets.token_urlsafe(32)
+    _ctx.set_secret("gitlab_webhook_token", new_token)
+    _ctx.log.info("API: New GitLab webhook token generated and stored in Vault.")
+    return {"status": "ok", "token": new_token}
+
+
+async def do_sync_webhooks_authed():
+    """Auth'd, idempotent re-registration of the group webhooks (Settings button)."""
+    if not _ctx:
+        raise HTTPException(status_code=500, detail="API Context not initialized")
+    from .gitlab_webhooks import sync_group_webhooks_from_ctx, WebhookConfigError
+    try:
+        result = await asyncio.to_thread(sync_group_webhooks_from_ctx, _ctx)
+    except WebhookConfigError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        _ctx.log.error(f"WEBHOOK SYNC ERROR: {exc}")
+        raise HTTPException(status_code=502, detail=f"Webhook sync failed: {exc}")
+    return {"status": "ok", **result}
+
+
+def _job_stream_snapshot() -> dict:
+    """Build a single live snapshot of orchestrator state for the SSE stream."""
+    if not _engine:
+        return {"jobs": [], "active_tasks": {}, "is_running": False, "ts": time.time()}
+    jobs = _engine.db.get_recent_jobs(30)
+    state = _engine.state or {}
+    return {
+        "jobs": jobs,
+        "active_tasks": state.get("active_tasks", {}) or {},
+        "is_running": bool(state.get("is_running", False)),
+        "ts": time.time(),
+    }
+
+
+async def stream_jobs(request: Request, token: str | None):
+    """SSE generator factory for ``GET /stream/jobs?token=...``.
+
+    Returns a StreamingResponse emitting a JSON snapshot whenever the orchestrator
+    state changes, plus a ~1s keep-alive tick. The token is validated in-handler
+    because EventSource cannot send an Authorization header.
+    """
+    from fastapi.responses import StreamingResponse
+
+    if not _validate_stream_token(token):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    async def generator():
+        last_hash = None
+        ticks = 0
+        try:
+            while True:
+                if await request.is_disconnected():
+                    break
+                snapshot = _job_stream_snapshot()
+                # Hash on everything except the wall-clock timestamp so we only
+                # push a new frame when the orchestrator state actually changes.
+                change_key = json.dumps(
+                    {k: v for k, v in snapshot.items() if k != "ts"},
+                    sort_keys=True,
+                    default=str,
+                )
+                snap_hash = hash(change_key)
+                ticks += 1
+                # Emit on change, on first connect, or at least every ~15s so the
+                # client keeps a fresh snapshot even on a quiet system.
+                if snap_hash != last_hash or ticks % 15 == 0:
+                    last_hash = snap_hash
+                    yield f"data: {json.dumps(snapshot, default=str)}\n\n"
+                else:
+                    yield ": keep-alive\n\n"
+                await asyncio.sleep(1.0)
+        except (asyncio.CancelledError, GeneratorExit):
+            pass
+
+    return StreamingResponse(
+        generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
