@@ -136,7 +136,7 @@ function Modal({ title, onClose, children, width = 720 }: {
   title: string; onClose: () => void; children: React.ReactNode; width?: number
 }) {
   return (
-    <div onClick={onClose} style={{
+    <div onClick={onClose} className="iac-modal-overlay" style={{
       position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)', zIndex: 1000,
       display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '2rem',
     }}>
@@ -169,7 +169,7 @@ interface ConfirmOpts {
 
 function ConfirmDialog({ opts, onClose }: { opts: ConfirmOpts; onClose: () => void }) {
   return (
-    <div onClick={onClose} style={{
+    <div onClick={onClose} className="iac-modal-overlay" style={{
       position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)', zIndex: 1100,
       display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '2rem',
     }}>
@@ -230,7 +230,7 @@ function LogViewer({ jobId, onClose }: { jobId: number; onClose: () => void }) {
   }, [lines])
 
   return (
-    <div onClick={onClose} style={{
+    <div onClick={onClose} className="iac-modal-overlay" style={{
       position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)', zIndex: 1000,
       display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '2rem',
     }}>
@@ -330,7 +330,7 @@ function History({ jobs, onLogs }: { jobs: IaCJob[]; onLogs: (id: number) => voi
 
   return (
     <div>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
+      <div className="iac-hist-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
         <h2 style={{ margin: 0, fontSize: '1rem', fontWeight: 700, color: 'var(--lx-text)' }}>Deployment History</h2>
         <input className="lx-input" value={filter} onChange={(e) => setFilter(e.target.value)} placeholder="Filter ID / Type / Status…" style={{ width: 240 }} />
       </div>
@@ -339,7 +339,7 @@ function History({ jobs, onLogs }: { jobs: IaCJob[]; onLogs: (id: number) => voi
           <div style={{ padding: '2rem', textAlign: 'center', color: 'var(--lx-text-muted)', fontSize: '0.85rem' }}>Keine Deployments gefunden.</div>
         )}
         {rows.map((job, i) => (
-          <div key={job.id} style={{
+          <div key={job.id} className="iac-hist-row" style={{
             display: 'flex', alignItems: 'center', gap: '0.75rem', padding: '0.6rem 1rem',
             borderTop: i === 0 ? 'none' : '1px solid var(--lx-border-soft)',
           }}>
@@ -352,7 +352,7 @@ function History({ jobs, onLogs }: { jobs: IaCJob[]; onLogs: (id: number) => voi
                 {job.start_time} → {job.end_time}
               </div>
             </div>
-            <div style={{ width: 90 }}><ProgressBar value={job.progress} color={statusColor(job.status)} /></div>
+            <div className="iac-hist-progress" style={{ width: 90 }}><ProgressBar value={job.progress} color={statusColor(job.status)} /></div>
             <StatusBadge status={job.status} />
             <button onClick={() => onLogs(job.id)} title="Logs" style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--lx-accent)', fontSize: '0.72rem', fontWeight: 600 }}>
               Logs
@@ -386,7 +386,7 @@ function ServiceHistoryModal({ service, onClose, onLogs }: {
         <div style={{ color: 'var(--lx-text-muted)', fontStyle: 'italic' }}>Keine Einträge gefunden.</div>
       )}
       {rows && rows.map((r, i) => (
-        <div key={r.id} style={{
+        <div key={r.id} className="iac-hist-row" style={{
           display: 'flex', alignItems: 'center', gap: 12, padding: '0.5rem 0',
           borderTop: i === 0 ? 'none' : '1px solid var(--lx-border-soft)',
         }}>
@@ -1105,7 +1105,31 @@ function SettingsRoot() {
   )
 }
 
+// Mobile responsiveness for the inline-styled bundle. Media queries can't live in
+// inline styles, so we inject a small stylesheet whose rules override the inline
+// styles via !important (a CSS !important declaration beats an inline style without
+// it). Targets the history views + modal overlays on narrow screens.
+const RESPONSIVE_CSS = `
+@media (max-width: 640px) {
+  .iac-modal-overlay { padding: 0.6rem !important; align-items: flex-start !important; }
+  .iac-modal-overlay > div { max-height: 92vh !important; }
+  .iac-hist-header { flex-direction: column !important; align-items: stretch !important; gap: 0.5rem !important; }
+  .iac-hist-header .lx-input { width: 100% !important; }
+  .iac-hist-row { flex-wrap: wrap !important; row-gap: 0.3rem !important; }
+  .iac-hist-progress { display: none !important; }
+}
+`
+
+function ResponsiveStyles() {
+  return <style>{RESPONSIVE_CSS}</style>
+}
+
 export default function PluginApp() {
   const isSettings = window.location.pathname.endsWith('/settings')
-  return isSettings ? <SettingsRoot /> : <Dashboard />
+  return (
+    <>
+      <ResponsiveStyles />
+      {isSettings ? <SettingsRoot /> : <Dashboard />}
+    </>
+  )
 }
