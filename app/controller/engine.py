@@ -144,7 +144,7 @@ class NativeGenerateStage:
         self.name = "Native Artifact Generation"
     async def run(self, engine, context: dict) -> StageResult:
         try:
-            await engine._execute_native_generation()
+            await engine._generate_inventory_and_snapshot(context.get("job_id", 0))
             await engine.emit_monitoring_inventory_sync()
             return StageResult(True, "Native artifacts generated.")
         except Exception as e:
@@ -585,6 +585,11 @@ class DeploymentEngine:
         # confuse resource-targeting.  A second host_provision queued while one
         # is running will wait here rather than fail with a network timeout.
         self._terraform_run_semaphore = asyncio.Semaphore(1)
+        # Serializes the shared-inventory mutation phase: concurrent pipelines used to
+        # regenerate /data/storage/git_repos/inventory_state in place while another was
+        # mid-deploy reading it, leaking CHANGE_ME/example.com placeholder defaults.
+        # Held only around generation; deploys then read an immutable per-job snapshot.
+        self._shared_state_lock = asyncio.Lock()
         ctx.subscribe("git:status_update")(self._on_git_status)
 
     def get_default_ansible_stages(self, pipeline_type: str = "connectivity"):
@@ -1230,6 +1235,7 @@ class DeploymentEngine:
             self.state["running_jobs"] = max(0, self.state.get("running_jobs", 0) - 1)
             self.state["is_running"] = self.state["running_jobs"] > 0
             self.db.update_job(job_id=current_job_id, status=self.state["last_deployment"])
+            self._cleanup_inventory_snapshot(current_job_id)
             if single_key:
                 async with self._pipeline_dispatch_lock:
                     self._active_single_service_keys.discard(single_key)
@@ -1400,6 +1406,62 @@ class DeploymentEngine:
         
         if proc.returncode != 0:
             raise RuntimeError(f"Native artifact generation failed:\n{stdout.decode('utf-8', errors='replace')}")
+
+    def _job_inventory_snapshot_dir(self, job_id: int) -> Path:
+        """Per-job immutable copy of the generated inventory. Lives under the shared
+        git_repos dir so the ansible runner's existing bind mount already exposes it
+        inside the container."""
+        return self.base_git_dir / ".job_snapshots" / f"job_{job_id}" / "inventory_state"
+
+    async def _generate_inventory_and_snapshot(self, job_id: int):
+        """Regenerate the shared inventory under a global lock, then pin an immutable
+        per-job snapshot to deploy from.
+
+        Fixes the concurrency race where two pipelines ran at once: pipeline B's
+        generation rewrote ``inventory_state`` while pipeline A was mid-deploy reading
+        it, so A fell back to the publishable ``CHANGE_ME``/``example.com`` defaults and
+        came up mis-configured. The lock serializes generation so runs never corrupt
+        each other's output; the snapshot then isolates A's deploy from any later
+        regeneration by B.
+        """
+        async with self._shared_state_lock:
+            await self._execute_native_generation()
+            if job_id:
+                self._snapshot_inventory(job_id)
+
+    def _snapshot_inventory(self, job_id: int):
+        src = self.base_git_dir / "inventory_state"
+        dst = self._job_inventory_snapshot_dir(job_id)
+        if dst.exists():
+            shutil.rmtree(dst, ignore_errors=True)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        # Skip .git — only the rendered inventory is needed and it avoids copying history.
+        shutil.copytree(src, dst, ignore=shutil.ignore_patterns(".git"))
+        self._assert_no_placeholder_leak(dst)
+
+    def _assert_no_placeholder_leak(self, inventory_dir: Path):
+        """Seatbelt (independent of the snapshot): refuse to deploy an inventory that
+        still carries the publishable ``CHANGE_ME`` placeholder — it is only ever
+        present when generation read partial source state. Fail loudly instead of
+        bringing a service up broken."""
+        inv_file = inventory_dir / "global" / "ansible" / "inventory.yml"
+        try:
+            text = inv_file.read_text(errors="replace") if inv_file.exists() else ""
+        except Exception:
+            return
+        if "CHANGE_ME" in text:
+            raise RuntimeError(
+                "Seatbelt: generated inventory still contains CHANGE_ME placeholders — "
+                "refusing to deploy stale/partial state. Re-run once repo syncs settle."
+            )
+
+    def _cleanup_inventory_snapshot(self, job_id: int):
+        try:
+            snap_root = self.base_git_dir / ".job_snapshots" / f"job_{job_id}"
+            if snap_root.exists():
+                shutil.rmtree(snap_root, ignore_errors=True)
+        except Exception:
+            pass
 
     async def reconcile_orphaned_runners(self, job_id=None):
         try:
@@ -2304,6 +2366,14 @@ class DeploymentEngine:
             
             await asyncio.create_subprocess_exec("docker", "rm", "-f", c_name, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
 
+            # Deploy from this job's immutable inventory snapshot (pinned right after its
+            # own generation) so a concurrent pipeline regenerating the shared
+            # inventory_state can't change what this run reads. Fall back to the live
+            # shared inventory for call paths that never generated a snapshot.
+            inv_root = "inventory_state"
+            if job_id and self._job_inventory_snapshot_dir(job_id).exists():
+                inv_root = f".job_snapshots/job_{job_id}/inventory_state"
+
             cmd = [
                 "docker", "run", "-d", "--name", c_name, "--pull", "always",
                 "--label", f"iac_job_id={job_id}", "--label", f"iac_task_name={task_name}",
@@ -2316,7 +2386,7 @@ class DeploymentEngine:
                 "/bin/sh", "-c", 
                 "mkdir -p /root/.ssh && cp \"$1\" /root/.ssh/id_rsa && chmod 600 /root/.ssh/id_rsa && shift && exec \"$@\"", 
                 "--", f"/data/storage/services/.iac_keys/{key_filename}",
-                "ansible-playbook", "-i", f"/data/storage/git_repos/inventory_state/{inventory_subpath}", f"/data/storage/git_repos/config_engine/{playbook_subpath}",
+                "ansible-playbook", "-i", f"/data/storage/git_repos/{inv_root}/{inventory_subpath}", f"/data/storage/git_repos/config_engine/{playbook_subpath}",
                 "-u", remote_user, "--diff" 
             ]
             if limit: cmd.extend(["--limit", limit])
