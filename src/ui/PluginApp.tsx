@@ -34,6 +34,14 @@ function statusColor(status: string): string {
   return 'var(--lx-state-unknown)'
 }
 
+function badgeVariant(status: string): string {
+  const s = (status || '').toUpperCase()
+  if (s === 'SUCCESS') return 'lx-badge--up'
+  if (FAIL_STATES.has(s)) return 'lx-badge--down'
+  if (RUNNING_STATES.has(s)) return 'lx-badge--accent'
+  return 'lx-badge--muted'
+}
+
 function describeType(t: string): string {
   return (t || 'unknown').replace(/[:_]/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase())
 }
@@ -41,17 +49,9 @@ function describeType(t: string): string {
 // ─── Shared atoms ────────────────────────────────────────────────────────────
 
 function StatusBadge({ status }: { status: string }) {
-  const color = statusColor(status)
   return (
-    <span style={{
-      display: 'inline-flex', alignItems: 'center', gap: 4,
-      fontSize: '0.65rem', fontWeight: 700, color,
-      background: `color-mix(in srgb, ${color} 12%, transparent)`,
-      border: `1px solid color-mix(in srgb, ${color} 30%, transparent)`,
-      borderRadius: 'var(--lx-radius-sm)', padding: '2px 7px',
-      letterSpacing: '0.04em', textTransform: 'uppercase',
-    }}>
-      <span style={{ width: 5, height: 5, borderRadius: '50%', background: color }} />
+    <span className={`lx-badge ${badgeVariant(status)}`}>
+      <span className="lx-dot" />
       {status || 'UNKNOWN'}
     </span>
   )
@@ -72,12 +72,9 @@ function ProgressBar({ value, color }: { value: number; color?: string }) {
   )
 }
 
-function Card({ children, accent }: { children: React.ReactNode; accent?: string }) {
+function Card({ children, accent, hover }: { children: React.ReactNode; accent?: string; hover?: boolean }) {
   return (
-    <div style={{
-      background: 'var(--lx-surface)',
-      border: '1px solid var(--lx-border-soft)',
-      borderRadius: 'var(--lx-radius-md)',
+    <div className={`lx-card${hover ? ' lx-card-hover' : ''}`} style={{
       overflow: 'hidden',
       ...(accent ? { borderTop: `2px solid ${accent}` } : {}),
     }}>
@@ -90,15 +87,13 @@ function KpiCard({ label, value, color, sub }: {
   label: string; value: React.ReactNode; color?: string; sub?: string
 }) {
   return (
-    <Card>
-      <div style={{ padding: '1rem 1.1rem' }}>
-        <div style={{ fontSize: '1.6rem', fontWeight: 800, color: color ?? 'var(--lx-text)', lineHeight: 1.1 }}>
+    <Card hover>
+      <div style={{ padding: '16px' }}>
+        <div className="lx-eyebrow">{label}</div>
+        <div style={{ fontSize: '1.5rem', fontWeight: 700, color: color ?? 'var(--lx-text)', lineHeight: 1.15, marginTop: 6 }}>
           {value}
         </div>
-        <div style={{ fontSize: '0.7rem', color: 'var(--lx-text-muted)', textTransform: 'uppercase', letterSpacing: '0.06em', marginTop: 4 }}>
-          {label}
-        </div>
-        {sub && <div style={{ fontSize: '0.66rem', color: 'var(--lx-text-muted)', marginTop: 4 }}>{sub}</div>}
+        {sub && <div style={{ fontSize: '0.7rem', color: 'var(--lx-text-muted)', marginTop: 5 }}>{sub}</div>}
       </div>
     </Card>
   )
@@ -115,24 +110,23 @@ function ErrorBox({ msg }: { msg: string }) {
   )
 }
 
-function Button({ label, onClick, variant = 'default', disabled, title }: {
+function Button({ label, onClick, variant = 'default', disabled, title, icon }: {
   label: string; onClick: () => void
-  variant?: 'default' | 'primary' | 'danger' | 'warn'; disabled?: boolean; title?: string
+  variant?: 'default' | 'primary' | 'danger' | 'warn'; disabled?: boolean; title?: string; icon?: string
 }) {
-  const accent =
-    variant === 'danger' ? 'var(--lx-state-down)'
-      : variant === 'warn' ? '#f59e0b'
-        : 'var(--lx-accent)'
+  // 'warn' keeps an amber tone via inline override; the rest map to shared variants.
+  const cls =
+    variant === 'primary' ? 'lx-btn lx-btn--primary lx-btn--sm'
+      : variant === 'danger' ? 'lx-btn lx-btn--danger lx-btn--sm'
+        : 'lx-btn lx-btn--secondary lx-btn--sm'
+  const warnStyle: React.CSSProperties =
+    variant === 'warn'
+      ? { color: '#f59e0b', borderColor: 'color-mix(in srgb, #f59e0b 40%, transparent)', background: 'color-mix(in srgb, #f59e0b 10%, transparent)' }
+      : {}
   return (
-    <button onClick={onClick} disabled={disabled} title={title} style={{
-      padding: '4px 12px', fontSize: '0.72rem', fontWeight: 600,
-      border: `1px solid color-mix(in srgb, ${accent} 40%, transparent)`,
-      borderRadius: 'var(--lx-radius-sm)',
-      background: variant === 'primary' ? `color-mix(in srgb, ${accent} 20%, transparent)` : `color-mix(in srgb, ${accent} 8%, transparent)`,
-      color: disabled ? 'var(--lx-text-muted)' : accent,
-      cursor: disabled ? 'not-allowed' : 'pointer', opacity: disabled ? 0.5 : 1,
-      display: 'inline-flex', alignItems: 'center', gap: 5, whiteSpace: 'nowrap',
-    }}>
+    <button onClick={onClick} disabled={disabled} title={title}
+      className={variant === 'warn' ? 'lx-btn lx-btn--secondary lx-btn--sm' : cls} style={warnStyle}>
+      {icon && <span className="material-icons" style={{ fontSize: 15 }}>{icon}</span>}
       {label}
     </button>
   )
@@ -250,11 +244,7 @@ function LogViewer({ jobId, onClose }: { jobId: number; onClose: () => void }) {
           borderBottom: '1px solid var(--lx-border-soft)', background: 'var(--lx-surface)',
         }}>
           <span style={{ fontWeight: 700, color: 'var(--lx-accent)' }}>Live Logs · Job #{jobId}</span>
-          <input value={grep} onChange={(e) => setGrep(e.target.value)} placeholder="grep…" style={{
-            marginLeft: 'auto', padding: '0.3rem 0.6rem', fontSize: '0.75rem',
-            borderRadius: 'var(--lx-radius-sm)', border: '1px solid var(--lx-border-soft)',
-            background: 'var(--lx-elevated)', color: 'var(--lx-text)', outline: 'none',
-          }} />
+          <input className="lx-input lx-mono" value={grep} onChange={(e) => setGrep(e.target.value)} placeholder="grep…" style={{ marginLeft: 'auto', width: 200 }} />
           <button onClick={onClose} style={{ background: 'none', border: 'none', color: 'var(--lx-text-muted)', cursor: 'pointer', fontSize: '1.1rem' }}>✕</button>
         </div>
         <div ref={scrollRef} style={{
@@ -279,9 +269,10 @@ function ActivePipelines({ jobs, runnersByJob, onLogs }: {
   const running = jobs.filter((j) => RUNNING_STATES.has((j.status || '').toUpperCase()))
   if (!running.length) {
     return (
-      <div style={{ textAlign: 'center', padding: '3rem 0', color: 'var(--lx-text-muted)' }}>
-        <div style={{ fontSize: 40, opacity: 0.4 }}>✓</div>
-        <div style={{ marginTop: 8, fontWeight: 600 }}>Infrastructure is stable. No active jobs.</div>
+      <div className="lx-card lx-empty">
+        <span className="material-icons">task_alt</span>
+        <div style={{ fontWeight: 600, color: 'var(--lx-text)' }}>Infrastructure is stable</div>
+        <div style={{ fontSize: '0.8rem' }}>No active jobs running right now.</div>
       </div>
     )
   }
@@ -341,11 +332,7 @@ function History({ jobs, onLogs }: { jobs: IaCJob[]; onLogs: (id: number) => voi
     <div>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
         <h2 style={{ margin: 0, fontSize: '1rem', fontWeight: 700, color: 'var(--lx-text)' }}>Deployment History</h2>
-        <input value={filter} onChange={(e) => setFilter(e.target.value)} placeholder="Filter ID / Type / Status…" style={{
-          padding: '0.35rem 0.7rem', fontSize: '0.78rem', width: 240,
-          borderRadius: 'var(--lx-radius-sm)', border: '1px solid var(--lx-border-soft)',
-          background: 'var(--lx-elevated)', color: 'var(--lx-text)', outline: 'none',
-        }} />
+        <input className="lx-input" value={filter} onChange={(e) => setFilter(e.target.value)} placeholder="Filter ID / Type / Status…" style={{ width: 240 }} />
       </div>
       <Card>
         {rows.length === 0 && (
@@ -449,11 +436,7 @@ function ServiceCatalog({ confirm, toast, onLogs }: { confirm: ConfirmFn; toast:
     <div>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
         <h2 style={{ margin: 0, fontSize: '1rem', fontWeight: 700, color: 'var(--lx-text)' }}>Service Catalog</h2>
-        <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Service suchen…" style={{
-          padding: '0.35rem 0.7rem', fontSize: '0.78rem', width: 240,
-          borderRadius: 'var(--lx-radius-sm)', border: '1px solid var(--lx-border-soft)',
-          background: 'var(--lx-elevated)', color: 'var(--lx-text)', outline: 'none',
-        }} />
+        <input className="lx-input" value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Service suchen…" style={{ width: 240 }} />
       </div>
       {error && <ErrorBox msg={error} />}
       {loading && <div style={{ color: 'var(--lx-text-muted)', padding: '2rem', textAlign: 'center' }}>Lade Katalog…</div>}
@@ -660,9 +643,9 @@ function Provision({ confirm, toast, isRunning, statsTick }: {
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem', gap: 8, flexWrap: 'wrap' }}>
         <h2 style={{ margin: 0, fontSize: '1rem', fontWeight: 700, color: 'var(--lx-text)' }}>Provisioning (Terraform)</h2>
         <div style={{ display: 'flex', gap: 8 }}>
-          <Button label="Check Env" onClick={checkEnv} disabled={isRunning} title="Read-only Terraform plan across all environments" />
-          <Button label="Deploy Infra" variant="danger" onClick={deployInfra} disabled={isRunning} title="Apply Terraform across the entire infrastructure" />
-          <Button label="Refresh" onClick={load} />
+          <Button label="Check Env" icon="fact_check" onClick={checkEnv} disabled={isRunning} title="Read-only Terraform plan across all environments" />
+          <Button label="Deploy Infra" icon="rocket_launch" variant="danger" onClick={deployInfra} disabled={isRunning} title="Apply Terraform across the entire infrastructure" />
+          <Button label="Refresh" icon="refresh" onClick={load} />
         </div>
       </div>
 
@@ -770,11 +753,7 @@ function Assignments({ confirm, toast, isRunning }: { confirm: ConfirmFn; toast:
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem', gap: 8, flexWrap: 'wrap' }}>
         <h2 style={{ margin: 0, fontSize: '1rem', fontWeight: 700, color: 'var(--lx-text)' }}>Infrastructure Topography</h2>
         <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
-          <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Host / Service…" style={{
-            padding: '0.35rem 0.7rem', fontSize: '0.78rem', width: 180,
-            borderRadius: 'var(--lx-radius-sm)', border: '1px solid var(--lx-border-soft)',
-            background: 'var(--lx-elevated)', color: 'var(--lx-text)', outline: 'none',
-          }} />
+          <input className="lx-input" value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Host / Service…" style={{ width: 180 }} />
           <Button label="Global Bootstrap" variant="warn" disabled={isRunning} onClick={() => run({ pipeline_type: 'bootstrap_compliance', limit: 'all' }, 'Global compliance bootstrap?', 'Runs the compliance/baseline playbook (as root) across ALL hosts.')} />
           <Button label="Global Adopt" variant="warn" disabled={isRunning} onClick={() => run({ pipeline_type: 'adopt_host', limit: 'all' }, 'Global adopt?', 'Imports every managed container (all sites) into Terraform state.')} />
           <Button label="Global Rollout" variant="danger" disabled={isRunning} onClick={() => run({ pipeline_type: 'rollout', limit: 'all' }, 'Global rollout?', 'Triggers a full infrastructure rollout across ALL hosts.')} />
@@ -833,27 +812,21 @@ function Assignments({ confirm, toast, isRunning }: { confirm: ConfirmFn; toast:
 
 function Field({ label, children, hint }: { label: string; children: React.ReactNode; hint?: string }) {
   return (
-    <div style={{ marginBottom: '0.9rem' }}>
-      <label style={{ display: 'block', fontSize: '0.72rem', fontWeight: 600, color: 'var(--lx-text)', marginBottom: 4 }}>{label}</label>
+    <div style={{ marginBottom: '16px' }}>
+      <label className="lx-label">{label}</label>
       {children}
-      {hint && <div style={{ fontSize: '0.64rem', color: 'var(--lx-text-muted)', marginTop: 3 }}>{hint}</div>}
+      {hint && <div style={{ fontSize: '0.66rem', color: 'var(--lx-text-muted)', marginTop: 5 }}>{hint}</div>}
     </div>
   )
-}
-
-const inputStyle: React.CSSProperties = {
-  width: '100%', padding: '0.4rem 0.6rem', fontSize: '0.78rem', boxSizing: 'border-box',
-  borderRadius: 'var(--lx-radius-sm)', border: '1px solid var(--lx-border-soft)',
-  background: 'var(--lx-elevated)', color: 'var(--lx-text)', outline: 'none',
 }
 
 function SectionCard({ title, children }: { title: string; children: React.ReactNode }) {
   return (
     <Card>
-      <div style={{ padding: '0.75rem 1rem', borderBottom: '1px solid var(--lx-border-soft)', background: 'var(--lx-elevated)', fontSize: '0.78rem', fontWeight: 700, color: 'var(--lx-text)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
-        {title}
+      <div style={{ padding: '14px 20px', borderBottom: '1px solid var(--lx-border-soft)' }}>
+        <span className="lx-section-title">{title}</span>
       </div>
-      <div style={{ padding: '1rem' }}>{children}</div>
+      <div style={{ padding: '20px' }}>{children}</div>
     </Card>
   )
 }
@@ -927,25 +900,25 @@ function SettingsPage({ confirm, toast }: { confirm: ConfirmFn; toast: ToastFn }
               Warning: Auto-Apply executes infrastructure changes immediately on webhook receipt.
             </div>
             <Field label="Test Deploy Allowed Hosts (comma-separated)" hint="Used by /api/iac/deploy/test-host/{host}; blocks rollout to non-allowlisted hosts.">
-              <input style={inputStyle} value={cfg.test_deploy_allowed_hosts} onChange={(e) => patch({ test_deploy_allowed_hosts: e.target.value })} placeholder="e.g. pve-test-01" />
+              <input className="lx-input" value={cfg.test_deploy_allowed_hosts} onChange={(e) => patch({ test_deploy_allowed_hosts: e.target.value })} placeholder="e.g. pve-test-01" />
             </Field>
           </SectionCard>
 
           <SectionCard title="GitLab Webhooks">
             <Field label="GitLab Base URL">
-              <input style={inputStyle} value={cfg.gitlab_url} onChange={(e) => patch({ gitlab_url: e.target.value })} />
+              <input className="lx-input" value={cfg.gitlab_url} onChange={(e) => patch({ gitlab_url: e.target.value })} />
             </Field>
             <Field label="GitLab Group ID">
-              <input style={inputStyle} value={cfg.group_id} onChange={(e) => patch({ group_id: e.target.value })} />
+              <input className="lx-input" value={cfg.group_id} onChange={(e) => patch({ group_id: e.target.value })} />
             </Field>
             <Field label="Lyndrix Base URL">
-              <input style={inputStyle} value={cfg.lyndrix_base_url} onChange={(e) => patch({ lyndrix_base_url: e.target.value })} />
+              <input className="lx-input" value={cfg.lyndrix_base_url} onChange={(e) => patch({ lyndrix_base_url: e.target.value })} />
             </Field>
             <Field label="GitLab API Credential (Vault key)">
-              <input style={inputStyle} value={cfg.gitlab_token_key} onChange={(e) => patch({ gitlab_token_key: e.target.value })} />
+              <input className="lx-input" value={cfg.gitlab_token_key} onChange={(e) => patch({ gitlab_token_key: e.target.value })} />
             </Field>
             <Field label="Webhook Endpoint Preview">
-              <input style={{ ...inputStyle, color: 'var(--lx-text-muted)' }} value={cfg.webhook_endpoint} readOnly />
+              <input className="lx-input lx-mono" style={{ color: 'var(--lx-text-muted)' }} value={cfg.webhook_endpoint} readOnly />
             </Field>
             <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
               <label style={{ fontSize: '0.78rem', color: 'var(--lx-text)', display: 'flex', alignItems: 'center', gap: 6 }}>
@@ -954,7 +927,7 @@ function SettingsPage({ confirm, toast }: { confirm: ConfirmFn; toast: ToastFn }
               </label>
               <label style={{ fontSize: '0.72rem', color: 'var(--lx-text-muted)', display: 'flex', alignItems: 'center', gap: 6 }}>
                 Interval (s)
-                <input type="number" min={300} step={60} style={{ ...inputStyle, width: 110 }} value={cfg.sync_interval} onChange={(e) => patch({ sync_interval: Number(e.target.value) })} />
+                <input type="number" min={300} step={60} className="lx-input" style={{ width: 110 }} value={cfg.sync_interval} onChange={(e) => patch({ sync_interval: Number(e.target.value) })} />
               </label>
             </div>
             <div style={{ display: 'flex', gap: 8, marginTop: 12 }}>
@@ -964,7 +937,7 @@ function SettingsPage({ confirm, toast }: { confirm: ConfirmFn; toast: ToastFn }
 
           <SectionCard title="Security · Webhook Token">
             <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
-              <input style={{ ...inputStyle, flex: 1, minWidth: 220, fontFamily: 'monospace' }} readOnly value={tokenReveal ?? (tokenInfo?.configured ? tokenInfo.masked : '(not set)')} />
+              <input className="lx-input lx-mono" style={{ flex: 1, minWidth: 220 }} readOnly value={tokenReveal ?? (tokenInfo?.configured ? tokenInfo.masked : '(not set)')} />
               <Button label="Generate Token" variant="warn" onClick={generateToken} />
             </div>
             {tokenReveal && (
@@ -1061,25 +1034,18 @@ function Dashboard() {
           <span style={{ width: 7, height: 7, borderRadius: '50%', background: connected ? 'var(--lx-state-up)' : 'var(--lx-state-down)' }} />
           {connected ? 'LIVE' : 'OFFLINE'}
         </span>
-        <Button label="Abort" variant="danger" disabled={!isRunning} onClick={abort} title={isRunning ? 'Abort the running execution' : 'No active job'} />
-        <Button label="Settings" onClick={goSettings} />
+        <Button label="Abort" icon="stop_circle" variant="danger" disabled={!isRunning} onClick={abort} title={isRunning ? 'Abort the running execution' : 'No active job'} />
+        <Button label="Settings" icon="settings" onClick={goSettings} />
       </div>
 
       {error && <ErrorBox msg={error} />}
 
-      <div style={{ display: 'flex', gap: 4, marginBottom: '1.5rem', borderBottom: '1px solid var(--lx-border-soft)', flexWrap: 'wrap' }}>
+      <div className="lx-tabs" style={{ marginBottom: '1.5rem', flexWrap: 'wrap' }}>
         {TABS.map((t) => {
           const activeTab = t.id === tab
           const badge = t.id === 'active' && runningCount > 0 ? runningCount : null
           return (
-            <button key={t.id} onClick={() => setTab(t.id)} style={{
-              display: 'inline-flex', alignItems: 'center', gap: 6, padding: '0.55rem 0.9rem',
-              background: 'none', border: 'none', cursor: 'pointer',
-              fontSize: '0.8rem', fontWeight: activeTab ? 700 : 500,
-              color: activeTab ? 'var(--lx-accent)' : 'var(--lx-text-muted)',
-              borderBottom: activeTab ? '2px solid var(--lx-accent)' : '2px solid transparent',
-              marginBottom: -1,
-            }}>
+            <button key={t.id} onClick={() => setTab(t.id)} className={`lx-tab${activeTab ? ' lx-tab--active' : ''}`}>
               {t.label}
               {badge !== null && (
                 <span style={{ background: 'var(--lx-accent)', color: '#000', borderRadius: 999, fontSize: '0.6rem', fontWeight: 800, padding: '1px 6px' }}>{badge}</span>
