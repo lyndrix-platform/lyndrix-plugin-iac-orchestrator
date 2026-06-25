@@ -637,8 +637,37 @@ async def do_list_jobs(limit: int = 20):
     return _engine.db.get_recent_jobs(limit)
 
 
-async def do_job_logs(job_id: int, tail: int = 200, grep: str | None = None):
-    """Tail a job's on-disk log file (the same file the NiceGUI dashboard streams)."""
+# Default amount of trailing log to seed an offset=0 tail request with, so the UI
+# gets recent context without ever reading a multi-hundred-MB file into memory.
+_LOG_TAIL_BYTES = 256 * 1024
+# Hard cap on grep matches returned in one response (grep streams the file line by
+# line, so memory stays flat regardless of file size; this just bounds the payload).
+_LOG_GREP_MAX = 5000
+
+
+async def do_job_logs(
+    job_id: int,
+    tail: int = 200,
+    grep: str | None = None,
+    offset: int = 0,
+):
+    """Incrementally tail a job's on-disk log file (memory-bounded).
+
+    The log file is append-only, so callers track a byte ``offset`` and fetch only
+    the new bytes since their last poll — O(new data) instead of re-reading the
+    whole file. Behaviour:
+
+    * ``offset > 0`` (and within the file): return only the bytes after ``offset``.
+    * ``offset > size`` (file rotated / new job / truncated): reset and tail.
+    * ``offset == 0``: seed with the last ``_LOG_TAIL_BYTES`` (drop the partial
+      first line) so the viewer opens with recent context.
+    * ``grep``: stream the file line by line (never loaded whole) and return up to
+      ``_LOG_GREP_MAX`` matching lines from the end.
+
+    Always returns the new ``offset`` (== current file size) and ``size`` so the
+    caller can resume. The full, unbounded log is served separately by
+    :func:`do_job_log_raw`.
+    """
     if not _engine:
         raise HTTPException(status_code=500, detail="Engine offline")
 
@@ -649,23 +678,98 @@ async def do_job_logs(job_id: int, tail: int = 200, grep: str | None = None):
             "job_id": job_id,
             "lines": _engine.db.get_job_logs(job_id),
             "source": "db",
+            "offset": 0,
+            "size": 0,
             "tail": tail,
             "grep": grep,
         }
 
     try:
+        size = log_path.stat().st_size
+
+        # grep: stream-scan the whole file line by line, keep only the last N matches.
+        if grep:
+            term = grep.lower()
+            from collections import deque
+            matches: deque = deque(maxlen=_LOG_GREP_MAX)
+            with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+                for ln in f:
+                    if term in ln.lower():
+                        matches.append(ln.rstrip("\n"))
+            return {
+                "job_id": job_id,
+                "lines": list(matches),
+                "source": "file",
+                "offset": size,
+                "size": size,
+                "tail": tail,
+                "grep": grep,
+            }
+
+        # Incremental / tail read (no whole-file load).
+        start = 0
+        drop_partial = False
+        if offset and 0 < offset <= size:
+            start = offset
+        elif offset > size:
+            start = max(0, size - _LOG_TAIL_BYTES)
+            drop_partial = start > 0
+        else:  # offset == 0
+            start = max(0, size - _LOG_TAIL_BYTES)
+            drop_partial = start > 0
+
         with open(log_path, "r", encoding="utf-8", errors="replace") as f:
-            content = f.read()
+            f.seek(start)
+            chunk = f.read()
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Failed to read log: {exc}")
 
-    lines = content.split("\n")
-    if grep:
-        term = grep.lower()
-        lines = [ln for ln in lines if term in ln.lower()]
-    if tail and tail > 0:
-        lines = lines[-tail:]
-    return {"job_id": job_id, "lines": lines, "source": "file", "tail": tail, "grep": grep}
+    lines = chunk.split("\n")
+    # Drop a trailing empty element from a chunk that ended on a newline.
+    if lines and lines[-1] == "":
+        lines.pop()
+    # When we seeked into the middle of the file, the first line is partial.
+    if drop_partial and lines:
+        lines = lines[1:]
+
+    return {
+        "job_id": job_id,
+        "lines": lines,
+        "source": "file",
+        "offset": size,
+        "size": size,
+        "tail": tail,
+        "grep": grep,
+    }
+
+
+async def do_job_log_raw(job_id: int, download: bool = False):
+    """Stream the ENTIRE job log file to the browser without loading it into memory.
+
+    Backs the "Open full log" / "Download" actions. ``FileResponse`` streams the
+    file in chunks, so a 100 MB+ log costs ~constant server memory. Served from the
+    stream router with ``?token=`` auth because the browser opens this URL directly
+    (a new tab / download) and cannot send a Bearer header.
+    """
+    from fastapi.responses import FileResponse
+
+    if not _engine:
+        raise HTTPException(status_code=500, detail="Engine offline")
+
+    log_path = _engine.config.get_log_path(job_id)
+    if not log_path or not Path(log_path).exists():
+        raise HTTPException(status_code=404, detail="Log file not found")
+
+    disposition = "attachment" if download else "inline"
+    return FileResponse(
+        str(log_path),
+        media_type="text/plain; charset=utf-8",
+        headers={
+            "Content-Disposition": f'{disposition}; filename="job_{job_id}.log"',
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 async def do_job_runners(job_id: int):

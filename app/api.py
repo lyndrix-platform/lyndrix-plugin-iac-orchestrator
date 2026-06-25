@@ -49,9 +49,10 @@ def build_plugin_router(service) -> APIRouter:
         job_id: int,
         tail: int = 200,
         grep: str | None = None,
+        offset: int = 0,
         identity: ApiIdentity = Depends(require_permission("api:read")),
     ):
-        return await _api.do_job_logs(job_id, tail=tail, grep=grep)
+        return await _api.do_job_logs(job_id, tail=tail, grep=grep, offset=offset)
 
     @router.get("/jobs/{job_id}/runners")
     async def job_runners(
@@ -183,5 +184,15 @@ def build_stream_router(service) -> APIRouter:
     @router.get("/stream/jobs")
     async def stream_jobs(request: Request, token: str | None = None):
         return await _api.stream_jobs(request, token)
+
+    # Full-log download/view. Lives on the stream router (direct-on-app, no registry
+    # header auth) because the browser opens this URL in a new tab / as a download
+    # and cannot send a Bearer header — it authenticates via ?token= like the SSE.
+    @router.get("/jobs/{job_id}/logs/raw")
+    async def job_log_raw(job_id: int, token: str | None = None, download: bool = False):
+        from fastapi import HTTPException
+        if not _api._validate_stream_token(token):
+            raise HTTPException(status_code=401, detail="Unauthorized")
+        return await _api.do_job_log_raw(job_id, download=download)
 
     return router
