@@ -19,6 +19,19 @@ import { useJobsSSE } from './lib/hooks'
 const RUNNING_STATES = new Set(['RUNNING', 'PENDING'])
 const FAIL_STATES = new Set(['FAILED', 'ERROR', 'ABORTED'])
 
+// In-SPA navigation the shell's BrowserRouter picks up — NOT a full page reload.
+// A full reload cold-loads the SPA before dynamic plugin routes register and
+// bounces to the dashboard / stalls.
+function spaNavigate(path: string) {
+  window.history.pushState({}, '', path)
+  window.dispatchEvent(new PopStateEvent('popstate'))
+}
+
+function goBack() {
+  const p = window.location.pathname.replace(/\/+$/, '')
+  spaNavigate(p.endsWith('/settings') ? p.slice(0, -'/settings'.length) : p)
+}
+
 const STEM_COLORS: Record<string, string> = {
   violet: '#8b5cf6', sky: '#0ea5e9', emerald: '#10b981', amber: '#f59e0b',
   rose: '#f43f5e', zinc: '#71717a', indigo: '#6366f1', teal: '#14b8a6',
@@ -1037,7 +1050,7 @@ function SettingsPage({ confirm, toast }: { confirm: ConfirmFn; toast: ToastFn }
   return (
     <div style={{ maxWidth: 760, margin: '0 auto', padding: '1.5rem 1.5rem 3rem' }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: '1.25rem' }}>
-        <button onClick={() => window.history.back()} style={{ background: 'none', border: '1px solid var(--lx-border-soft)', borderRadius: 'var(--lx-radius-sm)', color: 'var(--lx-text-muted)', cursor: 'pointer', padding: '3px 10px', fontSize: '0.72rem' }}>← Back</button>
+        <button onClick={goBack} style={{ background: 'none', border: '1px solid var(--lx-border-soft)', borderRadius: 'var(--lx-radius-sm)', color: 'var(--lx-text-muted)', cursor: 'pointer', padding: '3px 10px', fontSize: '0.72rem' }}>← Back</button>
         <h1 style={{ margin: 0, fontSize: '1.15rem', fontWeight: 800, color: 'var(--lx-text)' }}>IaC Orchestrator · Settings</h1>
       </div>
 
@@ -1178,7 +1191,7 @@ function Dashboard() {
   function goSettings() {
     const p = window.location.pathname.replace(/\/+$/, '')
     const target = p.endsWith('/iac') ? `${p}/settings` : `${p}/iac/settings`
-    window.location.assign(target)
+    spaNavigate(target)
   }
 
   return (
