@@ -10,7 +10,7 @@ log = get_logger("IaC:Generator:Renderer")
 # these — can resolve them per host. Without this, PermissiveUndefined collapses them to
 # '' and bakes an empty value into the generated inventory
 # (e.g. PDNS_HOST_IP: '{{ ansible_host_ip }}' -> '').
-DEPLOY_TIME_PASSTHROUGH = ("ansible_host_ip", "inventory_hostname")
+DEPLOY_TIME_PASSTHROUGH = ("ansible_host_ip", "ansible_host", "inventory_hostname")
 
 class PermissiveUndefined(Undefined):
     """Returns an empty string for missing variables to prevent hard crashes during evaluation."""
