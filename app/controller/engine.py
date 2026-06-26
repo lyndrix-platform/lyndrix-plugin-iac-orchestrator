@@ -484,7 +484,11 @@ class DetectDriftStage(BaseStage):
     def _get_host_services(self, state_dict: dict, host_name: str) -> set:
         """Helper to extract a simple set of service names for a given host."""
         svcs = set()
-        for s in state_dict.get(host_name, {}).get("services", []):
+        # Guard every level: the state, the host entry, or its 'services' may be null
+        # (a host with no services is stored as services: null) — `.get(k, default)`
+        # returns the stored None over the default, so a plain default isn't enough.
+        host_entry = (state_dict or {}).get(host_name) or {}
+        for s in (host_entry.get("services") or []):
             if isinstance(s, dict) and s.get("name"): svcs.add(s["name"])
         return svcs
 
@@ -499,7 +503,8 @@ class DetectDriftStage(BaseStage):
         context["current_desired_state"] = current_desired_state
 
         last_known_good_record = engine.db.get_state("last_known_good")
-        last_known_good_state = last_known_good_record.get("data") if last_known_good_record else {}
+        # `data` can be stored as null → coerce to {} so drift parsing never sees None.
+        last_known_good_state = (last_known_good_record.get("data") if last_known_good_record else {}) or {}
 
         diff = DeepDiff(last_known_good_state, current_desired_state, ignore_order=True)
 
