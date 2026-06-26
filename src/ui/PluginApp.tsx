@@ -506,45 +506,35 @@ function Overview({ statsTick, isRunning }: { statsTick: number; isRunning: bool
         <KpiCard label="Engine" value={isRunning ? 'Busy' : 'Idle'} color={isRunning ? 'var(--lx-accent)' : 'var(--lx-state-up)'} />
       </div>
 
-      {/* Host lifecycle (3 phases) */}
-      <Card>
-        <div style={{ padding: '0.75rem 1rem', borderBottom: '1px solid var(--lx-border-soft)', background: 'var(--lx-elevated)', fontSize: '0.78rem', fontWeight: 700, color: 'var(--lx-text)' }}>
-          Host Lifecycle · Provision → Configure → Deploy
-        </div>
-        <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.75rem', padding: '1rem', alignItems: 'stretch' }}>
-          {stats.by_phase.map((p, idx) => {
-            const c = stemColor(p.color)
-            return (
-              <React.Fragment key={p.phase}>
-                <div style={{
-                  flex: '1 1 180px', minWidth: 160, border: `1px solid var(--lx-border-soft)`,
-                  borderTop: `2px solid ${c}`, borderRadius: 'var(--lx-radius-sm)', padding: '0.75rem',
-                  background: 'var(--lx-surface)',
-                }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                    <span style={{ fontSize: '0.8rem', fontWeight: 700, color: 'var(--lx-text)' }}>{p.label}</span>
-                    <span style={{ fontSize: '1.1rem', fontWeight: 800, fontFamily: 'monospace', color: c }}>{p.total}</span>
+      {/* Host lifecycle phases — standalone tiles, like the KPI row above */}
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: '1rem', marginBottom: '1.25rem' }}>
+        {stats.by_phase.map((p) => {
+          const c = stemColor(p.color)
+          return (
+            <div key={p.phase} style={{
+              border: `1px solid var(--lx-border-soft)`,
+              borderTop: `2px solid ${c}`, borderRadius: 'var(--lx-radius-sm)', padding: '0.75rem',
+              background: 'var(--lx-surface)',
+            }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <span style={{ fontSize: '0.8rem', fontWeight: 700, color: 'var(--lx-text)' }}>{p.label}</span>
+                <span style={{ fontSize: '1.1rem', fontWeight: 800, fontFamily: 'monospace', color: c }}>{p.total}</span>
+              </div>
+              {p.total > 0 ? (
+                <div style={{ marginTop: 8 }}>
+                  <ProgressBar value={p.success_rate} color={c} />
+                  <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 4, fontSize: '0.62rem', color: 'var(--lx-text-muted)' }}>
+                    <span>{p.success} ok · {p.failed} fail</span>
+                    <span>{Math.round(p.success_rate)}%</span>
                   </div>
-                  {p.total > 0 ? (
-                    <div style={{ marginTop: 8 }}>
-                      <ProgressBar value={p.success_rate} color={c} />
-                      <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 4, fontSize: '0.62rem', color: 'var(--lx-text-muted)' }}>
-                        <span>{p.success} ok · {p.failed} fail</span>
-                        <span>{Math.round(p.success_rate)}%</span>
-                      </div>
-                    </div>
-                  ) : (
-                    <div style={{ marginTop: 8, fontSize: '0.66rem', fontStyle: 'italic', color: c }}>No runs yet</div>
-                  )}
                 </div>
-                {idx < stats.by_phase.length - 1 && (
-                  <div style={{ alignSelf: 'center', color: 'var(--lx-text-muted)', fontSize: '1.1rem' }}>→</div>
-                )}
-              </React.Fragment>
-            )
-          })}
-        </div>
-      </Card>
+              ) : (
+                <div style={{ marginTop: 8, fontSize: '0.66rem', fontStyle: 'italic', color: c }}>No runs yet</div>
+              )}
+            </div>
+          )
+        })}
+      </div>
 
       {/* Status breakdown + recent feed */}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))', gap: '1rem', marginTop: '1rem' }}>
