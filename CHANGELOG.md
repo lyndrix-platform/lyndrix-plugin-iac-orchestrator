@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **All orchestrator settings are now fully API-controllable** — a single schema source of truth (`app/controller/settings_schema.py`) exposes every operator-tunable setting (Pipeline, GitLab Webhooks, Ansible, Terraform, and all six Repository Roles) as a typed schema, so nothing is NiceGUI-only anymore:
+  - `GET /api/plugins/<id>/settings/schema` — typed field schema (kind/category/sensitive/options, credential selects resolved dynamically).
+  - `GET /api/plugins/<id>/settings/values` — current values; **secrets are masked** and reported via a `<key>__configured` flag (never returned in plaintext).
+  - `POST /api/plugins/<id>/settings/values` — persist values; a blank/sentinel secret **keeps** the stored value (never clobbers).
+  - `GET/POST /api/plugins/<id>/settings/credentials` + `DELETE …/credentials/{alias}` — manage the Git credential registry that backs the credential select-boxes.
+  - Persistence reuses the existing Vault keys (`iac_*`, `ansible_*`, `repo_<slug>_config`), so engine read-sites and behaviour are unchanged.
+- **React settings UI for the new surface** — the orchestrator's React bundle (`/iac/settings`) now renders the Ansible, Terraform and Repository-Roles sections plus a Git Credential Manager generically from `/settings/schema`, matching the `lx-*` design system (sensitive fields show a "set — overwrite to change" placeholder).
+
+### Fixed
+- **Live log viewer no longer freezes the dashboard** — the job-log poller did synchronous file reads (up to ~1 MB on grep, 200 KB on seed) directly on the NiceGUI event loop every second and on every search keystroke, which blocked the loop ("connection lost"/slow UI). Disk I/O now runs in a worker thread (`asyncio.to_thread`); the 1 s poll is scoped to the open dialog (stops on close) and is job-aware (no stale-job lines after switching); the filter input is debounced.
+
+### Added
 - **Provision tab is now operational** — the *Provisioning (Terraform)* tab's construction notice is gone and its actions are wired:
   - **Check Env** (`infra_plan`): a read-only `tofu plan` across every Terraform environment (no `-target`), comparing the live infrastructure against the desired plan without changing anything. Unconfigured environments (missing secret/render inputs) are skipped, not failed, so configured environments still report cleanly.
   - **Deploy Infra** (`infra_apply`): an operator-approved `tofu apply` across every environment, guarded by a confirm dialog.

@@ -100,6 +100,26 @@ def build_plugin_router(service) -> APIRouter:
     async def get_settings(identity: ApiIdentity = Depends(require_permission("api:read"))):
         return await _api.do_get_settings()
 
+    # Schema-driven, comprehensive settings surface (pipeline + webhooks + ansible +
+    # terraform + repo roles). The React UI renders generically from /settings/schema.
+    @router.get("/settings/schema")
+    async def get_settings_schema(
+        identity: ApiIdentity = Depends(require_permission("api:read")),
+    ):
+        return await _api.do_get_settings_schema()
+
+    @router.get("/settings/values")
+    async def get_settings_values(
+        identity: ApiIdentity = Depends(require_permission("api:read")),
+    ):
+        return await _api.do_get_settings_values()
+
+    @router.get("/settings/credentials")
+    async def list_credentials(
+        identity: ApiIdentity = Depends(require_permission("api:read")),
+    ):
+        return await _api.do_list_credentials()
+
     @router.get("/settings/webhook-token")
     async def get_webhook_token(
         identity: ApiIdentity = Depends(require_permission("api:read")),
@@ -124,6 +144,27 @@ def build_plugin_router(service) -> APIRouter:
         identity: ApiIdentity = Depends(require_permission("api:write")),
     ):
         return await _api.do_save_settings(payload)
+
+    @router.post("/settings/values")
+    async def save_settings_values(
+        payload: _api.SettingsValuesRequest,
+        identity: ApiIdentity = Depends(require_permission("api:write")),
+    ):
+        return await _api.do_save_settings_values(payload)
+
+    @router.post("/settings/credentials")
+    async def add_credential(
+        payload: _api.CredentialRequest,
+        identity: ApiIdentity = Depends(require_permission("api:write")),
+    ):
+        return await _api.do_add_credential(payload)
+
+    @router.delete("/settings/credentials/{alias}")
+    async def delete_credential(
+        alias: str,
+        identity: ApiIdentity = Depends(require_permission("api:write")),
+    ):
+        return await _api.do_delete_credential(alias)
 
     @router.post("/settings/webhook-token/generate")
     async def generate_webhook_token(

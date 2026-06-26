@@ -44,6 +44,8 @@ export const pluginApi = {
       method: 'POST',
       body: body !== undefined ? JSON.stringify(body) : undefined,
     }),
+  del: <T>(subpath: string) =>
+    apiFetch<T>(pluginPath(subpath), { method: 'DELETE' }),
 }
 
 // ─── Domain types ───────────────────────────────────────────────────────────
@@ -169,6 +171,26 @@ export interface IaCSettings {
   webhook_endpoint: string
 }
 
+// Schema-driven settings (comprehensive surface: ansible / terraform / repo roles).
+export interface SettingField {
+  key: string
+  label: string
+  kind: 'str' | 'bool' | 'int' | 'select' | 'textarea' | 'password'
+  category: string
+  sensitive: boolean
+  default: unknown
+  description: string
+  options: string[]
+}
+
+export interface SettingsSchemaResponse {
+  schema: SettingField[]
+}
+
+export interface SettingsValuesResponse {
+  values: Record<string, unknown>
+}
+
 export interface PipelinePayload {
   pipeline_type: 'bootstrap_compliance' | 'adopt_host' | 'rollout' | 'init_host' | 'compliance'
   limit?: string
@@ -207,6 +229,22 @@ export const iacApi = {
   abort: () => pluginApi.post<AcceptedResponse>('abort'),
   getSettings: () => pluginApi.get<IaCSettings>('settings/general'),
   saveSettings: (payload: Partial<IaCSettings>) => pluginApi.post<IaCSettings>('settings/general', payload),
+  // Schema-driven comprehensive settings (ansible / terraform / repo roles).
+  settingsSchema: () => pluginApi.get<SettingsSchemaResponse>('settings/schema'),
+  settingsValues: () => pluginApi.get<SettingsValuesResponse>('settings/values'),
+  saveSettingsValues: (values: Record<string, unknown>) =>
+    pluginApi.post<{ status: string; saved: string[]; values: Record<string, unknown> }>(
+      'settings/values', { values },
+    ),
+  listCredentials: () => pluginApi.get<{ credentials: string[] }>('settings/credentials'),
+  addCredential: (alias: string, secret: string) =>
+    pluginApi.post<{ status: string; alias: string; credentials: string[] }>(
+      'settings/credentials', { alias, secret },
+    ),
+  deleteCredential: (alias: string) =>
+    pluginApi.del<{ status: string; credentials: string[] }>(
+      `settings/credentials/${encodeURIComponent(alias)}`,
+    ),
   getWebhookToken: () =>
     pluginApi.get<{ configured: boolean; masked: string }>('settings/webhook-token'),
   generateWebhookToken: () =>
