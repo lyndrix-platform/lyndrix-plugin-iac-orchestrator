@@ -90,6 +90,28 @@ python driver.py --routes /iac /plugins --no-mobile --outdir shots   # /iac + Pl
 python driver.py --health-only                                       # no browser; print /api/health
 ```
 
+## Also reachable as a React bundle (lyndrix-ui shell)
+
+Besides the NiceGUI `/iac`, this plugin now ships a **React bundle**
+(`src/ui/PluginApp.tsx` → `ui_static/ui_bundle.js`, manifest **v0.8.0**) that
+renders inside the **lyndrix-ui** shell (same running stack, no extra setup).
+Drive it with the sibling `run-lyndrix-ui` driver (run from this repo root):
+
+```bash
+node ../lyndrix-ui/.claude/skills/run-lyndrix-ui/driver.mjs \
+  '/apps/lyndrix-plugin-iac_orchestrator/iac' /tmp/iac-react.png
+```
+
+> **safeId gotcha:** the shell route segment is the plugin id with dots → dashes
+> *only* — `lyndrix.plugin.iac_orchestrator` → `lyndrix-plugin-iac_orchestrator`
+> (the underscore stays). Using `…-iac-orchestrator` silently bounces to the
+> Dashboard. Settings is `…/iac_orchestrator/iac/settings`.
+
+A correct React shot shows the Overview with the **Provision / Configure / Deploy
+phase tiles as standalone KPI-style tiles** (un-nested), whereas the NiceGUI
+`/iac` still wraps the same three in a titled **Host Lifecycle** card — a handy
+way to tell the two front-ends apart.
+
 ## Run (human path)
 
 `docker compose ... up`, then browse to `http://localhost:8081/iac` and log in as
