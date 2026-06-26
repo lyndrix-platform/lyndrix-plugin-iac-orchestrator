@@ -1440,8 +1440,17 @@ class DeploymentEngine:
         if dst.exists():
             shutil.rmtree(dst, ignore_errors=True)
         dst.parent.mkdir(parents=True, exist_ok=True)
-        # Skip .git — only the rendered inventory is needed and it avoids copying history.
-        shutil.copytree(src, dst, ignore=shutil.ignore_patterns(".git"))
+        # Snapshot only the rendered inventory the deploy reads. Exclude .git and the
+        # terraform working dirs (.terraform_runs/.terraform): they hold ~100MB of state
+        # plus provider symlinks into the shared baked mirror (/data/storage/terraform-
+        # providers/...) that copytree would try to dereference and fail on. symlinks=True
+        # copies any remaining links verbatim instead of following dangling targets.
+        shutil.copytree(
+            src, dst,
+            ignore=shutil.ignore_patterns(".git", ".terraform_runs", ".terraform"),
+            symlinks=True,
+            ignore_dangling_symlinks=True,
+        )
         self._assert_no_placeholder_leak(dst)
 
     def _assert_no_placeholder_leak(self, inventory_dir: Path):
