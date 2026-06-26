@@ -7,6 +7,27 @@ from ..utils import StageResult
 
 log = get_logger("IaC:Engine:Ansible")
 
+
+def host_assigned_services(engine, host_name: str) -> list[str]:
+    """Service names assigned to ``host_name`` via the generated inventory's
+    ``service_*`` groups (e.g. service_aac_docker_proxy → aac-docker-proxy)."""
+    inv_path = engine.base_git_dir / "inventory_state" / "global" / "ansible" / "inventory.yml"
+    try:
+        with open(inv_path, 'r') as f:
+            inv = yaml.safe_load(f) or {}
+    except Exception as e:
+        log.warning(f"Could not read inventory for host service lookup: {e}")
+        return []
+    assigned = []
+    for grp, val in (inv.get("all", {}).get("children", {}) or {}).items():
+        if not grp.startswith("service_"):
+            continue
+        hosts = list((val or {}).get("hosts", {}).keys()) if val else []
+        if host_name in hosts:
+            assigned.append(grp.removeprefix("service_").replace("_", "-"))
+    return assigned
+
+
 class AnsiblePlaybookStage(BaseStage):
     def __init__(self, playbook_path: str, inventory_path: str, limit: str = None, name_override: str = None, extra_vars: dict = None, ssh_key_secret: str = "ansible_ssh_key", remote_user: str = "ansible-agent"):
         self.display_name = name_override or f"Ansible: {playbook_path}"
@@ -55,8 +76,21 @@ class AsyncBulkRolloutStage(BaseStage):
                     services = catalog_data.get("service_catalog", {}).get("services", [])
                     svc_names = [svc.get("name") for svc in services if svc.get("name")]
             except Exception as e: return StageResult(False, f"Raw catalog parse failed: {e}")
-            
-        if not svc_names: 
+
+        # Host-scoped rollout (limit is a single host, not "all"): only attempt services
+        # actually assigned to that host. Otherwise every changed service across the whole
+        # fleet is tried with `--limit <host>:&service_X`, which matches no hosts for
+        # off-host services and spams "leaves us with no hosts to target".
+        host_scope = (self.limit or "").split(":")[0].strip()
+        if host_scope and host_scope != "all":
+            assigned = set(host_assigned_services(engine, host_scope))
+            if assigned:
+                before = len(svc_names)
+                svc_names = [s for s in svc_names if s in assigned]
+                if before != len(svc_names):
+                    log.info(f"Host scope '{host_scope}': {len(svc_names)}/{before} services assigned here; skipped {before - len(svc_names)} off-host service(s).")
+
+        if not svc_names:
             log.info("No active services queued for deployment in this rollout.")
             return StageResult(True, "Skipped: No services to deploy.")
             
@@ -107,22 +141,7 @@ class ServiceDeployStage(BaseStage):
 
     def _get_host_services(self, engine, host_name: str) -> list[str]:
         """Return the service names assigned to host_name via service_* inventory groups."""
-        inv_path = engine.base_git_dir / "inventory_state" / "global" / "ansible" / "inventory.yml"
-        try:
-            with open(inv_path, 'r') as f:
-                inv = yaml.safe_load(f) or {}
-        except Exception as e:
-            log.warning(f"Could not read inventory for host service lookup: {e}")
-            return []
-        assigned = []
-        for grp, val in (inv.get("all", {}).get("children", {}) or {}).items():
-            if not grp.startswith("service_"):
-                continue
-            hosts = list((val or {}).get("hosts", {}).keys()) if val else []
-            if host_name in hosts:
-                # service_aac_docker_proxy → aac-docker-proxy
-                assigned.append(grp.removeprefix("service_").replace("_", "-"))
-        return assigned
+        return host_assigned_services(engine, host_name)
 
     async def run(self, engine, context: dict) -> StageResult:
         if not self.host_name:

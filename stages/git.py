@@ -84,26 +84,58 @@ class CloneServiceRepoStage(BaseStage):
                 f.write(ssh_key.replace('\\n', '\n').strip() + '\n')
             os.chmod(key_path, 0o600)
             auth_env["GIT_SSH_COMMAND"] = f"ssh -i {key_path} -o StrictHostKeyChecking=no"
+        async def _run_git(cmd, cwd=None):
+            proc = await asyncio.create_subprocess_exec(
+                *cmd, cwd=cwd, env=auth_env,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+            )
+            out, _ = await proc.communicate()
+            return proc.returncode, out.decode(errors="ignore").strip()
+
         try:
+            # Git refuses to operate on a repo whose directory owner differs from the
+            # current user — the NFS/bind-mounted service dirs are owned by a squashed
+            # uid, so every fetch failed with "detected dubious ownership", which used to
+            # fall through to the silent stale fallback below and deploy a month-old
+            # checkout. Mark all repos safe up front (idempotent → single '*' entry),
+            # mirroring what the core git-manager already does for the IaC repos.
+            await _run_git(["git", "config", "--global", "--replace-all", "safe.directory", "*"])
             if (target_dir / ".git").exists():
-                git_cmds = [ ["git", "fetch", "origin", self.branch], ["git", "checkout", "-f", self.branch], ["git", "reset", "--hard", f"origin/{self.branch}"] ]
-                for cmd in git_cmds:
-                    proc = await asyncio.create_subprocess_exec(*cmd, cwd=str(target_dir), env=auth_env, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
-                    await proc.communicate()
-                    if proc.returncode != 0: raise RuntimeError(f"Git sync failed at: {' '.join(cmd)}")
-                return StageResult(True, f"Updated {self.service_name}")
+                git_cmds = [
+                    ["git", "fetch", "origin", self.branch],
+                    ["git", "checkout", "-f", self.branch],
+                    ["git", "reset", "--hard", f"origin/{self.branch}"],
+                ]
+                # Retry the whole sync once; a transient network/auth blip must not fall
+                # through to deploying the existing (stale) checkout.
+                last_err = ""
+                for _attempt in range(2):
+                    failed = None
+                    for cmd in git_cmds:
+                        rc, out = await _run_git(cmd, cwd=str(target_dir))
+                        if rc != 0:
+                            failed = f"{' '.join(cmd)} -> {out}"
+                            break
+                    if failed is None:
+                        return StageResult(True, f"Updated {self.service_name}")
+                    last_err = failed
+                # Hard-fail: never silently deploy a stale service repo (wrong version/config).
+                raise RuntimeError(f"Service repo sync failed after retry: {last_err}")
             else:
                 if target_dir.exists():
                     import shutil
                     shutil.rmtree(target_dir)
-                proc = await asyncio.create_subprocess_exec("git", "clone", "-b", self.branch, repo_url, str(target_dir), env=auth_env, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
-                stdout, _ = await proc.communicate()
-                if proc.returncode != 0: raise RuntimeError(f"Clone failed: {stdout.decode(errors='ignore')}")
+                rc, out = await _run_git(["git", "clone", "-b", self.branch, repo_url, str(target_dir)])
+                if rc != 0:
+                    raise RuntimeError(f"Clone failed: {out}")
                 return StageResult(True, f"Successfully cloned {self.service_name}")
         except Exception as e:
-            log.error(f"Git error for {self.service_name}: {e}")
-            if (target_dir / "service.yml").exists(): return StageResult(True, f"Using local fallback for {self.service_name}")
-            return StageResult(False, f"Git failed and no valid service.yml found: {str(e)}")
+            # No silent stale fallback: surface the failure so the pipeline aborts loudly
+            # instead of bringing a service up on stale config/version. Note whether a
+            # local copy exists so the operator knows a manual/forced deploy is possible.
+            stale = " — a local copy exists but was NOT used (refusing to deploy stale state)" if (target_dir / "service.yml").exists() else ""
+            log.error(f"Git error for {self.service_name}: {e}{stale}")
+            return StageResult(False, f"Service repo sync failed for {self.service_name}: {e}{stale}")
 
 class SyncAllServicesStage(BaseStage):
     def __init__(self):
