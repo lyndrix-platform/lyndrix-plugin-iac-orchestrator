@@ -4,6 +4,14 @@ from core.logger import get_logger
 
 log = get_logger("IaC:Generator:Renderer")
 
+# Variables that are only known at DEPLOY time (per-host Ansible run), not during this
+# global, host-agnostic inventory-generation render. They MUST survive this stage as
+# literal Jinja so the downstream template engine — which has host scope and injects
+# these — can resolve them per host. Without this, PermissiveUndefined collapses them to
+# '' and bakes an empty value into the generated inventory
+# (e.g. PDNS_HOST_IP: '{{ ansible_host_ip }}' -> '').
+DEPLOY_TIME_PASSTHROUGH = ("ansible_host_ip", "inventory_hostname")
+
 class PermissiveUndefined(Undefined):
     """Returns an empty string for missing variables to prevent hard crashes during evaluation."""
     def _fail_with_undefined_error(self, *args, **kwargs):
@@ -38,6 +46,10 @@ def _build_flat_context(config: Dict[str, Any]) -> Dict[str, Any]:
     context.update(config)
     # Hilfsvariable, da in deiner 01_global_vars.yml "toplevel_vars.checkmk_commons" genutzt wird
     context['toplevel_vars'] = config
+    # Preserve deploy-time variables as literal Jinja so they pass through untouched
+    # instead of being blanked by PermissiveUndefined (see DEPLOY_TIME_PASSTHROUGH).
+    for var in DEPLOY_TIME_PASSTHROUGH:
+        context[var] = "{{ " + var + " }}"
     return context
 
 def render_templates(config: Dict[str, Any]) -> Dict[str, Any]:
