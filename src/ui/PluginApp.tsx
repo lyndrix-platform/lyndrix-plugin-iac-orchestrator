@@ -10,6 +10,7 @@ import {
   type ServiceHistoryRow,
   type IaCSettings,
   type PipelinePayload,
+  type SettingField,
 } from './lib/api'
 import { useJobsSSE } from './lib/hooks'
 
@@ -505,45 +506,35 @@ function Overview({ statsTick, isRunning }: { statsTick: number; isRunning: bool
         <KpiCard label="Engine" value={isRunning ? 'Busy' : 'Idle'} color={isRunning ? 'var(--lx-accent)' : 'var(--lx-state-up)'} />
       </div>
 
-      {/* Host lifecycle (3 phases) */}
-      <Card>
-        <div style={{ padding: '0.75rem 1rem', borderBottom: '1px solid var(--lx-border-soft)', background: 'var(--lx-elevated)', fontSize: '0.78rem', fontWeight: 700, color: 'var(--lx-text)' }}>
-          Host Lifecycle · Provision → Configure → Deploy
-        </div>
-        <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.75rem', padding: '1rem', alignItems: 'stretch' }}>
-          {stats.by_phase.map((p, idx) => {
-            const c = stemColor(p.color)
-            return (
-              <React.Fragment key={p.phase}>
-                <div style={{
-                  flex: '1 1 180px', minWidth: 160, border: `1px solid var(--lx-border-soft)`,
-                  borderTop: `2px solid ${c}`, borderRadius: 'var(--lx-radius-sm)', padding: '0.75rem',
-                  background: 'var(--lx-surface)',
-                }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                    <span style={{ fontSize: '0.8rem', fontWeight: 700, color: 'var(--lx-text)' }}>{p.label}</span>
-                    <span style={{ fontSize: '1.1rem', fontWeight: 800, fontFamily: 'monospace', color: c }}>{p.total}</span>
+      {/* Host lifecycle phases — standalone tiles, like the KPI row above */}
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: '1rem', marginBottom: '1.25rem' }}>
+        {stats.by_phase.map((p) => {
+          const c = stemColor(p.color)
+          return (
+            <div key={p.phase} style={{
+              border: `1px solid var(--lx-border-soft)`,
+              borderTop: `2px solid ${c}`, borderRadius: 'var(--lx-radius-sm)', padding: '0.75rem',
+              background: 'var(--lx-surface)',
+            }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <span style={{ fontSize: '0.8rem', fontWeight: 700, color: 'var(--lx-text)' }}>{p.label}</span>
+                <span style={{ fontSize: '1.1rem', fontWeight: 800, fontFamily: 'monospace', color: c }}>{p.total}</span>
+              </div>
+              {p.total > 0 ? (
+                <div style={{ marginTop: 8 }}>
+                  <ProgressBar value={p.success_rate} color={c} />
+                  <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 4, fontSize: '0.62rem', color: 'var(--lx-text-muted)' }}>
+                    <span>{p.success} ok · {p.failed} fail</span>
+                    <span>{Math.round(p.success_rate)}%</span>
                   </div>
-                  {p.total > 0 ? (
-                    <div style={{ marginTop: 8 }}>
-                      <ProgressBar value={p.success_rate} color={c} />
-                      <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 4, fontSize: '0.62rem', color: 'var(--lx-text-muted)' }}>
-                        <span>{p.success} ok · {p.failed} fail</span>
-                        <span>{Math.round(p.success_rate)}%</span>
-                      </div>
-                    </div>
-                  ) : (
-                    <div style={{ marginTop: 8, fontSize: '0.66rem', fontStyle: 'italic', color: c }}>No runs yet</div>
-                  )}
                 </div>
-                {idx < stats.by_phase.length - 1 && (
-                  <div style={{ alignSelf: 'center', color: 'var(--lx-text-muted)', fontSize: '1.1rem' }}>→</div>
-                )}
-              </React.Fragment>
-            )
-          })}
-        </div>
-      </Card>
+              ) : (
+                <div style={{ marginTop: 8, fontSize: '0.66rem', fontStyle: 'italic', color: c }}>No runs yet</div>
+              )}
+            </div>
+          )
+        })}
+      </div>
 
       {/* Status breakdown + recent feed */}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))', gap: '1rem', marginTop: '1rem' }}>
@@ -831,6 +822,170 @@ function SectionCard({ title, children }: { title: string; children: React.React
   )
 }
 
+// Categories rendered generically from the orchestrator's settings schema. The
+// Pipeline / GitLab-Webhooks / Token sections above stay hand-rolled (they carry
+// bespoke actions); everything else is driven straight off /settings/schema so it
+// can never drift from the backend.
+const SCHEMA_CATEGORIES = ['Ansible', 'Terraform', 'Repository Roles']
+
+const SECRET_PLACEHOLDER = '•••••••• (gesetzt — zum Ändern überschreiben)'
+
+function SchemaField({ field, value, configured, onChange }: {
+  field: SettingField
+  value: unknown
+  configured: boolean
+  onChange: (v: unknown) => void
+}) {
+  if (field.kind === 'bool') {
+    return <input type="checkbox" checked={Boolean(value)} onChange={(e) => onChange(e.target.checked)} />
+  }
+  if (field.kind === 'select') {
+    return (
+      <select className="lx-input" value={String(value ?? '')} onChange={(e) => onChange(e.target.value)}>
+        {field.options.map((opt) => (
+          <option key={opt} value={opt}>{opt === '' ? 'None (Local or Public)' : opt}</option>
+        ))}
+      </select>
+    )
+  }
+  if (field.kind === 'textarea') {
+    return (
+      <textarea
+        className="lx-input lx-mono"
+        rows={4}
+        value={String(value ?? '')}
+        placeholder={field.sensitive && configured ? SECRET_PLACEHOLDER : ''}
+        onChange={(e) => onChange(e.target.value)}
+      />
+    )
+  }
+  const type = field.kind === 'int' ? 'number' : field.kind === 'password' ? 'password' : 'text'
+  return (
+    <input
+      className="lx-input"
+      type={type}
+      value={String(value ?? '')}
+      placeholder={field.sensitive && configured ? SECRET_PLACEHOLDER : ''}
+      onChange={(e) => onChange(field.kind === 'int' ? Number(e.target.value) : e.target.value)}
+    />
+  )
+}
+
+function AdvancedSettings({ toast, confirm }: { toast: ToastFn; confirm: ConfirmFn }) {
+  const [schema, setSchema] = useState<SettingField[] | null>(null)
+  const [values, setValues] = useState<Record<string, unknown>>({})
+  const [creds, setCreds] = useState<string[]>([])
+  const [error, setError] = useState<string | null>(null)
+  const [newAlias, setNewAlias] = useState('')
+  const [newSecret, setNewSecret] = useState('')
+
+  const reload = useCallback(() => {
+    iacApi.settingsSchema().then((r) => setSchema(r.schema)).catch((e) => setError(e instanceof Error ? e.message : 'Schema konnte nicht geladen werden'))
+    iacApi.settingsValues().then((r) => setValues(r.values)).catch(() => { /* non-fatal */ })
+    iacApi.listCredentials().then((r) => setCreds(r.credentials)).catch(() => { /* non-fatal */ })
+  }, [])
+  useEffect(() => { reload() }, [reload])
+
+  function setVal(key: string, v: unknown) { setValues((prev) => ({ ...prev, [key]: v })) }
+
+  function saveCategory(category: string) {
+    if (!schema) return
+    const updates: Record<string, unknown> = {}
+    for (const f of schema.filter((x) => x.category === category)) {
+      const v = values[f.key]
+      if (f.sensitive) {
+        // Only transmit non-empty secrets; a blank field keeps the stored value.
+        if (typeof v === 'string' && v.trim() !== '') updates[f.key] = v
+      } else {
+        updates[f.key] = v
+      }
+    }
+    iacApi.saveSettingsValues(updates)
+      .then((r) => { setValues(r.values); toast(`${category} gespeichert (${r.saved.length} Feld(er)).`) })
+      .catch((e) => toast(e instanceof Error ? e.message : 'Speichern fehlgeschlagen', 'err'))
+  }
+
+  function addCredential() {
+    const a = newAlias.trim(); const s = newSecret.trim()
+    if (!a || !s) { toast('Name und Secret sind erforderlich.', 'err'); return }
+    iacApi.addCredential(a, s)
+      .then(() => { setNewAlias(''); setNewSecret(''); reload(); toast(`Credential '${a}' gespeichert.`) })
+      .catch((e) => toast(e instanceof Error ? e.message : 'Speichern fehlgeschlagen', 'err'))
+  }
+
+  function removeCredential(alias: string) {
+    confirm({
+      title: `Credential '${alias}' entfernen?`,
+      body: 'Entfernt den Alias aus der Registry (verschwindet aus den Auswahllisten). Das Secret selbst bleibt in Vault.',
+      confirmLabel: 'Entfernen',
+      onConfirm: () => {
+        iacApi.deleteCredential(alias)
+          .then(() => { reload(); toast(`Credential '${alias}' entfernt.`) })
+          .catch((e) => toast(e instanceof Error ? e.message : 'Entfernen fehlgeschlagen', 'err'))
+      },
+    })
+  }
+
+  if (error) return <ErrorBox msg={error} />
+  if (!schema) return null
+
+  return (
+    <>
+      {SCHEMA_CATEGORIES.map((cat) => {
+        const fields = schema.filter((f) => f.category === cat)
+        if (!fields.length) return null
+        return (
+          <SectionCard key={cat} title={cat}>
+            {fields.map((f) => {
+              const configured = Boolean(values[`${f.key}__configured`])
+              if (f.kind === 'bool') {
+                return (
+                  <div key={f.key} style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 16 }}>
+                    <SchemaField field={f} value={values[f.key]} configured={configured} onChange={(v) => setVal(f.key, v)} />
+                    <label style={{ fontSize: '0.8rem', color: 'var(--lx-text)' }}>{f.label}</label>
+                  </div>
+                )
+              }
+              return (
+                <Field key={f.key} label={f.sensitive && configured ? `${f.label} ✓` : f.label} hint={f.description || undefined}>
+                  <SchemaField field={f} value={values[f.key]} configured={configured} onChange={(v) => setVal(f.key, v)} />
+                </Field>
+              )
+            })}
+            <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+              <Button label={`Save ${cat}`} variant="primary" onClick={() => saveCategory(cat)} />
+            </div>
+          </SectionCard>
+        )
+      })}
+
+      <SectionCard title="Git Credential Manager">
+        <div style={{ fontSize: '0.7rem', color: 'var(--lx-text-muted)', marginBottom: 12 }}>
+          Tokens/Keys werden verschlüsselt in Vault gespeichert und stehen oben als Auswahl bereit
+          (GitLab API Credential, Repository-Rollen).
+        </div>
+        {creds.length === 0 ? (
+          <div style={{ fontSize: '0.74rem', color: 'var(--lx-text-muted)', marginBottom: 14 }}>Noch keine Credentials hinterlegt.</div>
+        ) : (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginBottom: 14 }}>
+            {creds.map((alias) => (
+              <div key={alias} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '6px 12px', border: '1px solid var(--lx-border-soft)', borderRadius: 'var(--lx-radius-sm)' }}>
+                <span className="lx-mono" style={{ fontSize: '0.76rem', color: 'var(--lx-text)' }}>{alias}</span>
+                <button onClick={() => removeCredential(alias)} style={{ background: 'none', border: 'none', color: '#f87171', cursor: 'pointer', fontSize: '0.72rem' }}>Entfernen</button>
+              </div>
+            ))}
+          </div>
+        )}
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr auto', gap: 8, alignItems: 'center' }}>
+          <input className="lx-input" placeholder="Name (z.B. gitlab_main)" value={newAlias} onChange={(e) => setNewAlias(e.target.value)} />
+          <input className="lx-input" type="password" placeholder="Token oder Private Key" value={newSecret} onChange={(e) => setNewSecret(e.target.value)} />
+          <Button label="Hinzufügen" variant="primary" onClick={addCredential} />
+        </div>
+      </SectionCard>
+    </>
+  )
+}
+
 function SettingsPage({ confirm, toast }: { confirm: ConfirmFn; toast: ToastFn }) {
   const [cfg, setCfg] = useState<IaCSettings | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -948,6 +1103,9 @@ function SettingsPage({ confirm, toast }: { confirm: ConfirmFn; toast: ToastFn }
           <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
             <Button label="Save Settings" variant="primary" onClick={save} />
           </div>
+
+          {/* Schema-driven sections: Ansible, Terraform, Repository Roles + credentials. */}
+          <AdvancedSettings toast={toast} confirm={confirm} />
         </div>
       )}
     </div>

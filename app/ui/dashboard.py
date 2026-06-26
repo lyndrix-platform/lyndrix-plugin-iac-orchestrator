@@ -156,16 +156,16 @@ async def render_dashboard(ctx, service):
         for ln in lines:
             log_stream.push(ln)
 
-    def update_log_content():
-        if not log_viewer.value or not active_log_job["id"]:
-            return
-        log_path = config.get_log_path(active_log_job["id"])
+    # Reads can be large (~1MB grep / 200KB seed). Doing them inline on the NiceGUI
+    # event loop froze the whole UI ("connection lost"), so the disk I/O runs in a
+    # worker thread (asyncio.to_thread) and only the cheap DOM push stays on the loop.
+    def _read_log_sync(job_id, offset, term):
+        """Pure file I/O — runs OFF the event loop. Returns a render-instruction dict."""
+        log_path = config.get_log_path(job_id)
         if not log_path.exists():
-            return
-        term = (log_search.value or "").lower()
-
-        # Grep mode: re-render a bounded, filtered tail (scans only the last ~1MB).
-        # Full-history search is available via the downloadable raw log.
+            return None
+        # Grep mode: bounded, filtered tail (scans only the last ~1MB). Full-history
+        # search stays available via the downloadable raw log.
         if term:
             try:
                 size = log_path.stat().st_size
@@ -173,52 +173,79 @@ async def render_dashboard(ctx, service):
                     f.seek(max(0, size - LOG_GREP_SCAN_BYTES))
                     chunk = f.read()
             except Exception:
-                return
+                return None
             matched = [ln for ln in chunk.split('\n') if term in ln.lower()]
-            log_stream.clear()
-            _push_lines(matched[-4000:])
-            active_log_job["grep"] = term
-            return
-
-        # Just left grep mode -> reset back to incremental tailing from scratch.
-        if active_log_job["grep"]:
-            active_log_job["grep"] = ""
-            active_log_job["offset"] = 0
-            log_stream.clear()
-
-        # Incremental mode: read only bytes appended since the stored offset.
+            return {"mode": "grep", "lines": matched[-4000:]}
+        # Incremental mode: only the bytes appended since the stored offset.
         try:
             size = log_path.stat().st_size
-            off = active_log_job["offset"]
-            if off and off == size:
-                return  # nothing new
+            if offset and offset == size:
+                return {"mode": "nochange"}
             reset = False
             drop_partial = False
-            if off == 0 or off > size:  # seed, or file shrank/rotated -> re-seed
+            if offset == 0 or offset > size:  # seed, or file shrank/rotated -> re-seed
                 start = max(0, size - LOG_SEED_BYTES)
                 drop_partial = start > 0
                 reset = True
             else:
-                start = off
+                start = offset
             with open(log_path, 'r', encoding='utf-8', errors='replace') as f:
                 f.seek(start)
                 chunk = f.read()
-            active_log_job["offset"] = size
         except Exception:
-            return
-
+            return None
         lines = chunk.split('\n')
         if lines and lines[-1] == '':
             lines.pop()
         if drop_partial and lines:
             lines = lines[1:]
-        if reset:
-            log_stream.clear()
-        if lines:
-            _push_lines(lines)
+        return {"mode": "incremental", "lines": lines, "reset": reset, "new_offset": size}
 
-    log_search.on('update:model-value', update_log_content)
-    ui.timer(1.0, update_log_content)
+    # Guards against overlapping reads piling up (timer tick racing a search keystroke).
+    _log_busy = {"v": False}
+
+    async def update_log_content():
+        if not log_viewer.value or not active_log_job["id"]:
+            return
+        if _log_busy["v"]:
+            return  # a read is still in flight; skip this tick
+        job_id = active_log_job["id"]
+        term = (log_search.value or "").lower()
+        # Leaving grep mode -> reset back to incremental tailing from scratch.
+        if not term and active_log_job["grep"]:
+            active_log_job["grep"] = ""
+            active_log_job["offset"] = 0
+            log_stream.clear()
+        offset = active_log_job["offset"]
+        _log_busy["v"] = True
+        try:
+            result = await asyncio.to_thread(_read_log_sync, job_id, offset, term)
+        finally:
+            _log_busy["v"] = False
+        # Bail if the user switched jobs or closed the dialog while we were reading.
+        if result is None or not log_viewer.value or active_log_job["id"] != job_id:
+            return
+        mode = result["mode"]
+        if mode == "nochange":
+            return
+        if mode == "grep":
+            log_stream.clear()
+            _push_lines(result["lines"])
+            active_log_job["grep"] = term
+            return
+        # incremental
+        if result["reset"]:
+            log_stream.clear()
+        if result["lines"]:
+            _push_lines(result["lines"])
+        active_log_job["offset"] = result["new_offset"]
+
+    # Debounced so fast typing in the filter doesn't fire a full scan per keystroke.
+    log_search.on('update:model-value', update_log_content, throttle=0.4)
+    # Timer only polls while the dialog is open (activated in open_live_logs, stopped
+    # when the dialog hides) — no more forever-running 1s disk poll behind a closed UI.
+    log_timer = ui.timer(1.0, update_log_content, active=False)
+    log_viewer.on('hide', lambda: log_timer.deactivate())
 
     def open_live_logs(job_id):
         active_log_job["id"] = job_id
@@ -228,7 +255,9 @@ async def render_dashboard(ctx, service):
         log_title.set_text(f"Live Pipeline Logs: Job #{job_id}")
         log_stream.clear()
         log_viewer.open()
-        update_log_content()
+        log_timer.activate()
+        # Kick an immediate first read without blocking this (sync) handler.
+        ui.timer(0.05, update_log_content, once=True)
 
     with ui.column().classes('w-full gap-6'):
         with ui.row().classes('w-full items-center justify-end'):

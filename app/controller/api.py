@@ -30,6 +30,8 @@ from pathlib import Path
 from fastapi import Request, Header, HTTPException
 from pydantic import BaseModel, Field
 
+from .settings_schema import OrchestratorSettings
+
 # Internal references to be set by init_api
 _ctx = None
 _engine = None
@@ -1192,6 +1194,90 @@ async def do_save_settings(payload: SettingsRequest):
         _ctx.set_secret("iac_webhook_sync_interval_seconds", str(interval))
 
     return await do_get_settings()
+
+
+# ── Settings: schema-driven, fully API-controllable surface ──────────────────
+#
+# These three endpoints expose EVERY operator-tunable setting (pipeline, GitLab
+# webhooks, Ansible, Terraform, repository roles) as a typed schema + values, so
+# everything the NiceGUI offers is reachable over the API and renderable by the
+# React UI. Persistence reuses the existing Vault keys via OrchestratorSettings;
+# secrets are masked on read and "blank = keep" on write.
+
+class SettingsValuesRequest(BaseModel):
+    values: dict = Field(default_factory=dict)
+
+
+class CredentialRequest(BaseModel):
+    alias: str
+    secret: str
+
+
+def _settings_mgr() -> OrchestratorSettings:
+    if not _ctx or not _service:
+        raise HTTPException(status_code=503, detail="Orchestrator not initialized")
+    return OrchestratorSettings(_ctx, _service)
+
+
+async def do_get_settings_schema():
+    """Return the typed field schema (grouped by category, secrets flagged)."""
+    mgr = _settings_mgr()
+    return {"schema": mgr.get_schema()}
+
+
+async def do_get_settings_values():
+    """Return current values (secrets masked, ``<key>__configured`` flags added)."""
+    mgr = _settings_mgr()
+    return {"values": mgr.get_values()}
+
+
+async def do_save_settings_values(payload: SettingsValuesRequest):
+    """Persist provided settings. Unknown keys ignored; blank secrets keep existing."""
+    mgr = _settings_mgr()
+    saved = mgr.save_values(payload.values or {})
+    return {"status": "ok", "saved": saved, "values": mgr.get_values()}
+
+
+async def do_list_credentials():
+    """List stored Git credential aliases (names only — never the secret values)."""
+    mgr = _settings_mgr()
+    return {"credentials": mgr.credential_aliases()}
+
+
+async def do_add_credential(payload: CredentialRequest):
+    """Store a Git credential (token/key) under an alias and index it in the registry."""
+    if not _ctx:
+        raise HTTPException(status_code=503, detail="Context offline")
+    alias = (payload.alias or "").strip()
+    secret_val = (payload.secret or "").strip()
+    if not alias or not secret_val:
+        raise HTTPException(status_code=422, detail="Both 'alias' and 'secret' are required.")
+    _ctx.set_secret(alias, secret_val)
+    raw = _ctx.get_secret("iac_token_registry")
+    try:
+        registry = list(json.loads(raw)) if raw else []
+    except Exception:
+        registry = []
+    if alias not in registry:
+        registry.append(alias)
+        _ctx.set_secret("iac_token_registry", json.dumps(registry))
+    return {"status": "ok", "alias": alias, "credentials": registry}
+
+
+async def do_delete_credential(alias: str):
+    """Remove a credential alias from the registry (the underlying secret is left in Vault)."""
+    if not _ctx:
+        raise HTTPException(status_code=503, detail="Context offline")
+    alias = (alias or "").strip()
+    raw = _ctx.get_secret("iac_token_registry")
+    try:
+        registry = list(json.loads(raw)) if raw else []
+    except Exception:
+        registry = []
+    if alias in registry:
+        registry = [a for a in registry if a != alias]
+        _ctx.set_secret("iac_token_registry", json.dumps(registry))
+    return {"status": "ok", "credentials": registry}
 
 
 async def do_get_webhook_token():
