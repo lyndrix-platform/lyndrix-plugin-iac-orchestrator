@@ -102,31 +102,100 @@ def _require_gitlab_token(x_gitlab_token: str | None):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
-def _validate_stream_token(token: str | None) -> bool:
-    """Validate an SSE ``?token=`` against the same credentials core's API accepts.
+def _resolve_stream_identity(token: str | None):
+    """Resolve a core ``ApiIdentity`` from a bearer ``token`` query parameter.
 
-    EventSource cannot send an Authorization header, so the live job stream takes
-    the bearer token (the ``lyk_...`` value the React app stores as
-    ``lyndrix_token``) as a query parameter and validates it here in-handler. We
-    accept either the master system API key or a valid per-user API key — the same
-    two key mechanisms core's ``authenticate_request`` honours for bearer tokens.
+    EventSource and browser tab/download requests cannot send an Authorization
+    header, so the live job stream and raw-log download take the bearer token
+    (the ``lyk_...`` value the React app stores as ``lyndrix_token``) via a query
+    parameter. We feed it into core's standard ``authenticate_request`` through a
+    synthetic request so the system key, the per-user key store and per-key scopes
+    are all honoured exactly as for normal header auth — without reaching into any
+    private ``core.components.*`` internals.
     """
     if not token:
-        return False
+        return None
     try:
-        from core.api import resolve_system_api_key
-        sys_key = resolve_system_api_key()
-        if sys_key and hmac.compare_digest(token.strip(), sys_key):
-            return True
-    except Exception:
-        pass
-    try:
-        from core.components.auth.logic.api_key_service import api_key_service
-        return api_key_service.verify(token.strip()) is not None
+        from starlette.requests import Request as _StarletteRequest
+        from core.api import authenticate_request
+        scope = {
+            "type": "http",
+            "headers": [(b"authorization", f"Bearer {token.strip()}".encode())],
+        }
+        return authenticate_request(_StarletteRequest(scope))
     except Exception as exc:
         if _ctx:
             _ctx.log.debug(f"STREAM: token verification failed: {exc}")
+        return None
+
+
+def _validate_stream_token(token: str | None, permission: str = "api:read") -> bool:
+    """Validate a stream/raw-log ``?token=`` and enforce a permission scope.
+
+    Mirrors the authorization the rest of the API enforces via
+    ``require_permission`` — a syntactically valid key is not enough; the resolved
+    identity must also be *granted* ``permission`` (``api:read`` by default). This
+    closes the gap where any low-privilege key could stream live state or download
+    raw logs that the equivalent ``require_permission("api:read")`` REST route
+    would deny.
+    """
+    identity = _resolve_stream_identity(token)
+    return identity is not None and identity.allows(permission)
+
+
+# ── Short-lived stream tickets ───────────────────────────────────────────────
+# Process-lifetime signing key for stream tickets. Tickets are only ever valid
+# within this process, which is fine given their short TTL: a restart simply
+# invalidates outstanding tickets and the client transparently mints a new one.
+_STREAM_TICKET_KEY = secrets.token_bytes(32)
+_STREAM_TICKET_TTL = 60  # seconds
+
+
+def issue_stream_ticket(permission: str = "api:read") -> str:
+    """Mint a short-lived, signed ticket authorizing a stream/raw-log read.
+
+    Minted only after the caller has already passed ``require_permission`` on the
+    authed endpoint, so the granted scope is baked into the ticket. EventSource
+    and browser tab/download requests then present this opaque ticket as
+    ``?ticket=`` instead of the long-lived bearer token, keeping the real
+    credential out of URLs, reverse-proxy access logs and browser history.
+    """
+    import base64
+    exp = int(time.time()) + _STREAM_TICKET_TTL
+    body = f"{exp}:{permission}"
+    sig = hmac.new(_STREAM_TICKET_KEY, body.encode(), "sha256").hexdigest()
+    return base64.urlsafe_b64encode(f"{body}:{sig}".encode()).decode()
+
+
+def _validate_stream_ticket(ticket: str | None, permission: str = "api:read") -> bool:
+    """Constant-time verify a stream ticket and check it is unexpired and in-scope."""
+    if not ticket:
         return False
+    try:
+        import base64
+        raw = base64.urlsafe_b64decode(ticket.encode()).decode()
+        exp_s, perm, sig = raw.rsplit(":", 2)
+        expected = hmac.new(_STREAM_TICKET_KEY, f"{exp_s}:{perm}".encode(), "sha256").hexdigest()
+        if not hmac.compare_digest(sig, expected):
+            return False
+        if int(exp_s) < int(time.time()):
+            return False
+        return perm == permission
+    except Exception:
+        return False
+
+
+def _authorize_stream_request(token: str | None, ticket: str | None,
+                              permission: str = "api:read") -> bool:
+    """Accept either a short-lived stream ticket (preferred) or a bearer token.
+
+    The React client now mints a ticket via ``POST /stream/ticket`` and passes it
+    as ``?ticket=``; the bearer-token path is retained for non-browser/API callers
+    that cannot pre-mint a ticket. Both paths enforce ``permission``.
+    """
+    if _validate_stream_ticket(ticket, permission):
+        return True
+    return _validate_stream_token(token, permission)
 
 
 def _prune_recent_events(now: float):
@@ -1213,6 +1282,19 @@ class CredentialRequest(BaseModel):
     secret: str
 
 
+# Git credential aliases double as Vault keys, so they are constrained to a safe
+# character set and may not collide with the plugin's own security-critical
+# secrets. Any ``iac_*`` key (engine configuration) is additionally reserved.
+_CREDENTIAL_ALIAS_RE = re.compile(r"^[a-z0-9_]+$")
+_RESERVED_CREDENTIAL_KEYS = frozenset({
+    "gitlab_webhook_token",
+    "ansible_ssh_key",
+    "iac_tf_ssh_private_key",
+    "iac_token_registry",
+    "system_api_key",
+})
+
+
 def _settings_mgr() -> OrchestratorSettings:
     if not _ctx or not _service:
         raise HTTPException(status_code=503, detail="Orchestrator not initialized")
@@ -1232,10 +1314,25 @@ async def do_get_settings_values():
 
 
 async def do_save_settings_values(payload: SettingsValuesRequest):
-    """Persist provided settings. Unknown keys ignored; blank secrets keep existing."""
+    """Persist provided settings. Unknown keys ignored; blank secrets keep existing.
+
+    Settings shadowed by an OS env var are NOT written (env always wins) and are
+    reported in ``locked`` with a ``warning`` status so the UI never claims a
+    no-op succeeded.
+    """
     mgr = _settings_mgr()
-    saved = mgr.save_values(payload.values or {})
-    return {"status": "ok", "saved": saved, "values": mgr.get_values()}
+    result = mgr.save_values(payload.values or {})
+    saved = result["saved"]
+    locked = result["locked"]
+    return {
+        "status": "warning" if locked else "ok",
+        "saved": saved,
+        "locked": locked,
+        "warning": (
+            f"Locked by environment (not saved): {', '.join(locked)}" if locked else None
+        ),
+        "values": mgr.get_values(),
+    }
 
 
 async def do_list_credentials():
@@ -1252,6 +1349,20 @@ async def do_add_credential(payload: CredentialRequest):
     secret_val = (payload.secret or "").strip()
     if not alias or not secret_val:
         raise HTTPException(status_code=422, detail="Both 'alias' and 'secret' are required.")
+    # Validate the alias before using it as a Vault key. Without this an operator
+    # (or compromised api:write identity) could pass the name of a security-
+    # critical engine secret (webhook token, SSH keys, the registry itself) and
+    # silently overwrite it through the credential form.
+    if not _CREDENTIAL_ALIAS_RE.match(alias):
+        raise HTTPException(
+            status_code=422,
+            detail="Alias must match ^[a-z0-9_]+$ (lowercase letters, digits, underscore).",
+        )
+    if alias in _RESERVED_CREDENTIAL_KEYS or alias.startswith("iac_"):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Alias '{alias}' is reserved for engine configuration and cannot be used.",
+        )
     _ctx.set_secret(alias, secret_val)
     raw = _ctx.get_secret("iac_token_registry")
     try:
@@ -1330,16 +1441,18 @@ def _job_stream_snapshot() -> dict:
     }
 
 
-async def stream_jobs(request: Request, token: str | None):
-    """SSE generator factory for ``GET /stream/jobs?token=...``.
+async def stream_jobs(request: Request, token: str | None, ticket: str | None = None):
+    """SSE generator factory for ``GET /stream/jobs?ticket=...``.
 
     Returns a StreamingResponse emitting a JSON snapshot whenever the orchestrator
-    state changes, plus a ~1s keep-alive tick. The token is validated in-handler
-    because EventSource cannot send an Authorization header.
+    state changes, plus a ~1s keep-alive tick. Authorization is validated
+    in-handler because EventSource cannot send an Authorization header — it
+    accepts a short-lived ``ticket`` (preferred) or a bearer ``token``, and both
+    must carry the ``api:read`` permission.
     """
     from fastapi.responses import StreamingResponse
 
-    if not _validate_stream_token(token):
+    if not _authorize_stream_request(token, ticket, "api:read"):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     async def generator():

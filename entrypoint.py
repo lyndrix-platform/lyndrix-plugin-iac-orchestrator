@@ -17,7 +17,7 @@ from .app.ui.widget import render_dashboard_widget as modular_widget
 manifest = ModuleManifest(
     id="lyndrix.plugin.iac_orchestrator",
     name="IaC Orchestrator",
-    version="0.8.1",
+    version="0.9.0",
     description="Standalone GitOps controller for executing Terraform and Ansible pipelines.",
     author="Lyndrix",
     icon="rocket_launch",
@@ -119,6 +119,11 @@ def setup(ctx):
 
     # API wiring
     init_api(ctx, _service)
+    # TODO(agent): these reach into core internals (`main.app`, `core.api.route_order`)
+    # to mount the auth-exempt public webhook + SSE routers directly on the app.
+    # The stable fix is a sanctioned `core.api` helper for "mount a public
+    # (auth-exempt) router"; it does not exist yet, so this coupling stays for now
+    # (audit findings -010, -011 structural move also deferred — needs core support).
     from main import app as fastapi_app
     from core.api.route_order import move_routes_before_catchall
 

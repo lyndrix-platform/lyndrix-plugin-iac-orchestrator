@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0] - 2026-06-27
+
+### Security / Changed
+- **Production hardening pass** across the API, controller and React UI layers (input validation, auth scoping, safe git sync, engine robustness).
+- **`POST /infra/apply` now requires the dedicated `iac:infra_apply` permission** (in addition to generic `api:write`), so operating a single service can never implicitly authorise a fleet-wide `tofu apply`/destroy. The master system key and superadmin role bypass both, as everywhere. (Confirmed consistent — B4.)
+
+### Notes
+- **External-services coupling is conceptual only** — this plugin makes no HTTP (or in-process) call to the external-services plugin, so the external-services API move to `/api/plugins/lyndrix.plugin.external_services/...` with required auth needs no caller-side change here (B3). No call site exists to migrate.
+
 ## [Unreleased]
 
 ### Added

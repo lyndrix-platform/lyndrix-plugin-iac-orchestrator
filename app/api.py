@@ -205,9 +205,23 @@ def build_plugin_router(service) -> APIRouter:
     async def infra_plan(identity: ApiIdentity = Depends(require_permission("api:write"))):
         return await _api.do_trigger_infra_plan()
 
+    # Fleet-wide `tofu apply` can create/change/DESTROY real infrastructure, so it
+    # requires a dedicated high-privilege permission in addition to generic write —
+    # operating a single service must not implicitly grant destroying the fleet.
+    # (The master system key and superadmin role bypass both, as everywhere.)
     @router.post("/infra/apply")
-    async def infra_apply(identity: ApiIdentity = Depends(require_permission("api:write"))):
+    async def infra_apply(
+        identity: ApiIdentity = Depends(require_permission("api:write")),
+        _apply: ApiIdentity = Depends(require_permission("iac:infra_apply")),
+    ):
         return await _api.do_trigger_infra_apply()
+
+    # Mint a short-lived ticket for the SSE/raw-log endpoints. Requires api:read
+    # (same scope the stream itself needs), so the long-lived bearer token never
+    # has to travel in a query string. See build_stream_router below.
+    @router.post("/stream/ticket")
+    async def stream_ticket(identity: ApiIdentity = Depends(require_permission("api:read"))):
+        return {"ticket": _api.issue_stream_ticket("api:read"), "expires_in": 60}
 
     return router
 
@@ -223,16 +237,22 @@ def build_stream_router(service) -> APIRouter:
     router = APIRouter(prefix=f"/api/plugins/{PLUGIN_ID}", tags=["IaC Orchestrator (stream)"])
 
     @router.get("/stream/jobs")
-    async def stream_jobs(request: Request, token: str | None = None):
-        return await _api.stream_jobs(request, token)
+    async def stream_jobs(request: Request, token: str | None = None, ticket: str | None = None):
+        return await _api.stream_jobs(request, token, ticket)
 
     # Full-log download/view. Lives on the stream router (direct-on-app, no registry
     # header auth) because the browser opens this URL in a new tab / as a download
-    # and cannot send a Bearer header — it authenticates via ?token= like the SSE.
+    # and cannot send a Bearer header — it authenticates via a short-lived ?ticket=
+    # (preferred) or ?token= like the SSE, and both must carry api:read.
     @router.get("/jobs/{job_id}/logs/raw")
-    async def job_log_raw(job_id: int, token: str | None = None, download: bool = False):
+    async def job_log_raw(
+        job_id: int,
+        token: str | None = None,
+        ticket: str | None = None,
+        download: bool = False,
+    ):
         from fastapi import HTTPException
-        if not _api._validate_stream_token(token):
+        if not _api._authorize_stream_request(token, ticket, "api:read"):
             raise HTTPException(status_code=401, detail="Unauthorized")
         return await _api.do_job_log_raw(job_id, download=download)
 

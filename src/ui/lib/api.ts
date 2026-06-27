@@ -9,6 +9,18 @@ export function pluginPath(subpath: string): string {
   return `/api/plugins/${PLUGIN_ID}/${subpath}`
 }
 
+// Default per-request timeout. No request should ever hang forever: a stalled
+// backend must surface an error so loading spinners resolve and polling loops
+// don't accumulate pending promises.
+const DEFAULT_TIMEOUT_MS = 20_000
+
+/** Client-side (History API) redirect to the login shell — no hard reload. */
+function redirectToLogin(): void {
+  if (window.location.pathname === '/login') return
+  window.history.pushState({}, '', '/login')
+  window.dispatchEvent(new PopStateEvent('popstate'))
+}
+
 async function apiFetch<T>(path: string, init: RequestInit = {}): Promise<T> {
   const token = getToken()
   const headers: Record<string, string> = {
@@ -17,11 +29,24 @@ async function apiFetch<T>(path: string, init: RequestInit = {}): Promise<T> {
     ...(init.headers as Record<string, string> | undefined),
   }
 
-  const res = await fetch(path, { ...init, headers })
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), DEFAULT_TIMEOUT_MS)
+
+  let res: Response
+  try {
+    res = await fetch(path, { ...init, headers, signal: controller.signal })
+  } catch (e) {
+    if (e instanceof DOMException && e.name === 'AbortError') {
+      throw new Error('Request timed out')
+    }
+    throw e
+  } finally {
+    clearTimeout(timer)
+  }
 
   if (res.status === 401) {
     localStorage.removeItem(TOKEN_KEY)
-    window.location.href = '/login'
+    redirectToLogin()
     throw new Error('Nicht autorisiert')
   }
 
@@ -253,4 +278,7 @@ export const iacApi = {
     pluginApi.post<AcceptedResponse & { projects_total?: number; created?: number; updated?: number; failed?: number }>(
       'settings/webhooks/sync',
     ),
+  // Short-lived ticket so the SSE/raw-log URLs never carry the bearer token.
+  streamTicket: () =>
+    pluginApi.post<{ ticket: string; expires_in: number }>('stream/ticket'),
 }

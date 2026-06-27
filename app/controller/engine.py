@@ -16,7 +16,7 @@ from deepdiff import DeepDiff
 import re
 
 from ...stages.base import BaseStage
-from .utils import StageResult, JobFileLogBridge
+from .utils import StageResult, JobFileLogBridge, current_job_id as _job_id_ctxvar
 from ...stages.git import (
     SyncRepoStage,
     CommitPushStage,
@@ -552,9 +552,16 @@ class CleanupOrphanedServicesStage(BaseStage):
         if not to_remove:
             return StageResult(True, "No services require cleanup.")
             
-        log.info(f"Placeholder: Would run cleanup playbook for removed services: {', '.join(to_remove)}")
+        # TODO(agent): orphan teardown is NOT implemented — this stage only logs.
+        # It is wired into the live rollout pipeline, so the flow implies a
+        # capability that does not run. Either implement the cleanup playbook call
+        # below or remove the stage from RolloutStrategy.build_stages (audit -018).
+        log.warning(
+            "Orphan cleanup is a no-op (not implemented): %d service(s) would be "
+            "removed: %s", len(to_remove), ", ".join(to_remove),
+        )
         # FUTURE: await engine.execute_ansible_docker(playbook_subpath="playbooks/cleanup.yml", extra_vars={"services_to_kill": ",".join(to_remove)}, ...)
-        return StageResult(True, "Placeholder cleanup completed.")
+        return StageResult(True, "Orphan cleanup skipped (not implemented).")
 
 class PersistStateStage(BaseStage):
     def __init__(self):
@@ -566,6 +573,270 @@ class PersistStateStage(BaseStage):
             # Use a placeholder 'latest' for commit hash for now
             engine.db.update_state("last_known_good", new_state, "latest")
         return StageResult(True, "State persisted.")
+
+# ============================================================================
+# PIPELINE STRATEGIES (factory + polymorphism)
+# ----------------------------------------------------------------------------
+# Each pipeline type is a polymorphic strategy that knows how to derive its DB
+# tag and assemble its type-specific stage list. Strategies are resolved through
+# ``get_pipeline_strategy`` (a registry/factory), replacing the two long
+# ``if/elif pipeline_type == ...`` ladders that used to live in
+# ``run_pipeline``. The shared envelope — repo sync, generation, optional state
+# commit, execution, notifications and the concurrency guards — stays in
+# ``DeploymentEngine.run_pipeline``.
+#
+# TODO(agent): once the in-file stage classes move into the stages/ package
+# (audit finding -016), these strategies can move into their own module too.
+# ============================================================================
+
+
+class PipelineStrategy:
+    """Base strategy for a single pipeline type.
+
+    Subclasses set the class attributes below (shared-prefix toggles) and
+    implement :meth:`build_stages`. The default :meth:`db_tag` returns the bare
+    pipeline type.
+    """
+
+    #: also sync the infra_engine repo before generation
+    sync_infra_engine: bool = False
+    #: commit/push the generated inventory_state after generation
+    commit_state: bool = True
+    #: execute via the named-task organizer (host_provision tracking) rather than
+    #: the flat stage loop
+    organizes_tasks: bool = False
+
+    def db_tag(self, payload: dict) -> str:
+        """DB ``pipeline_type`` tag for this run (defaults to the bare type)."""
+        return str(payload.get("pipeline_type") or "")
+
+    def build_stages(self, engine: "DeploymentEngine", payload: dict, context: dict) -> list:
+        """Type-specific stages appended after the shared sync/generate prefix."""
+        raise NotImplementedError
+
+
+class SingleServiceStrategy(PipelineStrategy):
+    commit_state = False
+
+    def db_tag(self, payload):
+        return f"single_service:{payload.get('service_name')}"
+
+    def build_stages(self, engine, payload, context):
+        svc_name = payload.get("service_name")
+        svc_branch = payload.get("service_branch", "main")
+        target_group = (
+            "stage_dev" if svc_branch == "dev" or str(svc_branch).endswith("-dev")
+            else ("stage_test" if svc_branch == "test"
+                  else f"service_{str(svc_name).replace('-', '_')}")
+        )
+        return [
+            CloneServiceRepoStage(svc_name, svc_branch, payload),
+            AnsiblePlaybookStage(
+                name_override=f"Single Service: {svc_name} ({svc_branch})",
+                playbook_path="playbooks/cd_playbooks/cd_rollout_single_service.yml",
+                inventory_path="global/ansible/inventory.yml",
+                limit=target_group,
+                extra_vars={
+                    "SERVICE_BRANCH": svc_branch,
+                    "target_service": svc_name,
+                    "target_group": target_group,
+                    "LOCAL_SERVICES_DIR": str(engine.config.services_dir),
+                },
+            ),
+        ]
+
+
+class HostProvisionStrategy(PipelineStrategy):
+    sync_infra_engine = True
+    organizes_tasks = True
+
+    def db_tag(self, payload):
+        return f"host_provision:{payload.get('host_name')}"
+
+    def build_stages(self, engine, payload, context):
+        host_name = payload.get("host_name")
+        context["host_name"] = host_name  # for task tracking
+        stages = [TerraformProvisionStage(host_name=host_name)]
+        # Ansible init: first compliance/baseline run as root (creates ansible-agent).
+        if not payload.get("skip_bootstrap"):
+            stages.append(ComplianceBootstrapStage(host_name=host_name))
+        # Service deployment stage for the host_provision pipeline.
+        if not payload.get("skip_service_deploy"):
+            stages.append(ServiceDeployStage(host_name=host_name))
+        # Hand off to the existing host deployment (rollout limit=host).
+        if not payload.get("skip_rollout"):
+            # On a complete reinstall, clear stale per-host state so the rollout's
+            # drift check redeploys this host's services.
+            stages.append(InvalidateHostStateStage(host_name=host_name))
+            stages.append(TriggerHostRolloutStage(host_name=host_name))
+        stages.append(DynamicRuleExecutionStage("host_provision"))
+        return stages
+
+
+class InitHostStrategy(PipelineStrategy):
+    sync_infra_engine = True
+
+    def db_tag(self, payload):
+        return f"init_host:{payload.get('host_name')}"
+
+    def build_stages(self, engine, payload, context):
+        # Terraform-only: bring the bare container into existence. No Ansible
+        # bootstrap/compliance/service deploy — just provision the host.
+        host_name = payload.get("host_name")
+        context["host_name"] = host_name
+        return [
+            TerraformProvisionStage(host_name=host_name),
+            DynamicRuleExecutionStage("init_host"),
+        ]
+
+
+class StateCheckStrategy(PipelineStrategy):
+    sync_infra_engine = True
+    commit_state = False
+
+    def db_tag(self, payload):
+        return f"state_check:{payload.get('host_name')}"
+
+    def build_stages(self, engine, payload, context):
+        # Read-only: `tofu state list` for the host; reports CREATED/NOT_CREATED.
+        host_name = payload.get("host_name")
+        context["host_name"] = host_name
+        return [TerraformStateCheckStage(host_name=host_name)]
+
+
+class AdoptHostStrategy(PipelineStrategy):
+    sync_infra_engine = True
+    commit_state = False
+
+    def db_tag(self, payload):
+        # Host-scoped adopt is tagged adopt_host:<host> so History/feeds show the
+        # target; a scope/'all' adopt stays bare "adopt_host".
+        host = str(payload.get("host_name") or "").strip()
+        return f"adopt_host:{host}" if host else "adopt_host"
+
+    def build_stages(self, engine, payload, context):
+        # Import existing CT(s) into Terraform state (then plan to verify) so
+        # manually-created containers come under management without recreation.
+        host_name = payload.get("host_name")
+        if host_name:
+            context["host_name"] = host_name
+            return [TerraformAdoptStage(host_name=host_name)]
+        return [TerraformAdoptScopeStage(limit=payload.get("limit") or "all")]
+
+
+class BootstrapComplianceStrategy(PipelineStrategy):
+    def db_tag(self, payload):
+        return f"bootstrap_compliance:{payload.get('host_name')}"
+
+    def build_stages(self, engine, payload, context):
+        # `host_name` bootstraps one host (waits for SSH first); `limit` ('all' or
+        # a site) runs the compliance playbook across that group in one pass.
+        host_name = payload.get("host_name")
+        if host_name:
+            bootstrap_stage = ComplianceBootstrapStage(host_name=host_name)
+        else:
+            _limit = payload.get("limit") or "all"
+            bootstrap_stage = AnsiblePlaybookStage(
+                name_override=f"Compliance Bootstrap: {_limit}",
+                playbook_path="playbooks/cd_playbooks/cd_compliance.yml",
+                inventory_path="global/ansible/inventory.yml",
+                limit=_limit,
+                ssh_key_secret="iac_tf_ssh_private_key",
+                remote_user="root",
+            )
+        return [bootstrap_stage, DynamicRuleExecutionStage("bootstrap_compliance")]
+
+
+class ComplianceStrategy(PipelineStrategy):
+    def db_tag(self, payload):
+        return f"compliance:{payload.get('host_name')}"
+
+    def build_stages(self, engine, payload, context):
+        # Baseline compliance playbook run as the svc account (ansible-agent) over
+        # the standard inventory — no root, no service deployment. `host_name`
+        # targets one host; `limit` ('all' or a site) runs it across that group.
+        host_name = payload.get("host_name")
+        _limit = host_name or payload.get("limit") or "all"
+        return [
+            AnsiblePlaybookStage(
+                name_override=f"Compliance: {_limit}",
+                playbook_path="playbooks/cd_playbooks/cd_compliance.yml",
+                inventory_path="global/ansible/inventory.yml",
+                limit=_limit,
+                # Defaults: remote_user="ansible-agent", ssh_key_secret="ansible_ssh_key".
+            ),
+            DynamicRuleExecutionStage("compliance"),
+        ]
+
+
+class InfraPlanStrategy(PipelineStrategy):
+    commit_state = False
+
+    def build_stages(self, engine, payload, context):
+        return [InfraPlanStage(), DynamicRuleExecutionStage("infra_plan")]
+
+
+class InfraApplyStrategy(PipelineStrategy):
+    def build_stages(self, engine, payload, context):
+        return [InfraApplyStage(), DynamicRuleExecutionStage("infra_apply")]
+
+
+class RolloutStrategy(PipelineStrategy):
+    def db_tag(self, payload):
+        # Host-scoped rollouts are tagged rollout:<host> so the job list reads
+        # like the provision job that spawned them.
+        _limit = str(payload.get("limit") or "").strip().lower()
+        return f"rollout:{_limit}" if (_limit and _limit != "all") else "rollout"
+
+    def build_stages(self, engine, payload, context):
+        target_services = payload.get("target_services")
+        if target_services is not None:
+            log.info(
+                "ENGINE: rollout constrained to %s services on limit '%s'.",
+                len(target_services),
+                payload.get("limit", "all"),
+            )
+        return [
+            DetectDriftStage(),
+            SyncAllServicesStage(),
+            AsyncBulkRolloutStage(
+                inventory_path="global/ansible/inventory.yml",
+                limit=payload.get("limit", "all"),
+                target_services=target_services,
+            ),
+            CleanupOrphanedServicesStage(),
+            DynamicRuleExecutionStage("rollout"),
+            PersistStateStage(),
+        ]
+
+
+class DefaultPipelineStrategy(PipelineStrategy):
+    """Fallback for types without a dedicated strategy (e.g. connectivity)."""
+
+    def build_stages(self, engine, payload, context):
+        return [DynamicRuleExecutionStage(str(payload.get("pipeline_type") or ""))]
+
+
+# Registry: pipeline_type -> singleton strategy instance.
+PIPELINE_STRATEGIES: dict[str, PipelineStrategy] = {
+    "single_service":       SingleServiceStrategy(),
+    "host_provision":       HostProvisionStrategy(),
+    "init_host":            InitHostStrategy(),
+    "state_check":          StateCheckStrategy(),
+    "adopt_host":           AdoptHostStrategy(),
+    "bootstrap_compliance": BootstrapComplianceStrategy(),
+    "compliance":           ComplianceStrategy(),
+    "infra_plan":           InfraPlanStrategy(),
+    "infra_apply":          InfraApplyStrategy(),
+    "rollout":              RolloutStrategy(),
+}
+_DEFAULT_PIPELINE_STRATEGY = DefaultPipelineStrategy()
+
+
+def get_pipeline_strategy(pipeline_type: str) -> PipelineStrategy:
+    """Factory: resolve the strategy for ``pipeline_type`` (default fallback)."""
+    return PIPELINE_STRATEGIES.get(pipeline_type, _DEFAULT_PIPELINE_STRATEGY)
+
 
 # --- THE ENGINE ---
 
@@ -923,39 +1194,20 @@ class DeploymentEngine:
         self.state["running_jobs"] = self.state.get("running_jobs", 0) + 1
         self.state["is_running"] = self.state["running_jobs"] > 0
 
-        # Better tagging for filtering
-        db_type = pipeline_type
-        if pipeline_type == "single_service":
-            db_type = f"single_service:{payload.get('service_name')}"
-        elif pipeline_type == "host_provision":
-            db_type = f"host_provision:{payload.get('host_name')}"
-        elif pipeline_type == "init_host":
-            db_type = f"init_host:{payload.get('host_name')}"
-        elif pipeline_type == "adopt_host":
-            # Host-scoped adopt is tagged adopt_host:<host> so History/feeds show the
-            # target (a scope/'all' adopt stays bare "adopt_host").
-            _h = str(payload.get("host_name") or "").strip()
-            db_type = f"adopt_host:{_h}" if _h else "adopt_host"
-        elif pipeline_type == "bootstrap_compliance":
-            db_type = f"bootstrap_compliance:{payload.get('host_name')}"
-        elif pipeline_type == "compliance":
-            db_type = f"compliance:{payload.get('host_name')}"
-        elif pipeline_type == "state_check":
-            db_type = f"state_check:{payload.get('host_name')}"
-        elif pipeline_type == "rollout":
-            # Host-scoped rollouts (e.g. the host_provision hand-off or the
-            # Assignments 'Deploy Host' button) are tagged rollout:<host> so the
-            # job list reads like the provision job that spawned it.
-            _limit = str(payload.get("limit") or "").strip().lower()
-            if _limit and _limit != "all":
-                db_type = f"rollout:{_limit}"
-            
+        # Resolve the polymorphic strategy for this pipeline type (factory).
+        # It owns the DB tag and the type-specific stage assembly below.
+        strategy = get_pipeline_strategy(pipeline_type)
+        db_type = strategy.db_tag(payload)
+
         current_job_id = self.db.create_job(db_type)
         
-        # FILE LOGGING SETUP
-        bridge = JobFileLogBridge(self.config.get_log_path(current_job_id))
+        # FILE LOGGING SETUP. Tag this execution context with the job id so the
+        # bridge persists only this job's records (concurrent pipelines share the
+        # "IaC:Engine" logger), and bind the same id to the handler.
+        _job_ctx_token = _job_id_ctxvar.set(current_job_id)
+        bridge = JobFileLogBridge(self.config.get_log_path(current_job_id), job_id=current_job_id)
         logging.getLogger("IaC:Engine").addHandler(bridge)
-        
+
         log.info("[SYSTEM] Pipeline Started")
         log.info(f"[SYSTEM] Job #{current_job_id} registered in database.")
 
@@ -991,14 +1243,16 @@ class DeploymentEngine:
         )
 
         context = {"payload": payload, "job_id": current_job_id}
-        
+
+        # Shared prefix: sync the core repos, generate inventory, optionally
+        # commit it back. The strategy supplies the type-specific suffix.
         pipeline = [
             SyncRepoStage("iac_controller"),
             SyncRepoStage("inventory_state"),
             SyncRepoStage("config_engine"),
             SyncRepoStage("aac_factory"),
         ]
-        if pipeline_type in ("host_provision", "adopt_host", "init_host", "state_check"):
+        if strategy.sync_infra_engine:
             pipeline.append(SyncRepoStage("infra_engine"))
         pipeline.extend([
             # Refresh inventory_state right before generation to minimize staleness windows.
@@ -1006,140 +1260,17 @@ class DeploymentEngine:
             NativeGenerateStage(),
         ])
 
-        # For single_service runs we do not persist generated inventory back to inventory_state.
-        # This avoids unnecessary commit/push contention and keeps service deploys focused.
-        # infra_plan is read-only (Check Env) and likewise must not commit state.
-        if pipeline_type not in ("single_service", "infra_plan", "adopt_host", "state_check"):
+        # Read-only / focused pipelines (single_service, infra_plan, adopt_host,
+        # state_check) do not persist generated inventory back to inventory_state.
+        if strategy.commit_state:
             pipeline.append(CommitPushStage("inventory_state", "ci: automated state update"))
-        
-        if pipeline_type == "single_service":
-            svc_name, svc_branch = payload.get("service_name"), payload.get("service_branch", "main")
-            target_group = "stage_dev" if svc_branch == "dev" or str(svc_branch).endswith("-dev") else ("stage_test" if svc_branch == "test" else f"service_{str(svc_name).replace('-', '_')}")
-            pipeline.extend([
-                CloneServiceRepoStage(svc_name, svc_branch, payload), 
-                AnsiblePlaybookStage(
-                    name_override=f"Single Service: {svc_name} ({svc_branch})", 
-                    playbook_path="playbooks/cd_playbooks/cd_rollout_single_service.yml", 
-                    inventory_path="global/ansible/inventory.yml", 
-                    limit=target_group, 
-                    extra_vars={"SERVICE_BRANCH": svc_branch, "target_service": svc_name, "target_group": target_group, "LOCAL_SERVICES_DIR": str(self.config.services_dir)}
-                )
-            ])
-        elif pipeline_type == "host_provision":
-            host_name = payload.get("host_name")
-            context["host_name"] = host_name  # Add to context for task tracking
-            pipeline.append(TerraformProvisionStage(host_name=host_name))
-            # Ansible init: first compliance/baseline run as root (creates ansible-agent).
-            if not payload.get("skip_bootstrap"):
-                pipeline.append(ComplianceBootstrapStage(host_name=host_name))
-            # Service deployment: NEW STAGE for host_provision pipeline
-            if not payload.get("skip_service_deploy"):
-                pipeline.append(ServiceDeployStage(host_name=host_name))
-            # Hand off to the existing host deployment (Assignments 'Deploy Host' = rollout limit=host).
-            if not payload.get("skip_rollout"):
-                # On a complete reinstall (fresh container), clear stale per-host state so
-                # the rollout's drift check redeploys this host's services.
-                pipeline.append(InvalidateHostStateStage(host_name=host_name))
-                pipeline.append(TriggerHostRolloutStage(host_name=host_name))
-            pipeline.append(DynamicRuleExecutionStage(pipeline_type))
-        elif pipeline_type == "init_host":
-            # Terraform-only: bring the bare container into existence. No Ansible
-            # bootstrap, no compliance, no service deploy — just provision the host
-            # (the "Init" step before Bootstrap in the Assignments tab).
-            host_name = payload.get("host_name")
-            context["host_name"] = host_name
-            pipeline.append(TerraformProvisionStage(host_name=host_name))
-            pipeline.append(DynamicRuleExecutionStage(pipeline_type))
-        elif pipeline_type == "state_check":
-            # Read-only: `tofu state list` for the host; reports CREATED/NOT_CREATED.
-            host_name = payload.get("host_name")
-            context["host_name"] = host_name
-            pipeline.append(TerraformStateCheckStage(host_name=host_name))
-        elif pipeline_type == "adopt_host":
-            # Import existing CT(s) into Terraform state (then plan to verify) so
-            # manually-created containers come under management without recreation.
-            # No bootstrap/deploy/apply — just adopt + plan. `host_name` adopts one
-            # host; `limit` ('all' or a site) adopts every managed host in scope.
-            host_name = payload.get("host_name")
-            if host_name:
-                context["host_name"] = host_name
-                pipeline.append(TerraformAdoptStage(host_name=host_name))
-            else:
-                pipeline.append(TerraformAdoptScopeStage(limit=payload.get("limit") or "all"))
-        elif pipeline_type == "bootstrap_compliance":
-            # `host_name` bootstraps one host (waits for SSH first); `limit` ('all'
-            # or a site) runs the compliance playbook across that group in one pass.
-            host_name = payload.get("host_name")
-            if host_name:
-                bootstrap_stage = ComplianceBootstrapStage(host_name=host_name)
-            else:
-                _limit = payload.get("limit") or "all"
-                bootstrap_stage = AnsiblePlaybookStage(
-                    name_override=f"Compliance Bootstrap: {_limit}",
-                    playbook_path="playbooks/cd_playbooks/cd_compliance.yml",
-                    inventory_path="global/ansible/inventory.yml",
-                    limit=_limit,
-                    ssh_key_secret="iac_tf_ssh_private_key",
-                    remote_user="root",
-                )
-            pipeline.extend([
-                bootstrap_stage,
-                DynamicRuleExecutionStage(pipeline_type),
-            ])
-        elif pipeline_type == "compliance":
-            # Same baseline compliance playbook as bootstrap, but run as the normal
-            # svc account (ansible-agent) over the standard inventory — no root, no
-            # service deployment. Used for recurring baseline/compliance enforcement
-            # once the host has already been bootstrapped. `host_name` targets one
-            # host; `limit` ('all' or a site) runs it across that group.
-            host_name = payload.get("host_name")
-            _limit = host_name or payload.get("limit") or "all"
-            pipeline.extend([
-                AnsiblePlaybookStage(
-                    name_override=f"Compliance: {_limit}",
-                    playbook_path="playbooks/cd_playbooks/cd_compliance.yml",
-                    inventory_path="global/ansible/inventory.yml",
-                    limit=_limit,
-                    # Defaults: remote_user="ansible-agent", ssh_key_secret="ansible_ssh_key".
-                ),
-                DynamicRuleExecutionStage(pipeline_type),
-            ])
-        elif pipeline_type == "infra_plan":
-            pipeline.extend([
-                InfraPlanStage(),
-                DynamicRuleExecutionStage(pipeline_type),
-            ])
-        elif pipeline_type == "infra_apply":
-            pipeline.extend([
-                InfraApplyStage(),
-                DynamicRuleExecutionStage(pipeline_type),
-            ])
-        elif pipeline_type == "rollout":
-            target_services = payload.get("target_services")
-            if target_services is not None:
-                log.info(
-                    "ENGINE: rollout constrained to %s services on limit '%s'.",
-                    len(target_services),
-                    payload.get("limit", "all"),
-                )
-            pipeline.extend([
-                DetectDriftStage(),
-                SyncAllServicesStage(),
-                AsyncBulkRolloutStage(
-                    inventory_path="global/ansible/inventory.yml",
-                    limit=payload.get("limit", "all"),
-                    target_services=target_services,
-                ),
-                CleanupOrphanedServicesStage(),
-                DynamicRuleExecutionStage(pipeline_type),
-                PersistStateStage()
-            ])
-        else:
-            pipeline.append(DynamicRuleExecutionStage(pipeline_type))
+
+        # Type-specific stages (polymorphic strategy replaces the if/elif ladder).
+        pipeline.extend(strategy.build_stages(self, payload, context))
 
         try:
-            # For host_provision, organize stages into named tasks with tracking
-            if pipeline_type == "host_provision":
+            # host_provision organizes stages into named tasks with tracking.
+            if strategy.organizes_tasks:
                 tasks = self._organize_host_provision_tasks(pipeline, context)
                 await self._execute_tasks(current_job_id, tasks, context)
             else:
@@ -1237,6 +1368,7 @@ class DeploymentEngine:
             )
         finally:
             logging.getLogger("IaC:Engine").removeHandler(bridge)
+            _job_id_ctxvar.reset(_job_ctx_token)
             self.state["running_jobs"] = max(0, self.state.get("running_jobs", 0) - 1)
             self.state["is_running"] = self.state["running_jobs"] > 0
             self.db.update_job(job_id=current_job_id, status=self.state["last_deployment"])
@@ -1258,7 +1390,8 @@ class DeploymentEngine:
         self.state["is_running"] = self.state["running_jobs"] > 0
         
         self.db.update_progress(job_id, progress=50, current_step="Resuming Bulk Rollout...")
-        bridge = JobFileLogBridge(self.config.get_log_path(job_id))
+        _job_ctx_token = _job_id_ctxvar.set(job_id)
+        bridge = JobFileLogBridge(self.config.get_log_path(job_id), job_id=job_id)
         logging.getLogger("IaC:Engine").addHandler(bridge)
         log.info(f"[SYSTEM] Resuming {len(pending_services)} pending services from job #{job_id}")
         
@@ -1297,6 +1430,7 @@ class DeploymentEngine:
             self._notify(f"Pipeline #{job_id} Resume Failed", str(e), "negative", notification_id=f"job_{job_id}")
         finally:
             logging.getLogger("IaC:Engine").removeHandler(bridge)
+            _job_id_ctxvar.reset(_job_ctx_token)
             self.state["running_jobs"] = max(0, self.state.get("running_jobs", 0) - 1)
             self.state["is_running"] = self.state["running_jobs"] > 0
             self.db.update_job(job_id=job_id, status=self.state["last_deployment"])
@@ -1834,6 +1968,21 @@ class DeploymentEngine:
             },
         }
 
+    @staticmethod
+    def _write_secrets_file(secrets_file: Path, payload: dict) -> None:
+        """Write the Terraform render secrets with owner-only perms (0600).
+
+        The payload (backend secret key, root password, SSH keys) is plaintext, so
+        it is restricted on disk and must be deleted by the caller once the render
+        step has consumed it — it lives under the git-managed inventory_state tree.
+        """
+        with open(secrets_file, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh)
+        try:
+            os.chmod(secrets_file, 0o600)
+        except OSError:
+            pass
+
     def _build_terraform_secrets_payload(self, tf_context: dict) -> tuple[dict, list[str]]:
         missing: list[str] = []
         repo = self._build_repo_terraform_inputs(tf_context)
@@ -2095,8 +2244,7 @@ class DeploymentEngine:
         run_dir.mkdir(parents=True, exist_ok=True)
 
         secrets_file = run_dir / "secrets.json"
-        with open(secrets_file, "w", encoding="utf-8") as fh:
-            json.dump(secrets_payload, fh)
+        self._write_secrets_file(secrets_file, secrets_payload)
 
         render_cmd = [
             sys.executable,
@@ -2108,18 +2256,25 @@ class DeploymentEngine:
             "--secrets", str(secrets_file),
         ]
         log.info("Rendering Terraform env for host '%s' using %s", host_name, ctx["tfvars_path"])
-        render_proc = await asyncio.create_subprocess_exec(
-            *render_cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-        )
-        render_out, _ = await render_proc.communicate()
-        render_text = render_out.decode("utf-8", errors="replace").strip()
-        if render_text:
-            for line in render_text.splitlines():
-                log.info(f"[TF-Render] {line}")
-        if render_proc.returncode != 0:
-            raise RuntimeError("Terraform render failed before runner execution.")
+        try:
+            render_proc = await asyncio.create_subprocess_exec(
+                *render_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            render_out, _ = await render_proc.communicate()
+            render_text = render_out.decode("utf-8", errors="replace").strip()
+            if render_text:
+                for line in render_text.splitlines():
+                    log.info(f"[TF-Render] {line}")
+            if render_proc.returncode != 0:
+                raise RuntimeError("Terraform render failed before runner execution.")
+        finally:
+            # Plaintext infra secrets must not linger in the git-managed tree.
+            try:
+                secrets_file.unlink(missing_ok=True)
+            except OSError:
+                pass
 
         node_name = ctx["node_name"]
         targets = [
@@ -2234,8 +2389,7 @@ class DeploymentEngine:
         run_dir.mkdir(parents=True, exist_ok=True)
 
         secrets_file = run_dir / "secrets.json"
-        with open(secrets_file, "w", encoding="utf-8") as fh:
-            json.dump(secrets_payload, fh)
+        self._write_secrets_file(secrets_file, secrets_payload)
 
         render_cmd = [
             sys.executable,
@@ -2247,18 +2401,25 @@ class DeploymentEngine:
             "--secrets", str(secrets_file),
         ]
         log.info("Rendering Terraform environment '%s' (%s)", env_name, mode)
-        render_proc = await asyncio.create_subprocess_exec(
-            *render_cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-        )
-        render_out, _ = await render_proc.communicate()
-        render_text = render_out.decode("utf-8", errors="replace").strip()
-        if render_text:
-            for line in render_text.splitlines():
-                log.info(f"[TF-Render] {line}")
-        if render_proc.returncode != 0:
-            raise RuntimeError("Terraform render failed before runner execution.")
+        try:
+            render_proc = await asyncio.create_subprocess_exec(
+                *render_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            render_out, _ = await render_proc.communicate()
+            render_text = render_out.decode("utf-8", errors="replace").strip()
+            if render_text:
+                for line in render_text.splitlines():
+                    log.info(f"[TF-Render] {line}")
+            if render_proc.returncode != 0:
+                raise RuntimeError("Terraform render failed before runner execution.")
+        finally:
+            # Plaintext infra secrets must not linger in the git-managed tree.
+            try:
+                secrets_file.unlink(missing_ok=True)
+            except OSError:
+                pass
 
         verb = "Plan" if mode == "plan" else "Apply"
         return await self.execute_terraform_docker(

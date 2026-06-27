@@ -72,9 +72,18 @@ class SettingField:
     coalesce_default: str | None = None  # blank str -> write this instead of ""
     repo_slug: str | None = None         # repo-role JSON storage
     repo_subkey: str | None = None
+    # OS env var that shadows the Vault value (env > vault in IaCConfig._get).
+    # When set, a saved value silently never takes effect, so we must surface the
+    # lock rather than report a false success.
+    env_var: str | None = None
 
     def storage_key(self) -> str:
         return self.vault_key or self.key
+
+    def is_env_locked(self) -> bool:
+        """True when an OS env var shadows this setting (Vault writes are inert)."""
+        import os
+        return bool(self.env_var and os.getenv(self.env_var) is not None)
 
 
 _REPO_ROLES = [
@@ -93,12 +102,13 @@ def _build_fields() -> list[SettingField]:
         SettingField(
             "auto_apply", "Auto-Apply on webhook", kind="bool", category="Pipeline",
             default=False, vault_key="iac_auto_apply", state_key="auto_apply_enabled",
-            bool_format="python",
+            bool_format="python", env_var="PLUGIN_IAC_ORCHESTRATOR_AUTO_APPLY",
             description="Execute immediately when a verified webhook arrives, without a manual plan gate.",
         ),
         SettingField(
             "test_deploy_allowed_hosts", "Test-Deploy allowed hosts", category="Pipeline",
             vault_key="iac_test_deploy_allowed_hosts",
+            env_var="PLUGIN_IAC_ORCHESTRATOR_TEST_DEPLOY_ALLOWED_HOSTS",
             description="Comma-separated allowlist of hosts permitted as ad-hoc test-deploy targets.",
         ),
         # ── GitLab Webhooks ───────────────────────────────────────────────────
@@ -136,6 +146,7 @@ def _build_fields() -> list[SettingField]:
         SettingField(
             "ansible_docker_image", "Ansible Runner Image", category="Ansible",
             vault_key="ansible_docker_image", default=_DEFAULT_ANSIBLE_IMAGE,
+            env_var="PLUGIN_IAC_ORCHESTRATOR_ANSIBLE_IMAGE",
             description="Container image used to execute Ansible playbooks.",
         ),
         SettingField(
@@ -160,6 +171,7 @@ def _build_fields() -> list[SettingField]:
             "iac_terraform_docker_image", "OpenTofu Runner Image", category="Terraform",
             vault_key="iac_terraform_docker_image", default=_DEFAULT_TOFU_IMAGE,
             coalesce_default=_TOFU_FALLBACK_IMAGE,
+            env_var="PLUGIN_IAC_ORCHESTRATOR_TERRAFORM_IMAGE",
             description="Image for every tofu init/plan/apply. Blank falls back to the upstream OpenTofu image.",
         ),
         SettingField(
@@ -259,10 +271,14 @@ class OrchestratorSettings:
         return schema
 
     def get_values(self) -> dict:
-        """Current values. Secrets are masked; a ``<key>__configured`` flag is added."""
+        """Current values. Secrets are masked; ``<key>__configured`` / ``<key>__locked`` added."""
         vals: dict[str, Any] = {}
         for f in SETTINGS_FIELDS:
             raw = self._read_raw(f)
+            # Surface env-shadowed settings so the UI can show them as locked
+            # instead of letting an operator "save" a value that never applies.
+            if f.is_env_locked():
+                vals[f"{f.key}__locked"] = True
             if f.sensitive:
                 vals[f.key] = ""
                 vals[f"{f.key}__configured"] = bool(raw)
@@ -275,12 +291,21 @@ class OrchestratorSettings:
                 vals[f.key] = raw if raw not in (None, "") else f.default
         return vals
 
-    def save_values(self, updates: dict) -> list[str]:
-        """Persist provided keys. Unknown keys are ignored; secrets blank = keep."""
+    def save_values(self, updates: dict) -> dict:
+        """Persist provided keys. Unknown keys are ignored; secrets blank = keep.
+
+        Returns ``{"saved": [...], "locked": [...]}`` where ``locked`` lists keys
+        whose value was NOT written because an OS env var shadows them (writing to
+        Vault would be a silent no-op — env always wins in IaCConfig._get).
+        """
         saved: list[str] = []
+        locked: list[str] = []
         for key, val in (updates or {}).items():
             f = _FIELDS_BY_KEY.get(key)
             if f is None:
+                continue
+            if f.is_env_locked():
+                locked.append(f.key)
                 continue
             if f.sensitive:
                 sval = ("" if val is None else str(val)).strip()
@@ -308,4 +333,4 @@ class OrchestratorSettings:
                     sval = f.coalesce_default
                 self._write_raw(f, sval)
                 saved.append(f.key)
-        return saved
+        return {"saved": saved, "locked": locked}

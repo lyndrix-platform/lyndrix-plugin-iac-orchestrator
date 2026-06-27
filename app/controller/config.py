@@ -6,17 +6,21 @@ class IaCConfig:
         self.ctx = ctx
         self._runtime_host_paths: dict[str, str] = {}
 
-    def _get(self, env_var: str, vault_key: str = None, default: str = None) -> str:
-        """Fetches a setting following the priority: Env Var > Vault/UI > Default."""
+    def _get(self, env_var: str, vault_key: str | None = None, default: str = "") -> str:
+        """Fetches a setting following the priority: Env Var > Vault/UI > Default.
+
+        Every call site supplies a non-empty ``default``, so the result is always a
+        ``str`` — the default is "" only as a safety net for the no-default case.
+        """
         val = os.getenv(env_var)
         if val is not None:
             return val
-            
+
         if vault_key:
             val = self.ctx.get_secret(vault_key)
             if val is not None:
                 return val
-                
+
         return default
 
     @property

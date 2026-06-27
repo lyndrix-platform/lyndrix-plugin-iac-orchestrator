@@ -223,20 +223,41 @@ function LogViewer({ jobId, onClose }: { jobId: number; onClose: () => void }) {
   const [err, setErr] = useState<string | null>(null)
   const scrollRef = useRef<HTMLDivElement | null>(null)
 
+  const inFlight = useRef(false)
+
   const load = useCallback(async () => {
+    if (inFlight.current) return
+    inFlight.current = true
     try {
       const res = await iacApi.jobLogs(jobId, 600, grep || undefined)
       setLines(res.lines)
       setErr(null)
     } catch (e) {
       setErr(e instanceof Error ? e.message : 'Log konnte nicht geladen werden')
+    } finally {
+      inFlight.current = false
     }
   }, [jobId, grep])
 
+  // Self-scheduling poll: re-arm only after the previous load settles, skip
+  // while the tab is hidden, and never let overlapping loads stack up (the
+  // in-flight guard above + the apiFetch timeout bound each request).
   useEffect(() => {
-    void load()
-    const t = setInterval(() => void load(), 2000)
-    return () => clearInterval(t)
+    let stopped = false
+    let timer: ReturnType<typeof setTimeout> | null = null
+
+    const tick = async () => {
+      if (stopped) return
+      if (!document.hidden) await load()
+      if (stopped) return
+      timer = setTimeout(() => void tick(), 2000)
+    }
+
+    void tick()
+    return () => {
+      stopped = true
+      if (timer) clearTimeout(timer)
+    }
   }, [load])
 
   useEffect(() => {
