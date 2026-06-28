@@ -1,4 +1,9 @@
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react'
+// react-i18next is provided by the host shell (window.__lyndrix_react_i18next);
+// declared external in vite.ui.config.ts so the plugin shares the host's i18n
+// instance + active language. Strings come from locales/iac.<locale>.json,
+// auto-registered by core and served via the catalog (namespace "iac").
+import { useTranslation } from 'react-i18next'
 import {
   iacApi,
   type CatalogService,
@@ -63,10 +68,11 @@ function describeType(t: string): string {
 // ─── Shared atoms ────────────────────────────────────────────────────────────
 
 function StatusBadge({ status }: { status: string }) {
+  const { t } = useTranslation('iac')
   return (
     <span className={`lx-badge ${badgeVariant(status)}`}>
       <span className="lx-dot" />
-      {status || 'UNKNOWN'}
+      {status || t('common.unknown', { defaultValue: 'UNKNOWN' })}
     </span>
   )
 }
@@ -156,12 +162,12 @@ function Modal({ title, onClose, children, width = 720 }: {
     }}>
       <div onClick={(e) => e.stopPropagation()} style={{
         width: '100%', maxWidth: width, maxHeight: '85vh', display: 'flex', flexDirection: 'column',
-        background: 'var(--lx-elevated)', border: '1px solid var(--lx-border)',
+        background: 'var(--lx-elevated-glass, var(--lx-elevated))', border: '1px solid var(--lx-border)',
         borderRadius: 'var(--lx-radius-lg)', overflow: 'hidden',
       }}>
         <div style={{
           display: 'flex', alignItems: 'center', gap: '0.75rem', padding: '0.75rem 1rem',
-          borderBottom: '1px solid var(--lx-border-soft)', background: 'var(--lx-surface)',
+          borderBottom: '1px solid var(--lx-border-soft)', background: 'var(--lx-surface-glass, var(--lx-surface))', backdropFilter: 'blur(16px) saturate(160%)', WebkitBackdropFilter: 'blur(16px) saturate(160%)',
         }}>
           <span style={{ fontWeight: 700, color: 'var(--lx-text)' }}>{title}</span>
           <button onClick={onClose} style={{ marginLeft: 'auto', background: 'none', border: 'none', color: 'var(--lx-text-muted)', cursor: 'pointer', fontSize: '1.1rem' }}>✕</button>
@@ -182,14 +188,15 @@ interface ConfirmOpts {
 }
 
 function ConfirmDialog({ opts, onClose }: { opts: ConfirmOpts; onClose: () => void }) {
+  const { t } = useTranslation('iac')
   return (
-    <div onClick={onClose} className="iac-modal-overlay" style={{
+    <div onClick={onClose} className="iac-modal-overlay iac-confirm-overlay" style={{
       position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)', zIndex: 1100,
       display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '2rem',
     }}>
       <div onClick={(e) => e.stopPropagation()} style={{
         width: '100%', maxWidth: 460,
-        background: 'var(--lx-elevated)', border: '1px solid color-mix(in srgb, var(--lx-state-down) 40%, transparent)',
+        background: 'var(--lx-elevated-glass, var(--lx-elevated))', border: '1px solid color-mix(in srgb, var(--lx-state-down) 40%, transparent)',
         borderRadius: 'var(--lx-radius-lg)', padding: '1.25rem',
       }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
@@ -200,9 +207,9 @@ function ConfirmDialog({ opts, onClose }: { opts: ConfirmOpts; onClose: () => vo
           {opts.body}
         </div>
         <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
-          <Button label="Cancel" onClick={onClose} />
+          <Button label={t('common.cancel', { defaultValue: 'Cancel' })} onClick={onClose} />
           <Button
-            label={opts.confirmLabel ?? 'Confirm'}
+            label={opts.confirmLabel ?? t('common.confirm', { defaultValue: 'Confirm' })}
             variant="danger"
             onClick={() => { opts.onConfirm(); onClose() }}
           />
@@ -218,6 +225,7 @@ type ToastFn = (msg: string, kind?: 'ok' | 'err') => void
 // ─── Live log viewer ─────────────────────────────────────────────────────────
 
 function LogViewer({ jobId, onClose }: { jobId: number; onClose: () => void }) {
+  const { t } = useTranslation('iac')
   const [lines, setLines] = useState<string[]>([])
   const [grep, setGrep] = useState('')
   const [err, setErr] = useState<string | null>(null)
@@ -233,7 +241,7 @@ function LogViewer({ jobId, onClose }: { jobId: number; onClose: () => void }) {
       setLines(res.lines)
       setErr(null)
     } catch (e) {
-      setErr(e instanceof Error ? e.message : 'Log konnte nicht geladen werden')
+      setErr(e instanceof Error ? e.message : t('log.loadError', { defaultValue: 'Log konnte nicht geladen werden' }))
     } finally {
       inFlight.current = false
     }
@@ -271,15 +279,15 @@ function LogViewer({ jobId, onClose }: { jobId: number; onClose: () => void }) {
     }}>
       <div onClick={(e) => e.stopPropagation()} style={{
         width: '100%', maxWidth: 1000, height: '80vh', display: 'flex', flexDirection: 'column',
-        background: 'var(--lx-elevated)', border: '1px solid var(--lx-border)',
+        background: 'var(--lx-elevated-glass, var(--lx-elevated))', border: '1px solid var(--lx-border)',
         borderRadius: 'var(--lx-radius-lg)', overflow: 'hidden',
       }}>
         <div style={{
-          display: 'flex', alignItems: 'center', gap: '0.75rem', padding: '0.75rem 1rem',
-          borderBottom: '1px solid var(--lx-border-soft)', background: 'var(--lx-surface)',
+          display: 'flex', alignItems: 'center', gap: '0.75rem', padding: '0.75rem 1rem', flexWrap: 'wrap',
+          borderBottom: '1px solid var(--lx-border-soft)', background: 'var(--lx-surface-glass, var(--lx-surface))', backdropFilter: 'blur(16px) saturate(160%)', WebkitBackdropFilter: 'blur(16px) saturate(160%)',
         }}>
-          <span style={{ fontWeight: 700, color: 'var(--lx-accent)' }}>Live Logs · Job #{jobId}</span>
-          <input className="lx-input lx-mono" value={grep} onChange={(e) => setGrep(e.target.value)} placeholder="grep…" style={{ marginLeft: 'auto', width: 200 }} />
+          <span style={{ fontWeight: 700, color: 'var(--lx-accent)' }}>{t('log.title', { defaultValue: 'Live Logs · Job #{{id}}', id: jobId })}</span>
+          <input className="lx-input lx-mono iac-search" value={grep} onChange={(e) => setGrep(e.target.value)} placeholder={t('log.grepPlaceholder', { defaultValue: 'grep…' })} style={{ marginLeft: 'auto', width: 200 }} />
           <button onClick={onClose} style={{ background: 'none', border: 'none', color: 'var(--lx-text-muted)', cursor: 'pointer', fontSize: '1.1rem' }}>✕</button>
         </div>
         <div ref={scrollRef} style={{
@@ -287,7 +295,7 @@ function LogViewer({ jobId, onClose }: { jobId: number; onClose: () => void }) {
           fontFamily: 'monospace', fontSize: '0.7rem', color: '#4ade80', whiteSpace: 'pre-wrap', wordBreak: 'break-word',
         }}>
           {err ? <span style={{ color: 'var(--lx-state-down)' }}>{err}</span>
-            : lines.length ? lines.join('\n') : 'Keine Logs gefunden.'}
+            : lines.length ? lines.join('\n') : t('log.empty', { defaultValue: 'Keine Logs gefunden.' })}
         </div>
       </div>
     </div>
@@ -301,18 +309,19 @@ function ActivePipelines({ jobs, runnersByJob, onLogs }: {
   runnersByJob: Record<number, [string, RunnerTask][]>
   onLogs: (id: number) => void
 }) {
+  const { t } = useTranslation('iac')
   const running = jobs.filter((j) => RUNNING_STATES.has((j.status || '').toUpperCase()))
   if (!running.length) {
     return (
       <div className="lx-card lx-empty">
         <span className="material-icons">task_alt</span>
-        <div style={{ fontWeight: 600, color: 'var(--lx-text)' }}>Infrastructure is stable</div>
-        <div style={{ fontSize: '0.8rem' }}>No active jobs running right now.</div>
+        <div style={{ fontWeight: 600, color: 'var(--lx-text)' }}>{t('active.stableTitle', { defaultValue: 'Infrastructure is stable' })}</div>
+        <div style={{ fontSize: '0.8rem' }}>{t('active.stableBody', { defaultValue: 'No active jobs running right now.' })}</div>
       </div>
     )
   }
   return (
-    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(380px, 1fr))', gap: '1rem' }}>
+    <div className="iac-card-grid" style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))', gap: '1rem' }}>
       {running.map((job) => {
         const runners = runnersByJob[job.id] || []
         return (
@@ -320,7 +329,7 @@ function ActivePipelines({ jobs, runnersByJob, onLogs }: {
             <div style={{ padding: '1rem' }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
                 <div>
-                  <div style={{ fontWeight: 800, color: 'var(--lx-accent)', fontSize: '1.05rem' }}>Pipeline #{job.id}</div>
+                  <div style={{ fontWeight: 800, color: 'var(--lx-accent)', fontSize: '1.05rem' }}>{t('active.pipeline', { defaultValue: 'Pipeline #{{id}}', id: job.id })}</div>
                   <div style={{ fontSize: '0.6rem', textTransform: 'uppercase', letterSpacing: '0.1em', color: 'var(--lx-text-muted)', fontWeight: 700 }}>{job.pipeline_type}</div>
                 </div>
                 <StatusBadge status={job.status} />
@@ -333,18 +342,18 @@ function ActivePipelines({ jobs, runnersByJob, onLogs }: {
                 {job.current_step || '…'}
               </div>
 
-              <div style={{ fontSize: '0.6rem', textTransform: 'uppercase', letterSpacing: '0.08em', color: 'var(--lx-text-muted)', fontWeight: 700, marginTop: '0.9rem', marginBottom: 4 }}>Active Runners</div>
+              <div style={{ fontSize: '0.6rem', textTransform: 'uppercase', letterSpacing: '0.08em', color: 'var(--lx-text-muted)', fontWeight: 700, marginTop: '0.9rem', marginBottom: 4 }}>{t('active.activeRunners', { defaultValue: 'Active Runners' })}</div>
               <div style={{ background: 'rgba(0,0,0,0.25)', border: '1px solid var(--lx-border-soft)', borderRadius: 'var(--lx-radius-sm)', padding: '0.4rem 0.6rem', minHeight: 28 }}>
                 {runners.length ? runners.map(([name, data]) => (
                   <div key={name} style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: '0.68rem', color: 'var(--lx-text)' }}>
                     <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{name}</span>
                     <span style={{ marginLeft: 'auto', fontSize: '0.6rem', color: 'var(--lx-text-muted)' }}>{String(data.status ?? '')}</span>
                   </div>
-                )) : <span style={{ fontSize: '0.65rem', color: 'var(--lx-text-muted)', fontStyle: 'italic' }}>Waiting for pool…</span>}
+                )) : <span style={{ fontSize: '0.65rem', color: 'var(--lx-text-muted)', fontStyle: 'italic' }}>{t('active.waitingPool', { defaultValue: 'Waiting for pool…' })}</span>}
               </div>
 
               <div style={{ marginTop: '0.85rem' }}>
-                <Button label="Live Logs" onClick={() => onLogs(job.id)} />
+                <Button label={t('active.liveLogs', { defaultValue: 'Live Logs' })} onClick={() => onLogs(job.id)} />
               </div>
             </div>
           </Card>
@@ -357,6 +366,7 @@ function ActivePipelines({ jobs, runnersByJob, onLogs }: {
 // ─── History ─────────────────────────────────────────────────────────────────
 
 function History({ jobs, onLogs }: { jobs: IaCJob[]; onLogs: (id: number) => void }) {
+  const { t } = useTranslation('iac')
   const [filter, setFilter] = useState('')
   const term = filter.toLowerCase()
   const rows = term
@@ -365,13 +375,13 @@ function History({ jobs, onLogs }: { jobs: IaCJob[]; onLogs: (id: number) => voi
 
   return (
     <div>
-      <div className="iac-hist-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
-        <h2 style={{ margin: 0, fontSize: '1rem', fontWeight: 700, color: 'var(--lx-text)' }}>Deployment History</h2>
-        <input className="lx-input" value={filter} onChange={(e) => setFilter(e.target.value)} placeholder="Filter ID / Type / Status…" style={{ width: 240 }} />
+      <div className="iac-view-header iac-hist-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem', gap: 8 }}>
+        <h2 style={{ margin: 0, fontSize: '1rem', fontWeight: 700, color: 'var(--lx-text)' }}>{t('history.title', { defaultValue: 'Deployment History' })}</h2>
+        <input className="lx-input iac-search" value={filter} onChange={(e) => setFilter(e.target.value)} placeholder={t('history.filterPlaceholder', { defaultValue: 'Filter ID / Type / Status…' })} style={{ width: 240 }} />
       </div>
       <Card>
         {rows.length === 0 && (
-          <div style={{ padding: '2rem', textAlign: 'center', color: 'var(--lx-text-muted)', fontSize: '0.85rem' }}>Keine Deployments gefunden.</div>
+          <div style={{ padding: '2rem', textAlign: 'center', color: 'var(--lx-text-muted)', fontSize: '0.85rem' }}>{t('history.empty', { defaultValue: 'Keine Deployments gefunden.' })}</div>
         )}
         {rows.map((job, i) => (
           <div key={job.id} className="iac-hist-row" style={{
@@ -389,8 +399,8 @@ function History({ jobs, onLogs }: { jobs: IaCJob[]; onLogs: (id: number) => voi
             </div>
             <div className="iac-hist-progress" style={{ width: 90 }}><ProgressBar value={job.progress} color={statusColor(job.status)} /></div>
             <StatusBadge status={job.status} />
-            <button onClick={() => onLogs(job.id)} title="Logs" style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--lx-accent)', fontSize: '0.72rem', fontWeight: 600 }}>
-              Logs
+            <button onClick={() => onLogs(job.id)} title={t('history.logs', { defaultValue: 'Logs' })} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--lx-accent)', fontSize: '0.72rem', fontWeight: 600 }}>
+              {t('history.logs', { defaultValue: 'Logs' })}
             </button>
           </div>
         ))}
@@ -404,21 +414,22 @@ function History({ jobs, onLogs }: { jobs: IaCJob[]; onLogs: (id: number) => voi
 function ServiceHistoryModal({ service, onClose, onLogs }: {
   service: string; onClose: () => void; onLogs: (id: number) => void
 }) {
+  const { t } = useTranslation('iac')
   const [rows, setRows] = useState<ServiceHistoryRow[] | null>(null)
   const [err, setErr] = useState<string | null>(null)
 
   useEffect(() => {
     iacApi.serviceHistory(service)
       .then(setRows)
-      .catch((e) => setErr(e instanceof Error ? e.message : 'Verlauf konnte nicht geladen werden'))
+      .catch((e) => setErr(e instanceof Error ? e.message : t('serviceHistory.loadError', { defaultValue: 'Verlauf konnte nicht geladen werden' })))
   }, [service])
 
   return (
-    <Modal title={`Deployment History: ${service}`} onClose={onClose}>
+    <Modal title={t('serviceHistory.title', { defaultValue: 'Deployment History: {{service}}', service })} onClose={onClose}>
       {err && <ErrorBox msg={err} />}
-      {!rows && !err && <div style={{ color: 'var(--lx-text-muted)' }}>Lade…</div>}
+      {!rows && !err && <div style={{ color: 'var(--lx-text-muted)' }}>{t('serviceHistory.loading', { defaultValue: 'Lade…' })}</div>}
       {rows && rows.length === 0 && (
-        <div style={{ color: 'var(--lx-text-muted)', fontStyle: 'italic' }}>Keine Einträge gefunden.</div>
+        <div style={{ color: 'var(--lx-text-muted)', fontStyle: 'italic' }}>{t('serviceHistory.empty', { defaultValue: 'Keine Einträge gefunden.' })}</div>
       )}
       {rows && rows.map((r, i) => (
         <div key={r.id} className="iac-hist-row" style={{
@@ -428,7 +439,7 @@ function ServiceHistoryModal({ service, onClose, onLogs }: {
           <span style={{ fontFamily: 'monospace', fontSize: '0.72rem', color: 'var(--lx-text-muted)', width: 50 }}>#{r.id}</span>
           <span style={{ flex: 1, fontSize: '0.72rem', color: 'var(--lx-text)' }}>{r.start_time}</span>
           <StatusBadge status={r.status} />
-          <button onClick={() => { onClose(); onLogs(r.id) }} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--lx-accent)', fontSize: '0.72rem', fontWeight: 600 }}>Logs</button>
+          <button onClick={() => { onClose(); onLogs(r.id) }} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--lx-accent)', fontSize: '0.72rem', fontWeight: 600 }}>{t('history.logs', { defaultValue: 'Logs' })}</button>
         </div>
       ))}
     </Modal>
@@ -438,6 +449,7 @@ function ServiceHistoryModal({ service, onClose, onLogs }: {
 // ─── Service catalog ─────────────────────────────────────────────────────────
 
 function ServiceCatalog({ confirm, toast, onLogs }: { confirm: ConfirmFn; toast: ToastFn; onLogs: (id: number) => void }) {
+  const { t } = useTranslation('iac')
   const [services, setServices] = useState<CatalogService[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -447,19 +459,19 @@ function ServiceCatalog({ confirm, toast, onLogs }: { confirm: ConfirmFn; toast:
   useEffect(() => {
     iacApi.catalog()
       .then(setServices)
-      .catch((e) => setError(e instanceof Error ? e.message : 'Katalog konnte nicht geladen werden'))
+      .catch((e) => setError(e instanceof Error ? e.message : t('catalog.loadError', { defaultValue: 'Katalog konnte nicht geladen werden' })))
       .finally(() => setLoading(false))
   }, [])
 
   function deploy(name: string, branch?: string) {
     confirm({
-      title: `Deploy service "${name}"?`,
-      body: `This triggers a single-service deployment of "${name}" on branch ${branch || 'main'}. Real services will be updated.`,
-      confirmLabel: 'Deploy',
+      title: t('catalog.deployConfirmTitle', { defaultValue: 'Deploy service "{{name}}"?', name }),
+      body: t('catalog.deployConfirmBody', { defaultValue: 'This triggers a single-service deployment of "{{name}}" on branch {{branch}}. Real services will be updated.', name, branch: branch || 'main' }),
+      confirmLabel: t('catalog.deployConfirmLabel', { defaultValue: 'Deploy' }),
       onConfirm: () => {
         iacApi.deployService(name, branch || 'main')
-          .then(() => toast(`Deployment für "${name}" eingereiht.`))
-          .catch((e) => toast(e instanceof Error ? e.message : 'Deploy fehlgeschlagen', 'err'))
+          .then(() => toast(t('catalog.deployQueued', { defaultValue: 'Deployment für "{{name}}" eingereiht.', name })))
+          .catch((e) => toast(e instanceof Error ? e.message : t('catalog.deployError', { defaultValue: 'Deploy fehlgeschlagen' }), 'err'))
       },
     })
   }
@@ -469,32 +481,32 @@ function ServiceCatalog({ confirm, toast, onLogs }: { confirm: ConfirmFn; toast:
 
   return (
     <div>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
-        <h2 style={{ margin: 0, fontSize: '1rem', fontWeight: 700, color: 'var(--lx-text)' }}>Service Catalog</h2>
-        <input className="lx-input" value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Service suchen…" style={{ width: 240 }} />
+      <div className="iac-view-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem', gap: 8 }}>
+        <h2 style={{ margin: 0, fontSize: '1rem', fontWeight: 700, color: 'var(--lx-text)' }}>{t('catalog.title', { defaultValue: 'Service Catalog' })}</h2>
+        <input className="lx-input iac-search" value={search} onChange={(e) => setSearch(e.target.value)} placeholder={t('catalog.searchPlaceholder', { defaultValue: 'Service suchen…' })} style={{ width: 240 }} />
       </div>
       {error && <ErrorBox msg={error} />}
-      {loading && <div style={{ color: 'var(--lx-text-muted)', padding: '2rem', textAlign: 'center' }}>Lade Katalog…</div>}
+      {loading && <div style={{ color: 'var(--lx-text-muted)', padding: '2rem', textAlign: 'center' }}>{t('catalog.loading', { defaultValue: 'Lade Katalog…' })}</div>}
       {!loading && rows.length === 0 && (
-        <Card><div style={{ padding: '2rem', textAlign: 'center', color: 'var(--lx-text-muted)', fontSize: '0.85rem' }}>Keine Services gefunden. Stelle sicher, dass "iac_controller" synchronisiert ist.</div></Card>
+        <Card><div style={{ padding: '2rem', textAlign: 'center', color: 'var(--lx-text-muted)', fontSize: '0.85rem' }}>{t('catalog.empty', { defaultValue: 'Keine Services gefunden. Stelle sicher, dass "iac_controller" synchronisiert ist.' })}</div></Card>
       )}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(300px, 1fr))', gap: '1rem' }}>
+      <div className="iac-card-grid" style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', gap: '1rem' }}>
         {rows.map((svc) => {
-          const name = svc.name || 'Unknown'
+          const name = svc.name || t('catalog.unknownService', { defaultValue: 'Unknown' })
           const branch = svc.branch || 'main'
-          const target = svc.target_environment || svc.host || 'Auto-Assigned'
+          const target = svc.target_environment || svc.host || t('catalog.autoAssigned', { defaultValue: 'Auto-Assigned' })
           return (
             <Card key={name} accent="var(--lx-accent-2)">
               <div style={{ padding: '1rem' }}>
                 <div style={{ fontWeight: 700, color: 'var(--lx-text)', fontSize: '0.9rem' }}>{name}</div>
-                <div style={{ fontSize: '0.65rem', color: 'var(--lx-text-muted)' }}>Repo: {svc.repository_name || name}</div>
+                <div style={{ fontSize: '0.65rem', color: 'var(--lx-text-muted)' }}>{t('catalog.repo', { defaultValue: 'Repo: {{name}}', name: svc.repository_name || name })}</div>
                 <div style={{ display: 'flex', gap: '1rem', marginTop: '0.7rem', fontSize: '0.68rem', color: 'var(--lx-text-muted)', fontFamily: 'monospace' }}>
                   <span>{target}</span>
                   <span>{branch}</span>
                 </div>
                 <div style={{ marginTop: '0.85rem', display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
-                  <Button label="History" onClick={() => setHistoryFor(name)} />
-                  <Button label="Deploy" variant="primary" onClick={() => deploy(name, branch)} />
+                  <Button label={t('catalog.history', { defaultValue: 'History' })} onClick={() => setHistoryFor(name)} />
+                  <Button label={t('catalog.deploy', { defaultValue: 'Deploy' })} variant="primary" onClick={() => deploy(name, branch)} />
                 </div>
               </div>
             </Card>
@@ -508,7 +520,11 @@ function ServiceCatalog({ confirm, toast, onLogs }: { confirm: ConfirmFn; toast:
 
 // ─── Overview (stats) ────────────────────────────────────────────────────────
 
-function Overview({ statsTick, isRunning }: { statsTick: number; isRunning: boolean }) {
+function Overview({ statsTick, isRunning, jobs, runningCount, onNavigate }: {
+  statsTick: number; isRunning: boolean; jobs: IaCJob[]; runningCount: number
+  onNavigate: (tab: TabId) => void
+}) {
+  const { t } = useTranslation('iac')
   const [stats, setStats] = useState<OrchestratorStats | null>(null)
   const [error, setError] = useState<string | null>(null)
 
@@ -516,12 +532,12 @@ function Overview({ statsTick, isRunning }: { statsTick: number; isRunning: bool
     let cancelled = false
     iacApi.stats()
       .then((s) => { if (!cancelled) { setStats(s); setError(null) } })
-      .catch((e) => { if (!cancelled) setError(e instanceof Error ? e.message : 'Statistik konnte nicht geladen werden') })
+      .catch((e) => { if (!cancelled) setError(e instanceof Error ? e.message : t('overview.loadError', { defaultValue: 'Statistik konnte nicht geladen werden' })) })
     return () => { cancelled = true }
   }, [statsTick])
 
   if (error) return <ErrorBox msg={error} />
-  if (!stats) return <div style={{ color: 'var(--lx-text-muted)', padding: '2rem', textAlign: 'center' }}>Lade Statistiken…</div>
+  if (!stats) return <div style={{ color: 'var(--lx-text-muted)', padding: '2rem', textAlign: 'center' }}>{t('overview.loading', { defaultValue: 'Lade Statistiken…' })}</div>
 
   const rateColor = stats.success_rate >= 80 ? 'var(--lx-state-up)' : stats.success_rate >= 50 ? '#f59e0b' : 'var(--lx-state-down)'
   const lastColor = stats.last_deployment_status === 'SUCCESS' ? 'var(--lx-state-up)'
@@ -529,15 +545,62 @@ function Overview({ statsTick, isRunning }: { statsTick: number; isRunning: bool
       : FAIL_STATES.has(stats.last_deployment_status || '') ? 'var(--lx-state-down)' : undefined
   const byStatus = Object.entries(stats.by_status).sort((a, b) => b[1] - a[1])
 
+  const pipelineBadge = runningCount > 0 ? (
+    <span style={{ background: 'var(--lx-accent)', color: '#000', borderRadius: 999, fontSize: '0.55rem', fontWeight: 800, padding: '1px 5px' }}>{runningCount}</span>
+  ) : null
+  const activeJob = jobs.find((j) => RUNNING_STATES.has((j.status || '').toUpperCase()))
+  const phaseSuccessRate = stats.by_phase.length
+    ? Math.round(stats.by_phase.reduce((a, p) => a + (p.total ? p.success_rate : 0), 0) / stats.by_phase.filter((p) => p.total > 0).length || 0)
+    : null
+  const tileRateColor = stats.success_rate >= 80 ? 'var(--lx-state-up)' : stats.success_rate >= 50 ? '#f59e0b' : 'var(--lx-state-down)'
+
   return (
     <div>
+      {/* Nav tiles — click to enter a view */}
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: '0.75rem', marginBottom: '1.75rem' }}>
+        <NavTile
+          icon="rocket_launch" label={t('overview.navPipelines', { defaultValue: 'Pipelines' })}
+          value={runningCount > 0 ? t('overview.running', { defaultValue: '{{count}} running', count: runningCount }) : t('overview.idle', { defaultValue: 'Idle' })}
+          sub={activeJob?.current_step ?? (isRunning ? t('overview.processing', { defaultValue: 'Processing…' }) : t('overview.noActiveJobs', { defaultValue: 'No active jobs' }))}
+          accent={runningCount > 0 ? 'var(--lx-accent)' : 'var(--lx-state-up)'}
+          badge={pipelineBadge}
+          onClick={() => onNavigate('active')}
+        />
+        <NavTile
+          icon="dns" label={t('overview.navProvision', { defaultValue: 'Provision' })}
+          value={t('overview.stages', { defaultValue: '{{count}} stages', count: stats.by_phase.length })}
+          sub={phaseSuccessRate !== null ? t('overview.avgSuccess', { defaultValue: '{{percent}}% avg success', percent: phaseSuccessRate }) : t('overview.terraformTofu', { defaultValue: 'Terraform · OpenTofu' })}
+          accent="var(--lx-accent-3, var(--lx-accent))"
+          onClick={() => onNavigate('provision')}
+        />
+        <NavTile
+          icon="apps" label={t('overview.navCatalog', { defaultValue: 'Catalog' })}
+          value={t('overview.services', { defaultValue: 'Services' })}
+          sub={t('overview.deployByRepo', { defaultValue: 'Deploy by repo · branch' })}
+          onClick={() => onNavigate('catalog')}
+        />
+        <NavTile
+          icon="account_tree" label={t('overview.navTopology', { defaultValue: 'Topology' })}
+          value={t('overview.hosts', { defaultValue: 'Hosts' })}
+          sub={t('overview.sitesStages', { defaultValue: 'Sites · stages · assignments' })}
+          onClick={() => onNavigate('assignments')}
+        />
+        <NavTile
+          icon="history" label={t('overview.navHistory', { defaultValue: 'History' })}
+          value={stats.total}
+          sub={t('overview.successRate', { defaultValue: '{{percent}}% success rate', percent: Math.round(stats.success_rate) })}
+          accent={tileRateColor}
+          onClick={() => onNavigate('history')}
+        />
+      </div>
+
       {/* KPI row */}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: '1rem', marginBottom: '1.25rem' }}>
-        <KpiCard label="Total Deployments" value={stats.total} sub={`${stats.finished} finished · ${stats.running} active`} />
-        <KpiCard label="Success Rate" value={`${Math.round(stats.success_rate)}%`} color={rateColor} sub={`${stats.success} ok · ${stats.failed} failed`} />
-        <KpiCard label="Avg Duration" value={stats.avg_duration_human} color="var(--lx-accent-2)" sub="successful runs" />
-        <KpiCard label="Last Deployment" value={(stats.last_deployment_status || '—')} color={lastColor} sub={stats.last_deployment_at ? new Date(stats.last_deployment_at).toLocaleString() : 'No runs yet'} />
-        <KpiCard label="Engine" value={isRunning ? 'Busy' : 'Idle'} color={isRunning ? 'var(--lx-accent)' : 'var(--lx-state-up)'} />
+        <KpiCard label={t('overview.kpiTotal', { defaultValue: 'Total Deployments' })} value={stats.total} sub={t('overview.kpiTotalSub', { defaultValue: '{{finished}} finished · {{running}} active', finished: stats.finished, running: stats.running })} />
+        <KpiCard label={t('overview.kpiSuccess', { defaultValue: 'Success Rate' })} value={`${Math.round(stats.success_rate)}%`} color={rateColor} sub={t('overview.kpiSuccessSub', { defaultValue: '{{success}} ok · {{failed}} failed', success: stats.success, failed: stats.failed })} />
+        <KpiCard label={t('overview.kpiAvg', { defaultValue: 'Avg Duration' })} value={stats.avg_duration_human} color="var(--lx-accent-2)" sub={t('overview.kpiAvgSub', { defaultValue: 'successful runs' })} />
+        <KpiCard label={t('overview.kpiLast', { defaultValue: 'Last Deployment' })} value={(stats.last_deployment_status || '—')} color={lastColor} sub={stats.last_deployment_at ? new Date(stats.last_deployment_at).toLocaleString() : t('overview.noRunsYet', { defaultValue: 'No runs yet' })} />
+        <KpiCard label={t('overview.kpiEngine', { defaultValue: 'Engine' })} value={isRunning ? t('overview.busy', { defaultValue: 'Busy' }) : t('overview.idle', { defaultValue: 'Idle' })} color={isRunning ? 'var(--lx-accent)' : 'var(--lx-state-up)'} />
       </div>
 
       {/* Host lifecycle phases — standalone tiles, like the KPI row above */}
@@ -548,7 +611,7 @@ function Overview({ statsTick, isRunning }: { statsTick: number; isRunning: bool
             <div key={p.phase} style={{
               border: `1px solid var(--lx-border-soft)`,
               borderTop: `2px solid ${c}`, borderRadius: 'var(--lx-radius-sm)', padding: '0.75rem',
-              background: 'var(--lx-surface)',
+              background: 'var(--lx-surface-glass, var(--lx-surface))', backdropFilter: 'blur(16px) saturate(160%)', WebkitBackdropFilter: 'blur(16px) saturate(160%)',
             }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                 <span style={{ fontSize: '0.8rem', fontWeight: 700, color: 'var(--lx-text)' }}>{p.label}</span>
@@ -558,12 +621,12 @@ function Overview({ statsTick, isRunning }: { statsTick: number; isRunning: bool
                 <div style={{ marginTop: 8 }}>
                   <ProgressBar value={p.success_rate} color={c} />
                   <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 4, fontSize: '0.62rem', color: 'var(--lx-text-muted)' }}>
-                    <span>{p.success} ok · {p.failed} fail</span>
+                    <span>{t('overview.phaseOkFail', { defaultValue: '{{success}} ok · {{failed}} fail', success: p.success, failed: p.failed })}</span>
                     <span>{Math.round(p.success_rate)}%</span>
                   </div>
                 </div>
               ) : (
-                <div style={{ marginTop: 8, fontSize: '0.66rem', fontStyle: 'italic', color: c }}>No runs yet</div>
+                <div style={{ marginTop: 8, fontSize: '0.66rem', fontStyle: 'italic', color: c }}>{t('overview.noRunsYet', { defaultValue: 'No runs yet' })}</div>
               )}
             </div>
           )
@@ -573,11 +636,11 @@ function Overview({ statsTick, isRunning }: { statsTick: number; isRunning: bool
       {/* Status breakdown + recent feed */}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))', gap: '1rem', marginTop: '1rem' }}>
         <Card>
-          <div style={{ padding: '0.75rem 1rem', borderBottom: '1px solid var(--lx-border-soft)', background: 'var(--lx-elevated)', fontSize: '0.78rem', fontWeight: 700, color: 'var(--lx-text)' }}>
-            Status Breakdown
+          <div style={{ padding: '0.75rem 1rem', borderBottom: '1px solid var(--lx-border-soft)', background: 'var(--lx-elevated-glass, var(--lx-elevated))', fontSize: '0.78rem', fontWeight: 700, color: 'var(--lx-text)' }}>
+            {t('overview.statusBreakdown', { defaultValue: 'Status Breakdown' })}
           </div>
           <div style={{ padding: '1rem' }}>
-            {byStatus.length === 0 && <div style={{ color: 'var(--lx-text-muted)', fontStyle: 'italic' }}>No deployments recorded yet.</div>}
+            {byStatus.length === 0 && <div style={{ color: 'var(--lx-text-muted)', fontStyle: 'italic' }}>{t('overview.noDeploymentsRecorded', { defaultValue: 'No deployments recorded yet.' })}</div>}
             {byStatus.map(([status, count]) => {
               const pct = stats.total ? (count / stats.total) * 100 : 0
               return (
@@ -594,11 +657,11 @@ function Overview({ statsTick, isRunning }: { statsTick: number; isRunning: bool
         </Card>
 
         <Card>
-          <div style={{ padding: '0.75rem 1rem', borderBottom: '1px solid var(--lx-border-soft)', background: 'var(--lx-elevated)', fontSize: '0.78rem', fontWeight: 700, color: 'var(--lx-text)' }}>
-            Recent Deployments
+          <div style={{ padding: '0.75rem 1rem', borderBottom: '1px solid var(--lx-border-soft)', background: 'var(--lx-elevated-glass, var(--lx-elevated))', fontSize: '0.78rem', fontWeight: 700, color: 'var(--lx-text)' }}>
+            {t('overview.recentDeployments', { defaultValue: 'Recent Deployments' })}
           </div>
           <div style={{ padding: '0.25rem 0', maxHeight: 280, overflow: 'auto' }}>
-            {stats.recent.length === 0 && <div style={{ padding: '1rem', color: 'var(--lx-text-muted)', fontStyle: 'italic' }}>Nothing here yet.</div>}
+            {stats.recent.length === 0 && <div style={{ padding: '1rem', color: 'var(--lx-text-muted)', fontStyle: 'italic' }}>{t('overview.nothingHere', { defaultValue: 'Nothing here yet.' })}</div>}
             {stats.recent.map((j) => (
               <div key={j.id} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '0.4rem 1rem' }}>
                 <span style={{ width: 4, height: 22, borderRadius: 2, background: stemColor(j.color), flexShrink: 0 }} />
@@ -621,31 +684,32 @@ function Overview({ statsTick, isRunning }: { statsTick: number; isRunning: bool
 function Provision({ confirm, toast, isRunning, statsTick }: {
   confirm: ConfirmFn; toast: ToastFn; isRunning: boolean; statsTick: number
 }) {
+  const { t } = useTranslation('iac')
   const [hosts, setHosts] = useState<TerraformHost[] | null>(null)
   const [error, setError] = useState<string | null>(null)
 
   const load = useCallback(() => {
     iacApi.terraformHosts()
       .then((h) => { setHosts(h); setError(null) })
-      .catch((e) => setError(e instanceof Error ? e.message : 'Terraform-Hosts konnten nicht geladen werden'))
+      .catch((e) => setError(e instanceof Error ? e.message : t('provision.loadError', { defaultValue: 'Terraform-Hosts konnten nicht geladen werden' })))
   }, [])
 
   useEffect(() => { load() }, [load, statsTick])
 
   function checkEnv() {
     iacApi.infraPlan()
-      .then(() => toast('Infrastructure plan (Check Env) queued.'))
-      .catch((e) => toast(e instanceof Error ? e.message : 'Plan fehlgeschlagen', 'err'))
+      .then(() => toast(t('provision.checkEnvQueued', { defaultValue: 'Infrastructure plan (Check Env) queued.' })))
+      .catch((e) => toast(e instanceof Error ? e.message : t('provision.planError', { defaultValue: 'Plan fehlgeschlagen' }), 'err'))
   }
   function deployInfra() {
     confirm({
-      title: 'Deploy entire infrastructure?',
-      body: 'This runs `tofu apply` across every Terraform environment and will create, change or destroy real infrastructure to match the desired plan. Run Check Env first to review the plan.',
-      confirmLabel: 'Deploy Infra',
+      title: t('provision.deployInfraConfirmTitle', { defaultValue: 'Deploy entire infrastructure?' }),
+      body: t('provision.deployInfraConfirmBody', { defaultValue: 'This runs `tofu apply` across every Terraform environment and will create, change or destroy real infrastructure to match the desired plan. Run Check Env first to review the plan.' }),
+      confirmLabel: t('provision.deployInfraConfirmLabel', { defaultValue: 'Deploy Infra' }),
       onConfirm: () => {
         iacApi.infraApply()
-          .then(() => toast('Infrastructure deploy queued.'))
-          .catch((e) => toast(e instanceof Error ? e.message : 'Deploy fehlgeschlagen', 'err'))
+          .then(() => toast(t('provision.deployInfraQueued', { defaultValue: 'Infrastructure deploy queued.' })))
+          .catch((e) => toast(e instanceof Error ? e.message : t('provision.deployError', { defaultValue: 'Deploy fehlgeschlagen' }), 'err'))
       },
     })
   }
@@ -665,28 +729,28 @@ function Provision({ confirm, toast, isRunning, statsTick }: {
 
   return (
     <div>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem', gap: 8, flexWrap: 'wrap' }}>
-        <h2 style={{ margin: 0, fontSize: '1rem', fontWeight: 700, color: 'var(--lx-text)' }}>Provisioning (Terraform)</h2>
-        <div style={{ display: 'flex', gap: 8 }}>
-          <Button label="Check Env" icon="fact_check" onClick={checkEnv} disabled={isRunning} title="Read-only Terraform plan across all environments" />
-          <Button label="Deploy Infra" icon="rocket_launch" variant="danger" onClick={deployInfra} disabled={isRunning} title="Apply Terraform across the entire infrastructure" />
-          <Button label="Refresh" icon="refresh" onClick={load} />
+      <div className="iac-view-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem', gap: 8, flexWrap: 'wrap' }}>
+        <h2 style={{ margin: 0, fontSize: '1rem', fontWeight: 700, color: 'var(--lx-text)' }}>{t('provision.title', { defaultValue: 'Provisioning (Terraform)' })}</h2>
+        <div className="iac-header-actions" style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+          <Button label={t('provision.checkEnv', { defaultValue: 'Check Env' })} icon="fact_check" onClick={checkEnv} disabled={isRunning} title={t('provision.checkEnvTitle', { defaultValue: 'Read-only Terraform plan across all environments' })} />
+          <Button label={t('provision.deployInfra', { defaultValue: 'Deploy Infra' })} icon="rocket_launch" variant="danger" onClick={deployInfra} disabled={isRunning} title={t('provision.deployInfraTitle', { defaultValue: 'Apply Terraform across the entire infrastructure' })} />
+          <Button label={t('provision.refresh', { defaultValue: 'Refresh' })} icon="refresh" onClick={load} />
         </div>
       </div>
 
       {error && <ErrorBox msg={error} />}
-      {!hosts && !error && <div style={{ color: 'var(--lx-text-muted)', padding: '2rem', textAlign: 'center' }}>Lade Hosts…</div>}
+      {!hosts && !error && <div style={{ color: 'var(--lx-text-muted)', padding: '2rem', textAlign: 'center' }}>{t('provision.loading', { defaultValue: 'Lade Hosts…' })}</div>}
 
       {hosts && (
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(170px, 1fr))', gap: '1rem', marginBottom: '1.25rem' }}>
-          <KpiCard label="Total Hosts" value={hosts.length} />
-          <KpiCard label="Terraform-Managed" value={managed.length} color="#8b5cf6" sub="have a terraform block" />
-          <KpiCard label="Unmanaged" value={unmanaged.length} color="#f59e0b" sub="Ansible-only / manual" />
+          <KpiCard label={t('provision.kpiTotalHosts', { defaultValue: 'Total Hosts' })} value={hosts.length} />
+          <KpiCard label={t('provision.kpiManaged', { defaultValue: 'Terraform-Managed' })} value={managed.length} color="#8b5cf6" sub={t('provision.kpiManagedSub', { defaultValue: 'have a terraform block' })} />
+          <KpiCard label={t('provision.kpiUnmanaged', { defaultValue: 'Unmanaged' })} value={unmanaged.length} color="#f59e0b" sub={t('provision.kpiUnmanagedSub', { defaultValue: 'Ansible-only / manual' })} />
         </div>
       )}
 
       {hosts && hosts.length === 0 && (
-        <Card><div style={{ padding: '2rem', textAlign: 'center', color: 'var(--lx-text-muted)' }}>No hosts found. Ensure 'iac_controller/environments' is synced.</div></Card>
+        <Card><div style={{ padding: '2rem', textAlign: 'center', color: 'var(--lx-text-muted)' }}>{t('provision.empty', { defaultValue: "No hosts found. Ensure 'iac_controller/environments' is synced." })}</div></Card>
       )}
 
       {Object.entries(grouped).sort().map(([site, stages]) => (
@@ -697,7 +761,7 @@ function Provision({ confirm, toast, isRunning, statsTick }: {
           {Object.entries(stages).sort().map(([stage, items]) => (
             <div key={stage} style={{ marginBottom: 12 }}>
               <div style={{ fontSize: '0.72rem', fontWeight: 700, color: 'var(--lx-accent-3, var(--lx-accent))', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 8 }}>{stage}</div>
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(300px, 1fr))', gap: '0.75rem' }}>
+              <div className="iac-card-grid" style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', gap: '0.75rem' }}>
                 {items.map((h) => {
                   const c = h.managed ? '#8b5cf6' : 'var(--lx-state-unknown)'
                   return (
@@ -708,15 +772,15 @@ function Provision({ confirm, toast, isRunning, statsTick }: {
                             <div style={{ fontWeight: 700, color: 'var(--lx-text)', fontSize: '0.85rem', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{h.host}</div>
                             <div style={{ fontSize: '0.62rem', color: 'var(--lx-text-muted)' }}>{h.site} / {h.stage}</div>
                           </div>
-                          <StatusBadge status={h.state === 'unknown' ? 'UNKNOWN' : h.state.toUpperCase()} />
+                          <StatusBadge status={h.state === 'unknown' ? t('common.unknown', { defaultValue: 'UNKNOWN' }) : h.state.toUpperCase()} />
                         </div>
                         <div style={{ marginTop: 8, fontSize: '0.66rem', fontFamily: 'monospace', color: 'var(--lx-text-muted)', display: 'grid', gap: 2 }}>
-                          <div>addr: {h.ansible_host}</div>
-                          <div style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>provider: {h.provider}</div>
-                          <div>workspace: {h.workspace}</div>
+                          <div>{t('provision.addr', { defaultValue: 'addr: {{value}}', value: h.ansible_host })}</div>
+                          <div style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{t('provision.provider', { defaultValue: 'provider: {{value}}', value: h.provider })}</div>
+                          <div>{t('provision.workspace', { defaultValue: 'workspace: {{value}}', value: h.workspace })}</div>
                         </div>
                         {!h.managed && (
-                          <div style={{ marginTop: 8, fontSize: '0.62rem', fontStyle: 'italic', color: 'var(--lx-text-muted)' }}>No terraform block</div>
+                          <div style={{ marginTop: 8, fontSize: '0.62rem', fontStyle: 'italic', color: 'var(--lx-text-muted)' }}>{t('provision.noTerraformBlock', { defaultValue: 'No terraform block' })}</div>
                         )}
                       </div>
                     </Card>
@@ -734,6 +798,7 @@ function Provision({ confirm, toast, isRunning, statsTick }: {
 // ─── Assignments / Topography ────────────────────────────────────────────────
 
 function Assignments({ confirm, toast, isRunning }: { confirm: ConfirmFn; toast: ToastFn; isRunning: boolean }) {
+  const { t } = useTranslation('iac')
   const [items, setItems] = useState<Assignment[] | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [search, setSearch] = useState('')
@@ -741,7 +806,7 @@ function Assignments({ confirm, toast, isRunning }: { confirm: ConfirmFn; toast:
   const load = useCallback(() => {
     iacApi.assignments()
       .then((a) => { setItems(a); setError(null) })
-      .catch((e) => setError(e instanceof Error ? e.message : 'Assignments konnten nicht geladen werden'))
+      .catch((e) => setError(e instanceof Error ? e.message : t('assignments.loadError', { defaultValue: 'Assignments konnten nicht geladen werden' })))
   }, [])
   useEffect(() => { load() }, [load])
 
@@ -749,11 +814,11 @@ function Assignments({ confirm, toast, isRunning }: { confirm: ConfirmFn; toast:
     confirm({
       title: confirmTitle,
       body,
-      confirmLabel: 'Run',
+      confirmLabel: t('common.run', { defaultValue: 'Run' }),
       onConfirm: () => {
         iacApi.runPipeline(payload)
-          .then((r) => toast(r.message || 'Pipeline queued.'))
-          .catch((e) => toast(e instanceof Error ? e.message : 'Trigger fehlgeschlagen', 'err'))
+          .then((r) => toast(r.message || t('assignments.queued', { defaultValue: 'Pipeline queued.' })))
+          .catch((e) => toast(e instanceof Error ? e.message : t('assignments.triggerError', { defaultValue: 'Trigger fehlgeschlagen' }), 'err'))
       },
     })
   }
@@ -775,50 +840,50 @@ function Assignments({ confirm, toast, isRunning }: { confirm: ConfirmFn; toast:
 
   return (
     <div>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem', gap: 8, flexWrap: 'wrap' }}>
-        <h2 style={{ margin: 0, fontSize: '1rem', fontWeight: 700, color: 'var(--lx-text)' }}>Infrastructure Topography</h2>
-        <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
-          <input className="lx-input" value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Host / Service…" style={{ width: 180 }} />
-          <Button label="Global Bootstrap" variant="warn" disabled={isRunning} onClick={() => run({ pipeline_type: 'bootstrap_compliance', limit: 'all' }, 'Global compliance bootstrap?', 'Runs the compliance/baseline playbook (as root) across ALL hosts.')} />
-          <Button label="Global Adopt" variant="warn" disabled={isRunning} onClick={() => run({ pipeline_type: 'adopt_host', limit: 'all' }, 'Global adopt?', 'Imports every managed container (all sites) into Terraform state.')} />
-          <Button label="Global Rollout" variant="danger" disabled={isRunning} onClick={() => run({ pipeline_type: 'rollout', limit: 'all' }, 'Global rollout?', 'Triggers a full infrastructure rollout across ALL hosts.')} />
+      <div className="iac-view-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem', gap: 8, flexWrap: 'wrap' }}>
+        <h2 style={{ margin: 0, fontSize: '1rem', fontWeight: 700, color: 'var(--lx-text)' }}>{t('assignments.title', { defaultValue: 'Infrastructure Topography' })}</h2>
+        <div className="iac-header-actions" style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+          <input className="lx-input iac-search" value={search} onChange={(e) => setSearch(e.target.value)} placeholder={t('assignments.searchPlaceholder', { defaultValue: 'Host / Service…' })} style={{ width: 180 }} />
+          <Button label={t('assignments.globalBootstrap', { defaultValue: 'Global Bootstrap' })} variant="warn" disabled={isRunning} onClick={() => run({ pipeline_type: 'bootstrap_compliance', limit: 'all' }, t('assignments.globalBootstrapTitle', { defaultValue: 'Global compliance bootstrap?' }), t('assignments.globalBootstrapBody', { defaultValue: 'Runs the compliance/baseline playbook (as root) across ALL hosts.' }))} />
+          <Button label={t('assignments.globalAdopt', { defaultValue: 'Global Adopt' })} variant="warn" disabled={isRunning} onClick={() => run({ pipeline_type: 'adopt_host', limit: 'all' }, t('assignments.globalAdoptTitle', { defaultValue: 'Global adopt?' }), t('assignments.globalAdoptBody', { defaultValue: 'Imports every managed container (all sites) into Terraform state.' }))} />
+          <Button label={t('assignments.globalRollout', { defaultValue: 'Global Rollout' })} variant="danger" disabled={isRunning} onClick={() => run({ pipeline_type: 'rollout', limit: 'all' }, t('assignments.globalRolloutTitle', { defaultValue: 'Global rollout?' }), t('assignments.globalRolloutBody', { defaultValue: 'Triggers a full infrastructure rollout across ALL hosts.' }))} />
         </div>
       </div>
 
       {error && <ErrorBox msg={error} />}
-      {!items && !error && <div style={{ color: 'var(--lx-text-muted)', padding: '2rem', textAlign: 'center' }}>Lade Assignments…</div>}
+      {!items && !error && <div style={{ color: 'var(--lx-text-muted)', padding: '2rem', textAlign: 'center' }}>{t('assignments.loading', { defaultValue: 'Lade Assignments…' })}</div>}
       {items && items.length === 0 && (
-        <Card><div style={{ padding: '2rem', textAlign: 'center', color: 'var(--lx-text-muted)' }}>No assignments found. Ensure 'iac_controller/environments' is populated.</div></Card>
+        <Card><div style={{ padding: '2rem', textAlign: 'center', color: 'var(--lx-text-muted)' }}>{t('assignments.empty', { defaultValue: "No assignments found. Ensure 'iac_controller/environments' is populated." })}</div></Card>
       )}
 
       {Object.entries(grouped).sort().map(([site, stages]) => (
         <div key={site} style={{ marginBottom: '1.25rem' }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 10, borderBottom: '1px solid var(--lx-border-soft)', paddingBottom: 6, marginBottom: 10, flexWrap: 'wrap' }}>
             <span style={{ fontSize: '0.95rem', fontWeight: 800, letterSpacing: '0.08em', color: 'var(--lx-text)' }}>{site.toUpperCase()}</span>
-            <span style={{ display: 'flex', gap: 6, marginLeft: 'auto' }}>
-              <Button label="Site Bootstrap" variant="warn" disabled={isRunning} onClick={() => run({ pipeline_type: 'bootstrap_compliance', limit: site }, `Bootstrap site ${site}?`, `Runs compliance/baseline (as root) across all ${site.toUpperCase()} hosts.`)} />
-              <Button label="Site Adopt" variant="warn" disabled={isRunning} onClick={() => run({ pipeline_type: 'adopt_host', limit: site }, `Adopt site ${site}?`, `Imports all managed ${site.toUpperCase()} containers into Terraform state.`)} />
-              <Button label="Site Rollout" variant="danger" disabled={isRunning} onClick={() => run({ pipeline_type: 'rollout', limit: site }, `Rollout site ${site}?`, `Rolls out all hosts in ${site.toUpperCase()}.`)} />
+            <span style={{ display: 'flex', gap: 6, marginLeft: 'auto', flexWrap: 'wrap' }}>
+              <Button label={t('assignments.siteBootstrap', { defaultValue: 'Site Bootstrap' })} variant="warn" disabled={isRunning} onClick={() => run({ pipeline_type: 'bootstrap_compliance', limit: site }, t('assignments.siteBootstrapTitle', { defaultValue: 'Bootstrap site {{site}}?', site }), t('assignments.siteBootstrapBody', { defaultValue: 'Runs compliance/baseline (as root) across all {{site}} hosts.', site: site.toUpperCase() }))} />
+              <Button label={t('assignments.siteAdopt', { defaultValue: 'Site Adopt' })} variant="warn" disabled={isRunning} onClick={() => run({ pipeline_type: 'adopt_host', limit: site }, t('assignments.siteAdoptTitle', { defaultValue: 'Adopt site {{site}}?', site }), t('assignments.siteAdoptBody', { defaultValue: 'Imports all managed {{site}} containers into Terraform state.', site: site.toUpperCase() }))} />
+              <Button label={t('assignments.siteRollout', { defaultValue: 'Site Rollout' })} variant="danger" disabled={isRunning} onClick={() => run({ pipeline_type: 'rollout', limit: site }, t('assignments.siteRolloutTitle', { defaultValue: 'Rollout site {{site}}?', site }), t('assignments.siteRolloutBody', { defaultValue: 'Rolls out all hosts in {{site}}.', site: site.toUpperCase() }))} />
             </span>
           </div>
           {Object.entries(stages).sort().map(([stage, hosts]) => (
             <div key={stage} style={{ marginBottom: 12, paddingLeft: 12, borderLeft: '2px solid var(--lx-border-soft)' }}>
               <div style={{ fontSize: '0.72rem', fontWeight: 700, color: 'var(--lx-state-up)', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 8 }}>{stage}</div>
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(320px, 1fr))', gap: '0.75rem' }}>
+              <div className="iac-card-grid" style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', gap: '0.75rem' }}>
                 {hosts.map((it) => (
                   <Card key={it.host} accent="var(--lx-state-up)">
                     <div style={{ padding: '0.85rem' }}>
                       <div style={{ fontWeight: 700, color: 'var(--lx-text)', fontSize: '0.85rem', marginBottom: 8, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{it.host}</div>
                       <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
-                        <Button label="Adopt" variant="warn" disabled={isRunning} onClick={() => run({ pipeline_type: 'adopt_host', host_name: it.host }, `Adopt host ${it.host}?`, `Imports the existing container for ${it.host} into Terraform state (import + plan, no apply).`)} />
-                        <Button label="Init" disabled={isRunning} onClick={() => run({ pipeline_type: 'init_host', host_name: it.host }, `Init host ${it.host}?`, `Provisions the container for ${it.host} via Terraform only (no Ansible, no services). Real infrastructure will be created.`)} />
-                        <Button label="Bootstrap" variant="warn" disabled={isRunning} onClick={() => run({ pipeline_type: 'bootstrap_compliance', host_name: it.host }, `Bootstrap host ${it.host}?`, `Runs the initial compliance/baseline playbook as root on ${it.host}.`)} />
-                        <Button label="Compliance" disabled={isRunning} onClick={() => run({ pipeline_type: 'compliance', host_name: it.host }, `Run compliance on ${it.host}?`, `Re-runs the compliance baseline as the svc user (ansible-agent) on ${it.host} — no service deployment.`)} />
-                        <Button label="Deploy Services" variant="danger" disabled={isRunning} onClick={() => run({ pipeline_type: 'rollout', limit: it.host }, `Deploy services to ${it.host}?`, `Deploys this host's services to ${it.host}.`)} />
+                        <Button label={t('assignments.adopt', { defaultValue: 'Adopt' })} variant="warn" disabled={isRunning} onClick={() => run({ pipeline_type: 'adopt_host', host_name: it.host }, t('assignments.adoptTitle', { defaultValue: 'Adopt host {{host}}?', host: it.host }), t('assignments.adoptBody', { defaultValue: 'Imports the existing container for {{host}} into Terraform state (import + plan, no apply).', host: it.host }))} />
+                        <Button label={t('assignments.init', { defaultValue: 'Init' })} disabled={isRunning} onClick={() => run({ pipeline_type: 'init_host', host_name: it.host }, t('assignments.initTitle', { defaultValue: 'Init host {{host}}?', host: it.host }), t('assignments.initBody', { defaultValue: 'Provisions the container for {{host}} via Terraform only (no Ansible, no services). Real infrastructure will be created.', host: it.host }))} />
+                        <Button label={t('assignments.bootstrap', { defaultValue: 'Bootstrap' })} variant="warn" disabled={isRunning} onClick={() => run({ pipeline_type: 'bootstrap_compliance', host_name: it.host }, t('assignments.bootstrapTitle', { defaultValue: 'Bootstrap host {{host}}?', host: it.host }), t('assignments.bootstrapBody', { defaultValue: 'Runs the initial compliance/baseline playbook as root on {{host}}.', host: it.host }))} />
+                        <Button label={t('assignments.compliance', { defaultValue: 'Compliance' })} disabled={isRunning} onClick={() => run({ pipeline_type: 'compliance', host_name: it.host }, t('assignments.complianceTitle', { defaultValue: 'Run compliance on {{host}}?', host: it.host }), t('assignments.complianceBody', { defaultValue: 'Re-runs the compliance baseline as the svc user (ansible-agent) on {{host}} — no service deployment.', host: it.host }))} />
+                        <Button label={t('assignments.deployServices', { defaultValue: 'Deploy Services' })} variant="danger" disabled={isRunning} onClick={() => run({ pipeline_type: 'rollout', limit: it.host }, t('assignments.deployServicesTitle', { defaultValue: 'Deploy services to {{host}}?', host: it.host }), t('assignments.deployServicesBody', { defaultValue: "Deploys this host's services to {{host}}.", host: it.host }))} />
                       </div>
                       <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5, marginTop: 10 }}>
                         {it.services.map((s) => (
-                          <span key={s} style={{ fontSize: '0.62rem', color: 'var(--lx-text-muted)', background: 'var(--lx-elevated)', border: '1px solid var(--lx-border-soft)', borderRadius: 'var(--lx-radius-sm)', padding: '1px 7px' }}>{s}</span>
+                          <span key={s} style={{ fontSize: '0.62rem', color: 'var(--lx-text-muted)', background: 'var(--lx-elevated-glass, var(--lx-elevated))', border: '1px solid var(--lx-border-soft)', borderRadius: 'var(--lx-radius-sm)', padding: '1px 7px' }}>{s}</span>
                         ))}
                       </div>
                     </div>
@@ -862,14 +927,14 @@ function SectionCard({ title, children }: { title: string; children: React.React
 // can never drift from the backend.
 const SCHEMA_CATEGORIES = ['Ansible', 'Terraform', 'Repository Roles']
 
-const SECRET_PLACEHOLDER = '•••••••• (gesetzt — zum Ändern überschreiben)'
-
 function SchemaField({ field, value, configured, onChange }: {
   field: SettingField
   value: unknown
   configured: boolean
   onChange: (v: unknown) => void
 }) {
+  const { t } = useTranslation('iac')
+  const secretPlaceholder = t('settings.secretPlaceholder', { defaultValue: '•••••••• (gesetzt — zum Ändern überschreiben)' })
   if (field.kind === 'bool') {
     return <input type="checkbox" checked={Boolean(value)} onChange={(e) => onChange(e.target.checked)} />
   }
@@ -877,7 +942,7 @@ function SchemaField({ field, value, configured, onChange }: {
     return (
       <select className="lx-input" value={String(value ?? '')} onChange={(e) => onChange(e.target.value)}>
         {field.options.map((opt) => (
-          <option key={opt} value={opt}>{opt === '' ? 'None (Local or Public)' : opt}</option>
+          <option key={opt} value={opt}>{opt === '' ? t('settings.selectNone', { defaultValue: 'None (Local or Public)' }) : opt}</option>
         ))}
       </select>
     )
@@ -888,7 +953,7 @@ function SchemaField({ field, value, configured, onChange }: {
         className="lx-input lx-mono"
         rows={4}
         value={String(value ?? '')}
-        placeholder={field.sensitive && configured ? SECRET_PLACEHOLDER : ''}
+        placeholder={field.sensitive && configured ? secretPlaceholder : ''}
         onChange={(e) => onChange(e.target.value)}
       />
     )
@@ -899,13 +964,14 @@ function SchemaField({ field, value, configured, onChange }: {
       className="lx-input"
       type={type}
       value={String(value ?? '')}
-      placeholder={field.sensitive && configured ? SECRET_PLACEHOLDER : ''}
+      placeholder={field.sensitive && configured ? secretPlaceholder : ''}
       onChange={(e) => onChange(field.kind === 'int' ? Number(e.target.value) : e.target.value)}
     />
   )
 }
 
 function AdvancedSettings({ toast, confirm }: { toast: ToastFn; confirm: ConfirmFn }) {
+  const { t } = useTranslation('iac')
   const [schema, setSchema] = useState<SettingField[] | null>(null)
   const [values, setValues] = useState<Record<string, unknown>>({})
   const [creds, setCreds] = useState<string[]>([])
@@ -914,7 +980,7 @@ function AdvancedSettings({ toast, confirm }: { toast: ToastFn; confirm: Confirm
   const [newSecret, setNewSecret] = useState('')
 
   const reload = useCallback(() => {
-    iacApi.settingsSchema().then((r) => setSchema(r.schema)).catch((e) => setError(e instanceof Error ? e.message : 'Schema konnte nicht geladen werden'))
+    iacApi.settingsSchema().then((r) => setSchema(r.schema)).catch((e) => setError(e instanceof Error ? e.message : t('settings.schemaLoadError', { defaultValue: 'Schema konnte nicht geladen werden' })))
     iacApi.settingsValues().then((r) => setValues(r.values)).catch(() => { /* non-fatal */ })
     iacApi.listCredentials().then((r) => setCreds(r.credentials)).catch(() => { /* non-fatal */ })
   }, [])
@@ -935,27 +1001,27 @@ function AdvancedSettings({ toast, confirm }: { toast: ToastFn; confirm: Confirm
       }
     }
     iacApi.saveSettingsValues(updates)
-      .then((r) => { setValues(r.values); toast(`${category} gespeichert (${r.saved.length} Feld(er)).`) })
-      .catch((e) => toast(e instanceof Error ? e.message : 'Speichern fehlgeschlagen', 'err'))
+      .then((r) => { setValues(r.values); toast(t('settings.savedCategory', { defaultValue: '{{category}} gespeichert ({{count}} Feld(er)).', category, count: r.saved.length })) })
+      .catch((e) => toast(e instanceof Error ? e.message : t('settings.saveError', { defaultValue: 'Speichern fehlgeschlagen' }), 'err'))
   }
 
   function addCredential() {
     const a = newAlias.trim(); const s = newSecret.trim()
-    if (!a || !s) { toast('Name und Secret sind erforderlich.', 'err'); return }
+    if (!a || !s) { toast(t('settings.credNameSecretRequired', { defaultValue: 'Name und Secret sind erforderlich.' }), 'err'); return }
     iacApi.addCredential(a, s)
-      .then(() => { setNewAlias(''); setNewSecret(''); reload(); toast(`Credential '${a}' gespeichert.`) })
-      .catch((e) => toast(e instanceof Error ? e.message : 'Speichern fehlgeschlagen', 'err'))
+      .then(() => { setNewAlias(''); setNewSecret(''); reload(); toast(t('settings.credSaved', { defaultValue: "Credential '{{alias}}' gespeichert.", alias: a })) })
+      .catch((e) => toast(e instanceof Error ? e.message : t('settings.saveError', { defaultValue: 'Speichern fehlgeschlagen' }), 'err'))
   }
 
   function removeCredential(alias: string) {
     confirm({
-      title: `Credential '${alias}' entfernen?`,
-      body: 'Entfernt den Alias aus der Registry (verschwindet aus den Auswahllisten). Das Secret selbst bleibt in Vault.',
-      confirmLabel: 'Entfernen',
+      title: t('settings.removeCredConfirmTitle', { defaultValue: "Credential '{{alias}}' entfernen?", alias }),
+      body: t('settings.removeCredConfirmBody', { defaultValue: 'Entfernt den Alias aus der Registry (verschwindet aus den Auswahllisten). Das Secret selbst bleibt in Vault.' }),
+      confirmLabel: t('settings.removeCredConfirmLabel', { defaultValue: 'Entfernen' }),
       onConfirm: () => {
         iacApi.deleteCredential(alias)
-          .then(() => { reload(); toast(`Credential '${alias}' entfernt.`) })
-          .catch((e) => toast(e instanceof Error ? e.message : 'Entfernen fehlgeschlagen', 'err'))
+          .then(() => { reload(); toast(t('settings.credRemoved', { defaultValue: "Credential '{{alias}}' entfernt.", alias })) })
+          .catch((e) => toast(e instanceof Error ? e.message : t('settings.removeCredError', { defaultValue: 'Entfernen fehlgeschlagen' }), 'err'))
       },
     })
   }
@@ -987,33 +1053,32 @@ function AdvancedSettings({ toast, confirm }: { toast: ToastFn; confirm: Confirm
               )
             })}
             <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
-              <Button label={`Save ${cat}`} variant="primary" onClick={() => saveCategory(cat)} />
+              <Button label={t('settings.saveCategory', { defaultValue: 'Save {{category}}', category: cat })} variant="primary" onClick={() => saveCategory(cat)} />
             </div>
           </SectionCard>
         )
       })}
 
-      <SectionCard title="Git Credential Manager">
+      <SectionCard title={t('settings.gitCredManager', { defaultValue: 'Git Credential Manager' })}>
         <div style={{ fontSize: '0.7rem', color: 'var(--lx-text-muted)', marginBottom: 12 }}>
-          Tokens/Keys werden verschlüsselt in Vault gespeichert und stehen oben als Auswahl bereit
-          (GitLab API Credential, Repository-Rollen).
+          {t('settings.gitCredManagerDesc', { defaultValue: 'Tokens/Keys werden verschlüsselt in Vault gespeichert und stehen oben als Auswahl bereit (GitLab API Credential, Repository-Rollen).' })}
         </div>
         {creds.length === 0 ? (
-          <div style={{ fontSize: '0.74rem', color: 'var(--lx-text-muted)', marginBottom: 14 }}>Noch keine Credentials hinterlegt.</div>
+          <div style={{ fontSize: '0.74rem', color: 'var(--lx-text-muted)', marginBottom: 14 }}>{t('settings.noCredentials', { defaultValue: 'Noch keine Credentials hinterlegt.' })}</div>
         ) : (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginBottom: 14 }}>
             {creds.map((alias) => (
               <div key={alias} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '6px 12px', border: '1px solid var(--lx-border-soft)', borderRadius: 'var(--lx-radius-sm)' }}>
                 <span className="lx-mono" style={{ fontSize: '0.76rem', color: 'var(--lx-text)' }}>{alias}</span>
-                <button onClick={() => removeCredential(alias)} style={{ background: 'none', border: 'none', color: '#f87171', cursor: 'pointer', fontSize: '0.72rem' }}>Entfernen</button>
+                <button onClick={() => removeCredential(alias)} style={{ background: 'none', border: 'none', color: '#f87171', cursor: 'pointer', fontSize: '0.72rem' }}>{t('settings.remove', { defaultValue: 'Entfernen' })}</button>
               </div>
             ))}
           </div>
         )}
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr auto', gap: 8, alignItems: 'center' }}>
-          <input className="lx-input" placeholder="Name (z.B. gitlab_main)" value={newAlias} onChange={(e) => setNewAlias(e.target.value)} />
-          <input className="lx-input" type="password" placeholder="Token oder Private Key" value={newSecret} onChange={(e) => setNewSecret(e.target.value)} />
-          <Button label="Hinzufügen" variant="primary" onClick={addCredential} />
+        <div className="iac-cred-add" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr auto', gap: 8, alignItems: 'center' }}>
+          <input className="lx-input" placeholder={t('settings.credNamePlaceholder', { defaultValue: 'Name (z.B. gitlab_main)' })} value={newAlias} onChange={(e) => setNewAlias(e.target.value)} />
+          <input className="lx-input" type="password" placeholder={t('settings.credSecretPlaceholder', { defaultValue: 'Token oder Private Key' })} value={newSecret} onChange={(e) => setNewSecret(e.target.value)} />
+          <Button label={t('settings.add', { defaultValue: 'Hinzufügen' })} variant="primary" onClick={addCredential} />
         </div>
       </SectionCard>
     </>
@@ -1021,13 +1086,14 @@ function AdvancedSettings({ toast, confirm }: { toast: ToastFn; confirm: Confirm
 }
 
 function SettingsPage({ confirm, toast }: { confirm: ConfirmFn; toast: ToastFn }) {
+  const { t } = useTranslation('iac')
   const [cfg, setCfg] = useState<IaCSettings | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [tokenInfo, setTokenInfo] = useState<{ configured: boolean; masked: string } | null>(null)
   const [tokenReveal, setTokenReveal] = useState<string | null>(null)
 
   useEffect(() => {
-    iacApi.getSettings().then(setCfg).catch((e) => setError(e instanceof Error ? e.message : 'Einstellungen konnten nicht geladen werden'))
+    iacApi.getSettings().then(setCfg).catch((e) => setError(e instanceof Error ? e.message : t('settings.loadError', { defaultValue: 'Einstellungen konnten nicht geladen werden' })))
     iacApi.getWebhookToken().then(setTokenInfo).catch(() => { /* non-fatal */ })
   }, [])
 
@@ -1038,104 +1104,104 @@ function SettingsPage({ confirm, toast }: { confirm: ConfirmFn; toast: ToastFn }
   function save() {
     if (!cfg) return
     iacApi.saveSettings(cfg)
-      .then((s) => { setCfg(s); toast('Einstellungen gespeichert.') })
-      .catch((e) => toast(e instanceof Error ? e.message : 'Speichern fehlgeschlagen', 'err'))
+      .then((s) => { setCfg(s); toast(t('settings.saved', { defaultValue: 'Einstellungen gespeichert.' })) })
+      .catch((e) => toast(e instanceof Error ? e.message : t('settings.saveError', { defaultValue: 'Speichern fehlgeschlagen' }), 'err'))
   }
 
   function generateToken() {
     confirm({
-      title: 'Generate a new webhook token?',
-      body: 'This replaces the current GitLab webhook token in Vault. Existing GitLab webhooks must be re-synced with the new token afterwards.',
-      confirmLabel: 'Generate',
+      title: t('settings.generateTokenConfirmTitle', { defaultValue: 'Generate a new webhook token?' }),
+      body: t('settings.generateTokenConfirmBody', { defaultValue: 'This replaces the current GitLab webhook token in Vault. Existing GitLab webhooks must be re-synced with the new token afterwards.' }),
+      confirmLabel: t('settings.generateTokenConfirmLabel', { defaultValue: 'Generate' }),
       onConfirm: () => {
         iacApi.generateWebhookToken()
-          .then((r) => { setTokenReveal(r.token); setTokenInfo({ configured: true, masked: '•'.repeat(32) }); toast('Neuer Webhook-Token erzeugt und in Vault gespeichert.') })
-          .catch((e) => toast(e instanceof Error ? e.message : 'Token-Erzeugung fehlgeschlagen', 'err'))
+          .then((r) => { setTokenReveal(r.token); setTokenInfo({ configured: true, masked: '•'.repeat(32) }); toast(t('settings.tokenGenerated', { defaultValue: 'Neuer Webhook-Token erzeugt und in Vault gespeichert.' })) })
+          .catch((e) => toast(e instanceof Error ? e.message : t('settings.tokenError', { defaultValue: 'Token-Erzeugung fehlgeschlagen' }), 'err'))
       },
     })
   }
 
   function syncWebhooks() {
     confirm({
-      title: 'Sync GitLab webhooks?',
-      body: 'Upserts merge-request webhooks for all projects in the configured GitLab group to point at the Lyndrix orchestrator endpoint.',
-      confirmLabel: 'Sync',
+      title: t('settings.syncWebhooksConfirmTitle', { defaultValue: 'Sync GitLab webhooks?' }),
+      body: t('settings.syncWebhooksConfirmBody', { defaultValue: 'Upserts merge-request webhooks for all projects in the configured GitLab group to point at the Lyndrix orchestrator endpoint.' }),
+      confirmLabel: t('settings.syncWebhooksConfirmLabel', { defaultValue: 'Sync' }),
       onConfirm: () => {
         iacApi.syncWebhooks()
-          .then((r) => toast(`Webhook sync ok — projects=${r.projects_total ?? '?'}, created=${r.created ?? 0}, updated=${r.updated ?? 0}, failed=${r.failed ?? 0}.`))
-          .catch((e) => toast(e instanceof Error ? e.message : 'Sync fehlgeschlagen', 'err'))
+          .then((r) => toast(t('settings.syncWebhooksResult', { defaultValue: 'Webhook sync ok — projects={{projects}}, created={{created}}, updated={{updated}}, failed={{failed}}.', projects: r.projects_total ?? '?', created: r.created ?? 0, updated: r.updated ?? 0, failed: r.failed ?? 0 })))
+          .catch((e) => toast(e instanceof Error ? e.message : t('settings.syncError', { defaultValue: 'Sync fehlgeschlagen' }), 'err'))
       },
     })
   }
 
   return (
-    <div style={{ maxWidth: 760, margin: '0 auto', padding: '1.5rem 1.5rem 3rem' }}>
+    <div className="iac-page" style={{ maxWidth: 760, margin: '0 auto', padding: '1.5rem 1.5rem 3rem' }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: '1.25rem' }}>
-        <button onClick={goBack} style={{ background: 'none', border: '1px solid var(--lx-border-soft)', borderRadius: 'var(--lx-radius-sm)', color: 'var(--lx-text-muted)', cursor: 'pointer', padding: '3px 10px', fontSize: '0.72rem' }}>← Back</button>
-        <h1 style={{ margin: 0, fontSize: '1.15rem', fontWeight: 800, color: 'var(--lx-text)' }}>IaC Orchestrator · Settings</h1>
+        <button onClick={goBack} style={{ background: 'none', border: '1px solid var(--lx-border-soft)', borderRadius: 'var(--lx-radius-sm)', color: 'var(--lx-text-muted)', cursor: 'pointer', padding: '3px 10px', fontSize: '0.72rem' }}>{t('settings.back', { defaultValue: '← Back' })}</button>
+        <h1 style={{ margin: 0, fontSize: '1.15rem', fontWeight: 800, color: 'var(--lx-text)' }}>{t('settings.pageTitle', { defaultValue: 'IaC Orchestrator · Settings' })}</h1>
       </div>
 
       {error && <ErrorBox msg={error} />}
-      {!cfg && !error && <div style={{ color: 'var(--lx-text-muted)' }}>Lade…</div>}
+      {!cfg && !error && <div style={{ color: 'var(--lx-text-muted)' }}>{t('settings.loading', { defaultValue: 'Lade…' })}</div>}
 
       {cfg && (
         <div style={{ display: 'grid', gap: '1rem' }}>
-          <SectionCard title="Pipeline Configuration">
+          <SectionCard title={t('settings.pipelineConfig', { defaultValue: 'Pipeline Configuration' })}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: '0.6rem' }}>
               <input type="checkbox" checked={cfg.auto_apply} onChange={(e) => patch({ auto_apply: e.target.checked })} id="auto_apply" />
-              <label htmlFor="auto_apply" style={{ fontSize: '0.8rem', color: 'var(--lx-text)' }}>Enable Auto-Apply</label>
+              <label htmlFor="auto_apply" style={{ fontSize: '0.8rem', color: 'var(--lx-text)' }}>{t('settings.enableAutoApply', { defaultValue: 'Enable Auto-Apply' })}</label>
             </div>
             <div style={{ fontSize: '0.66rem', color: '#f59e0b', fontStyle: 'italic', marginBottom: '0.8rem' }}>
-              Warning: Auto-Apply executes infrastructure changes immediately on webhook receipt.
+              {t('settings.autoApplyWarning', { defaultValue: 'Warning: Auto-Apply executes infrastructure changes immediately on webhook receipt.' })}
             </div>
-            <Field label="Test Deploy Allowed Hosts (comma-separated)" hint="Used by /api/iac/deploy/test-host/{host}; blocks rollout to non-allowlisted hosts.">
+            <Field label={t('settings.testDeployHosts', { defaultValue: 'Test Deploy Allowed Hosts (comma-separated)' })} hint={t('settings.testDeployHostsHint', { defaultValue: 'Used by /api/iac/deploy/test-host/{host}; blocks rollout to non-allowlisted hosts.' })}>
               <input className="lx-input" value={cfg.test_deploy_allowed_hosts} onChange={(e) => patch({ test_deploy_allowed_hosts: e.target.value })} placeholder="e.g. pve-test-01" />
             </Field>
           </SectionCard>
 
-          <SectionCard title="GitLab Webhooks">
-            <Field label="GitLab Base URL">
+          <SectionCard title={t('settings.gitlabWebhooks', { defaultValue: 'GitLab Webhooks' })}>
+            <Field label={t('settings.gitlabBaseUrl', { defaultValue: 'GitLab Base URL' })}>
               <input className="lx-input" value={cfg.gitlab_url} onChange={(e) => patch({ gitlab_url: e.target.value })} />
             </Field>
-            <Field label="GitLab Group ID">
+            <Field label={t('settings.gitlabGroupId', { defaultValue: 'GitLab Group ID' })}>
               <input className="lx-input" value={cfg.group_id} onChange={(e) => patch({ group_id: e.target.value })} />
             </Field>
-            <Field label="Lyndrix Base URL">
+            <Field label={t('settings.lyndrixBaseUrl', { defaultValue: 'Lyndrix Base URL' })}>
               <input className="lx-input" value={cfg.lyndrix_base_url} onChange={(e) => patch({ lyndrix_base_url: e.target.value })} />
             </Field>
-            <Field label="GitLab API Credential (Vault key)">
+            <Field label={t('settings.gitlabApiCredential', { defaultValue: 'GitLab API Credential (Vault key)' })}>
               <input className="lx-input" value={cfg.gitlab_token_key} onChange={(e) => patch({ gitlab_token_key: e.target.value })} />
             </Field>
-            <Field label="Webhook Endpoint Preview">
+            <Field label={t('settings.webhookEndpointPreview', { defaultValue: 'Webhook Endpoint Preview' })}>
               <input className="lx-input lx-mono" style={{ color: 'var(--lx-text-muted)' }} value={cfg.webhook_endpoint} readOnly />
             </Field>
             <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
               <label style={{ fontSize: '0.78rem', color: 'var(--lx-text)', display: 'flex', alignItems: 'center', gap: 6 }}>
                 <input type="checkbox" checked={cfg.autosync_enabled} onChange={(e) => patch({ autosync_enabled: e.target.checked })} />
-                Auto-sync new repos
+                {t('settings.autosyncRepos', { defaultValue: 'Auto-sync new repos' })}
               </label>
               <label style={{ fontSize: '0.72rem', color: 'var(--lx-text-muted)', display: 'flex', alignItems: 'center', gap: 6 }}>
-                Interval (s)
+                {t('settings.intervalSeconds', { defaultValue: 'Interval (s)' })}
                 <input type="number" min={300} step={60} className="lx-input" style={{ width: 110 }} value={cfg.sync_interval} onChange={(e) => patch({ sync_interval: Number(e.target.value) })} />
               </label>
             </div>
             <div style={{ display: 'flex', gap: 8, marginTop: 12 }}>
-              <Button label="Sync Webhooks Now" variant="primary" onClick={syncWebhooks} />
+              <Button label={t('settings.syncWebhooksNow', { defaultValue: 'Sync Webhooks Now' })} variant="primary" onClick={syncWebhooks} />
             </div>
           </SectionCard>
 
-          <SectionCard title="Security · Webhook Token">
+          <SectionCard title={t('settings.security', { defaultValue: 'Security · Webhook Token' })}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
-              <input className="lx-input lx-mono" style={{ flex: 1, minWidth: 220 }} readOnly value={tokenReveal ?? (tokenInfo?.configured ? tokenInfo.masked : '(not set)')} />
-              <Button label="Generate Token" variant="warn" onClick={generateToken} />
+              <input className="lx-input lx-mono" style={{ flex: 1, minWidth: 220 }} readOnly value={tokenReveal ?? (tokenInfo?.configured ? tokenInfo.masked : t('settings.tokenNotSet', { defaultValue: '(not set)' }))} />
+              <Button label={t('settings.generateToken', { defaultValue: 'Generate Token' })} variant="warn" onClick={generateToken} />
             </div>
             {tokenReveal && (
-              <div style={{ fontSize: '0.64rem', color: '#f59e0b', marginTop: 6 }}>Copy this token now — it will not be shown again.</div>
+              <div style={{ fontSize: '0.64rem', color: '#f59e0b', marginTop: 6 }}>{t('settings.copyTokenOnce', { defaultValue: 'Copy this token now — it will not be shown again.' })}</div>
             )}
           </SectionCard>
 
           <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
-            <Button label="Save Settings" variant="primary" onClick={save} />
+            <Button label={t('settings.saveSettings', { defaultValue: 'Save Settings' })} variant="primary" onClick={save} />
           </div>
 
           {/* Schema-driven sections: Ansible, Terraform, Repository Roles + credentials. */}
@@ -1150,16 +1216,58 @@ function SettingsPage({ confirm, toast }: { confirm: ConfirmFn; toast: ToastFn }
 
 type TabId = 'overview' | 'active' | 'provision' | 'catalog' | 'assignments' | 'history'
 
-const TABS: { id: TabId; label: string }[] = [
-  { id: 'overview', label: 'Overview' },
-  { id: 'active', label: 'Active Pipelines' },
-  { id: 'provision', label: 'Provision' },
-  { id: 'catalog', label: 'Service Catalog' },
-  { id: 'assignments', label: 'Assignments' },
-  { id: 'history', label: 'History' },
-]
+const VIEW_LABELS: Record<TabId, string> = {
+  overview: 'Overview', active: 'Active Pipelines', provision: 'Provision',
+  catalog: 'Service Catalog', assignments: 'Topology', history: 'History',
+}
+
+// ─── Nav tile (Overview → sub-view entry point) ───────────────────────────────
+
+function NavTile({ icon, label, value, sub, accent, onClick, badge }: {
+  icon: string; label: string; value: React.ReactNode; sub?: string
+  accent?: string; onClick: () => void; badge?: React.ReactNode
+}) {
+  return (
+    <button className="iac-nav-tile" onClick={onClick} style={{
+      display: 'flex', flexDirection: 'column', gap: 6,
+      padding: '1rem', width: '100%', textAlign: 'left', cursor: 'pointer',
+      background: 'var(--lx-surface-glass, var(--lx-surface))', backdropFilter: 'blur(16px) saturate(160%)', WebkitBackdropFilter: 'blur(16px) saturate(160%)', border: '1px solid var(--lx-border-soft)',
+      borderRadius: 'var(--lx-radius-md)', transition: 'border-color 0.18s, background 0.18s',
+    }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+        <span className="material-icons" style={{ fontSize: 14, color: accent ?? 'var(--lx-accent)', flexShrink: 0 }}>{icon}</span>
+        <span style={{ fontSize: '0.65rem', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.1em', color: 'var(--lx-text-muted)' }}>{label}</span>
+        {badge}
+        <span className="iac-nav-tile-arrow material-icons" style={{ marginLeft: 'auto', fontSize: 13, color: 'var(--lx-text-muted)', opacity: 0.3, transition: 'opacity 0.18s, transform 0.18s' }}>arrow_forward</span>
+      </div>
+      <div style={{ fontSize: '1.25rem', fontWeight: 800, color: accent ?? 'var(--lx-text)', lineHeight: 1.1 }}>{value}</div>
+      {sub && <div style={{ fontSize: '0.67rem', color: 'var(--lx-text-muted)', lineHeight: 1.4 }}>{sub}</div>}
+    </button>
+  )
+}
+
+// ─── View header (breadcrumb back to overview in sub-views) ───────────────────
+
+function ViewHeader({ tab, onBack }: { tab: TabId; onBack: () => void }) {
+  const { t } = useTranslation('iac')
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: '1.25rem' }}>
+      <button onClick={onBack} style={{
+        display: 'inline-flex', alignItems: 'center', gap: 4, cursor: 'pointer',
+        background: 'none', border: 'none', padding: 0,
+        fontSize: '0.72rem', color: 'var(--lx-text-muted)',
+      }}>
+        <span className="material-icons" style={{ fontSize: 14 }}>arrow_back</span>
+        {t('views.overview', { defaultValue: 'Overview' })}
+      </button>
+      <span style={{ color: 'var(--lx-border-soft)', fontSize: '0.8rem' }}>/</span>
+      <span style={{ fontSize: '0.8rem', fontWeight: 700, color: 'var(--lx-text)' }}>{t(`views.${tab}`, { defaultValue: VIEW_LABELS[tab] })}</span>
+    </div>
+  )
+}
 
 function Dashboard() {
+  const { t } = useTranslation('iac')
   const { snapshot, connected, error } = useJobsSSE()
   const [tab, setTab] = useState<TabId>('overview')
   const [logJob, setLogJob] = useState<number | null>(null)
@@ -1175,7 +1283,6 @@ function Dashboard() {
   const jobs = snapshot?.jobs ?? []
   const isRunning = snapshot?.is_running ?? false
 
-  // Drive periodic stats/provision refresh from SSE snapshot changes + a timer.
   const [statsTick, setStatsTick] = useState(0)
   useEffect(() => {
     const t = setInterval(() => setStatsTick((n) => n + 1), 8000)
@@ -1198,13 +1305,13 @@ function Dashboard() {
 
   function abort() {
     confirm({
-      title: 'Abort running execution?',
-      body: 'This kills the runner containers and marks all RUNNING jobs as ABORTED. In-flight infrastructure changes may be left partially applied.',
-      confirmLabel: 'Abort',
+      title: t('dashboard.abortConfirmTitle', { defaultValue: 'Abort running execution?' }),
+      body: t('dashboard.abortConfirmBody', { defaultValue: 'This kills the runner containers and marks all RUNNING jobs as ABORTED. In-flight infrastructure changes may be left partially applied.' }),
+      confirmLabel: t('dashboard.abortConfirmLabel', { defaultValue: 'Abort' }),
       onConfirm: () => {
         iacApi.abort()
-          .then((r) => toast(`Execution aborted (${(r.aborted_jobs as number[] | undefined)?.length ?? 0} job(s)).`))
-          .catch((e) => toast(e instanceof Error ? e.message : 'Abort fehlgeschlagen', 'err'))
+          .then((r) => toast(t('dashboard.aborted', { defaultValue: 'Execution aborted ({{count}} job(s)).', count: (r.aborted_jobs as number[] | undefined)?.length ?? 0 })))
+          .catch((e) => toast(e instanceof Error ? e.message : t('dashboard.abortError', { defaultValue: 'Abort fehlgeschlagen' }), 'err'))
       },
     })
   }
@@ -1216,43 +1323,34 @@ function Dashboard() {
   }
 
   return (
-    <div style={{ maxWidth: 1100, margin: '0 auto', padding: '1.5rem 1.5rem 3rem' }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', marginBottom: '1.25rem', flexWrap: 'wrap' }}>
-        <h1 style={{ margin: 0, fontSize: '1.2rem', fontWeight: 800, color: 'var(--lx-text)' }}>IaC Orchestrator</h1>
-        <span title={connected ? 'Live verbunden' : 'Getrennt'} style={{
-          marginLeft: 'auto', display: 'inline-flex', alignItems: 'center', gap: 5,
-          fontSize: '0.68rem', color: connected ? 'var(--lx-state-up)' : 'var(--lx-state-down)',
-        }}>
-          <span style={{ width: 7, height: 7, borderRadius: '50%', background: connected ? 'var(--lx-state-up)' : 'var(--lx-state-down)' }} />
-          {connected ? 'LIVE' : 'OFFLINE'}
+    <div className="iac-page" style={{ maxWidth: 1100, margin: '0 auto', padding: '1.5rem 1.5rem 3rem' }}>
+      {/* Minimal top bar — just live indicator + abort */}
+      <div className="iac-topbar" style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', marginBottom: '1.5rem', flexWrap: 'wrap' }}>
+        <span style={{ fontSize: '0.65rem', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.1em', color: 'var(--lx-text-muted)' }}>
+          {t('dashboard.title', { defaultValue: 'IaC Orchestrator' })}
         </span>
-        <Button label="Abort" icon="stop_circle" variant="danger" disabled={!isRunning} onClick={abort} title={isRunning ? 'Abort the running execution' : 'No active job'} />
-        <Button label="Settings" icon="settings" onClick={goSettings} />
+        <span title={connected ? t('status.liveConnected', { defaultValue: 'Live connected' }) : t('status.disconnected', { defaultValue: 'Disconnected' })} style={{
+          marginLeft: 'auto', display: 'inline-flex', alignItems: 'center', gap: 5,
+          fontSize: '0.65rem', color: connected ? 'var(--lx-state-up)' : 'var(--lx-state-down)',
+        }}>
+          <span style={{ width: 6, height: 6, borderRadius: '50%', background: connected ? 'var(--lx-state-up)' : 'var(--lx-state-down)' }} />
+          {connected ? t('status.live', { defaultValue: 'LIVE' }) : t('status.offline', { defaultValue: 'OFFLINE' })}
+        </span>
+        <Button label={t('dashboard.abort', { defaultValue: 'Abort' })} icon="stop_circle" variant="danger" disabled={!isRunning} onClick={abort}
+          title={isRunning ? t('dashboard.abortRunningTitle', { defaultValue: 'Abort the running execution' }) : t('dashboard.noActiveJob', { defaultValue: 'No active job' })} />
+        <Button label={t('dashboard.settings', { defaultValue: 'Settings' })} icon="settings" onClick={goSettings} />
       </div>
 
       {error && <ErrorBox msg={error} />}
 
-      <div className="lx-tabs" style={{ marginBottom: '1.5rem', flexWrap: 'wrap' }}>
-        {TABS.map((t) => {
-          const activeTab = t.id === tab
-          const badge = t.id === 'active' && runningCount > 0 ? runningCount : null
-          return (
-            <button key={t.id} onClick={() => setTab(t.id)} className={`lx-tab${activeTab ? ' lx-tab--active' : ''}`}>
-              {t.label}
-              {badge !== null && (
-                <span style={{ background: 'var(--lx-accent)', color: '#000', borderRadius: 999, fontSize: '0.6rem', fontWeight: 800, padding: '1px 6px' }}>{badge}</span>
-              )}
-            </button>
-          )
-        })}
-      </div>
+      {tab !== 'overview' && <ViewHeader tab={tab} onBack={() => setTab('overview')} />}
 
-      {tab === 'overview' && <Overview statsTick={statsTick} isRunning={isRunning} />}
-      {tab === 'active' && <ActivePipelines jobs={jobs} runnersByJob={runnersByJob} onLogs={setLogJob} />}
-      {tab === 'provision' && <Provision confirm={confirm} toast={toast} isRunning={isRunning} statsTick={statsTick} />}
-      {tab === 'catalog' && <ServiceCatalog confirm={confirm} toast={toast} onLogs={setLogJob} />}
+      {tab === 'overview'    && <Overview statsTick={statsTick} isRunning={isRunning} jobs={jobs} runningCount={runningCount} onNavigate={setTab} />}
+      {tab === 'active'      && <ActivePipelines jobs={jobs} runnersByJob={runnersByJob} onLogs={setLogJob} />}
+      {tab === 'provision'   && <Provision confirm={confirm} toast={toast} isRunning={isRunning} statsTick={statsTick} />}
+      {tab === 'catalog'     && <ServiceCatalog confirm={confirm} toast={toast} onLogs={setLogJob} />}
       {tab === 'assignments' && <Assignments confirm={confirm} toast={toast} isRunning={isRunning} />}
-      {tab === 'history' && <History jobs={jobs} onLogs={setLogJob} />}
+      {tab === 'history'     && <History jobs={jobs} onLogs={setLogJob} />}
 
       {logJob !== null && <LogViewer jobId={logJob} onClose={() => setLogJob(null)} />}
       {confirmOpts && <ConfirmDialog opts={confirmOpts} onClose={() => setConfirmOpts(null)} />}
@@ -1261,7 +1359,7 @@ function Dashboard() {
           position: 'fixed', bottom: 24, left: '50%', transform: 'translateX(-50%)', zIndex: 1200,
           padding: '0.6rem 1.1rem', borderRadius: 'var(--lx-radius-md)', fontSize: '0.8rem', fontWeight: 600,
           color: toastMsg.kind === 'err' ? 'var(--lx-state-down)' : 'var(--lx-state-up)',
-          background: 'var(--lx-elevated)',
+          background: 'var(--lx-elevated-glass, var(--lx-elevated))',
           border: `1px solid color-mix(in srgb, ${toastMsg.kind === 'err' ? 'var(--lx-state-down)' : 'var(--lx-state-up)'} 40%, transparent)`,
           boxShadow: 'var(--lx-glow)',
         }}>{toastMsg.msg}</div>
@@ -1288,7 +1386,7 @@ function SettingsRoot() {
           position: 'fixed', bottom: 24, left: '50%', transform: 'translateX(-50%)', zIndex: 1200,
           padding: '0.6rem 1.1rem', borderRadius: 'var(--lx-radius-md)', fontSize: '0.8rem', fontWeight: 600,
           color: toastMsg.kind === 'err' ? 'var(--lx-state-down)' : 'var(--lx-state-up)',
-          background: 'var(--lx-elevated)',
+          background: 'var(--lx-elevated-glass, var(--lx-elevated))',
           border: `1px solid color-mix(in srgb, ${toastMsg.kind === 'err' ? 'var(--lx-state-down)' : 'var(--lx-state-up)'} 40%, transparent)`,
           boxShadow: 'var(--lx-glow)',
         }}>{toastMsg.msg}</div>
@@ -1302,13 +1400,42 @@ function SettingsRoot() {
 // styles via !important (a CSS !important declaration beats an inline style without
 // it). Targets the history views + modal overlays on narrow screens.
 const RESPONSIVE_CSS = `
+.iac-nav-tile:hover {
+  border-color: var(--lx-accent) !important;
+  background: color-mix(in srgb, var(--lx-accent) 5%, var(--lx-surface)) !important;
+}
+.iac-nav-tile:hover .iac-nav-tile-arrow {
+  opacity: 0.8 !important;
+  transform: translateX(3px) !important;
+}
 @media (max-width: 640px) {
+  /* Tall modals (logs / generic) dock to the top so the content area gets the
+     height; the short confirm/approval dialog stays vertically centred. */
   .iac-modal-overlay { padding: 0.6rem !important; align-items: flex-start !important; }
   .iac-modal-overlay > div { max-height: 92vh !important; }
-  .iac-hist-header { flex-direction: column !important; align-items: stretch !important; gap: 0.5rem !important; }
-  .iac-hist-header .lx-input { width: 100% !important; }
+  .iac-confirm-overlay { align-items: center !important; padding: 1rem !important; }
+
+  /* Page gutters: tighter so cards aren't cramped on a phone. */
+  .iac-page { padding: 1rem 0.85rem 2.5rem !important; }
+
+  /* Top bar wraps instead of squeezing the live indicator + buttons. */
+  .iac-topbar { row-gap: 0.5rem !important; }
+
+  /* View headers stack: title on top, search/actions full-width below. */
+  .iac-view-header { flex-direction: column !important; align-items: stretch !important; gap: 0.6rem !important; }
+  .iac-view-header .iac-header-actions { width: 100% !important; }
+  .iac-search { width: 100% !important; min-width: 0 !important; flex: 1 1 100% !important; }
+
+  /* History rows reflow; drop the inline progress bar to save width. */
   .iac-hist-row { flex-wrap: wrap !important; row-gap: 0.3rem !important; }
   .iac-hist-progress { display: none !important; }
+
+  /* Every multi-column card grid collapses to a single centred column so a
+     lone card fills the row instead of hugging the left edge. */
+  .iac-card-grid { grid-template-columns: 1fr !important; }
+
+  /* Credential add row stacks (name / secret / button on their own lines). */
+  .iac-cred-add { grid-template-columns: 1fr !important; }
 }
 `
 

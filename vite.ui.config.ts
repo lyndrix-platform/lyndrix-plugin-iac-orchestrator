@@ -14,12 +14,16 @@ export default defineConfig({
     outDir: 'ui_static',
     emptyOutDir: true,
     rollupOptions: {
-      external: ['react', 'react-dom', 'react-dom/client'],
+      // Shared from the host shell via window globals — never bundled.
+      external: ['react', 'react-dom', 'react-dom/client', 'react-i18next', 'i18next', '@lyndrix/ui'],
       output: {
         globals: {
           react: '__lyndrix_react',
           'react-dom': '__lyndrix_react',
           'react-dom/client': '__lyndrix_react_dom_client',
+          'react-i18next': '__lyndrix_react_i18next',
+          i18next: '__lyndrix_i18n',
+          '@lyndrix/ui': '__lyndrix_ui',
         },
       },
     },

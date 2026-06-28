@@ -17,7 +17,7 @@ from .app.ui.widget import render_dashboard_widget as modular_widget
 manifest = ModuleManifest(
     id="lyndrix.plugin.iac_orchestrator",
     name="IaC Orchestrator",
-    version="0.9.0",
+    version="0.9.1",
     description="Standalone GitOps controller for executing Terraform and Ansible pipelines.",
     author="Lyndrix",
     icon="rocket_launch",
@@ -27,6 +27,9 @@ manifest = ModuleManifest(
     repo_url="https://github.com/lyndrix-platform/lyndrix-plugin-iac-orchestrator",
     ui_route="/iac",
     react_ui=True,
+    # i18next-shaped namespace served to the React UI; core auto-registers
+    # locales/iac.<locale>.json and adds "iac" to the client allowlist.
+    i18n_namespace="iac",
     react_routes=[
         {
             "path": "/iac",

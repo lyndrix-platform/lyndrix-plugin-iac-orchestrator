@@ -174,8 +174,11 @@ def _validate_stream_ticket(ticket: str | None, permission: str = "api:read") ->
     try:
         import base64
         raw = base64.urlsafe_b64decode(ticket.encode()).decode()
-        exp_s, perm, sig = raw.rsplit(":", 2)
-        expected = hmac.new(_STREAM_TICKET_KEY, f"{exp_s}:{perm}".encode(), "sha256").hexdigest()
+        # Split from the right once to isolate the sig, then split from the left
+        # once for exp — the permission may itself contain colons (e.g. "api:read").
+        body, sig = raw.rsplit(":", 1)
+        exp_s, perm = body.split(":", 1)
+        expected = hmac.new(_STREAM_TICKET_KEY, body.encode(), "sha256").hexdigest()
         if not hmac.compare_digest(sig, expected):
             return False
         if int(exp_s) < int(time.time()):
