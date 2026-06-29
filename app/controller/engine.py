@@ -1029,12 +1029,44 @@ class DeploymentEngine:
             if not inventory:
                 return
             payload = self._build_monitoring_inventory_payload(inventory)
-            self.ctx.emit("monitoring:inventory_sync", payload)
-            log.info(
-                f"MONITORING: Emitted generated inventory sync with {len(payload['hosts'])} hosts and {len(payload['services'])} services."
-            )
+            await self._post_monitoring_inventory(payload)
         except Exception as exc:
-            log.error(f"MONITORING: Failed to emit inventory sync: {exc}")
+            log.error(f"MONITORING: Failed to post inventory sync: {exc}")
+
+    async def _post_monitoring_inventory(self, payload: dict) -> None:
+        from config import settings
+        import httpx
+
+        api_key = settings.LYNDRIX_SYSTEM_API_KEY
+        if not api_key:
+            log.warning(
+                "MONITORING: LYNDRIX_SYSTEM_API_KEY not set — inventory sync skipped. "
+                "Set a system API key to enable automatic monitoring population."
+            )
+            return
+
+        url = (
+            f"http://127.0.0.1:{settings.PORT}"
+            "/api/plugins/lyndrix.plugin.state_monitoring/inventory-sync"
+        )
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(
+                url,
+                json=payload,
+                headers={"Authorization": f"Bearer {api_key}"},
+            )
+
+        if resp.status_code == 404:
+            log.debug("MONITORING: State Monitoring plugin not installed — skipping inventory sync.")
+        elif resp.status_code == 403:
+            log.warning("MONITORING: State Monitoring plugin not enabled or API key lacks api:write — skipping.")
+        elif not resp.is_success:
+            log.error(f"MONITORING: Inventory sync API returned {resp.status_code}: {resp.text[:200]}")
+        else:
+            log.info(
+                f"MONITORING: Posted inventory sync — "
+                f"{len(payload['hosts'])} hosts, {len(payload['services'])} services."
+            )
 
     # ------------------------------------------------------------------
     # Notification helpers — use messaging:outbound instead of system:notify

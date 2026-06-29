@@ -48,7 +48,7 @@ manifest = ModuleManifest(
     permissions={
         "subscribe": ["vault:ready_for_data", "iac:webhook_verified", "git:status_update", "db:connected", "socket:response"],
         "emit": ["iac:pipeline_started", "iac:webhook_verified", "git:sync", "git:commit_push",
-                 "system:notify", "user:notify", "monitoring:inventory_sync", "socket:request", "messaging:outbound"],
+                 "system:notify", "user:notify", "socket:request", "messaging:outbound"],
     },
     notification_endpoints=[
         NotificationEndpoint(
