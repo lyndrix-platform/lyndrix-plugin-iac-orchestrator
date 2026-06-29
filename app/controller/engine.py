@@ -146,6 +146,7 @@ class NativeGenerateStage:
         try:
             await engine._generate_inventory_and_snapshot(context.get("job_id", 0))
             await engine.emit_monitoring_inventory_sync()
+            engine.emit_iac_inventory_updated()
             return StageResult(True, "Native artifacts generated.")
         except Exception as e:
             return StageResult(False, f"Native generation failed: {e}")
@@ -1067,6 +1068,45 @@ class DeploymentEngine:
                 f"MONITORING: Posted inventory sync — "
                 f"{len(payload['hosts'])} hosts, {len(payload['services'])} services."
             )
+
+    # ------------------------------------------------------------------
+    # Generic inventory event — consumed by any interested plugin
+    # ------------------------------------------------------------------
+
+    def emit_iac_inventory_updated(self) -> None:
+        """Emit ``iac:inventory_updated`` with the current managed host list.
+
+        The payload is intentionally generic — groups, roles, and IPs — so any
+        plugin can subscribe and apply its own filtering logic without the
+        orchestrator needing to know about that plugin.
+        """
+        try:
+            inventory = self._load_generated_inventory()
+            if not inventory:
+                return
+            all_hosts = (inventory.get("all") or {}).get("hosts") or {}
+            children = (inventory.get("all") or {}).get("children") or {}
+
+            host_groups: dict[str, list[str]] = {}
+            for group_name, group_data in children.items():
+                for host_name in (group_data.get("hosts") or {}).keys():
+                    host_groups.setdefault(host_name, []).append(group_name)
+
+            hosts = [
+                {
+                    "name": host_name,
+                    "hostname": host_data.get("hostname") or host_name,
+                    "ip": host_data.get("ansible_host"),
+                    "groups": sorted(host_groups.get(host_name, [])),
+                    "baseline_roles": host_data.get("baseline_roles") or [],
+                    "terraform": host_data.get("terraform") or {},
+                }
+                for host_name, host_data in all_hosts.items()
+            ]
+            self.ctx.emit("iac:inventory_updated", {"hosts": hosts})
+            log.debug(f"IAC: Emitted iac:inventory_updated with {len(hosts)} host(s).")
+        except Exception as exc:
+            log.error(f"IAC: Failed to emit iac:inventory_updated: {exc}")
 
     # ------------------------------------------------------------------
     # Notification helpers — use messaging:outbound instead of system:notify

@@ -165,9 +165,9 @@ function Modal({ title, onClose, children, width = 720 }: {
         background: 'var(--lx-elevated-glass, var(--lx-elevated))', border: '1px solid var(--lx-border)',
         borderRadius: 'var(--lx-radius-lg)', overflow: 'hidden',
       }}>
-        <div style={{
+        <div className="lx-card" style={{
           display: 'flex', alignItems: 'center', gap: '0.75rem', padding: '0.75rem 1rem',
-          borderBottom: '1px solid var(--lx-border-soft)', background: 'var(--lx-surface-glass, var(--lx-surface))', backdropFilter: 'blur(16px) saturate(160%)', WebkitBackdropFilter: 'blur(16px) saturate(160%)',
+          borderBottom: '1px solid var(--lx-border-soft)',
         }}>
           <span style={{ fontWeight: 700, color: 'var(--lx-text)' }}>{title}</span>
           <button onClick={onClose} style={{ marginLeft: 'auto', background: 'none', border: 'none', color: 'var(--lx-text-muted)', cursor: 'pointer', fontSize: '1.1rem' }}>✕</button>
@@ -282,9 +282,9 @@ function LogViewer({ jobId, onClose }: { jobId: number; onClose: () => void }) {
         background: 'var(--lx-elevated-glass, var(--lx-elevated))', border: '1px solid var(--lx-border)',
         borderRadius: 'var(--lx-radius-lg)', overflow: 'hidden',
       }}>
-        <div style={{
+        <div className="lx-card" style={{
           display: 'flex', alignItems: 'center', gap: '0.75rem', padding: '0.75rem 1rem', flexWrap: 'wrap',
-          borderBottom: '1px solid var(--lx-border-soft)', background: 'var(--lx-surface-glass, var(--lx-surface))', backdropFilter: 'blur(16px) saturate(160%)', WebkitBackdropFilter: 'blur(16px) saturate(160%)',
+          borderBottom: '1px solid var(--lx-border-soft)',
         }}>
           <span style={{ fontWeight: 700, color: 'var(--lx-accent)' }}>{t('log.title', { defaultValue: 'Live Logs · Job #{{id}}', id: jobId })}</span>
           <input className="lx-input lx-mono iac-search" value={grep} onChange={(e) => setGrep(e.target.value)} placeholder={t('log.grepPlaceholder', { defaultValue: 'grep…' })} style={{ marginLeft: 'auto', width: 200 }} />
@@ -608,10 +608,8 @@ function Overview({ statsTick, isRunning, jobs, runningCount, onNavigate }: {
         {stats.by_phase.map((p) => {
           const c = stemColor(p.color)
           return (
-            <div key={p.phase} style={{
-              border: `1px solid var(--lx-border-soft)`,
+            <div key={p.phase} className="lx-card" style={{
               borderTop: `2px solid ${c}`, borderRadius: 'var(--lx-radius-sm)', padding: '0.75rem',
-              background: 'var(--lx-surface-glass, var(--lx-surface))', backdropFilter: 'blur(16px) saturate(160%)', WebkitBackdropFilter: 'blur(16px) saturate(160%)',
             }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                 <span style={{ fontSize: '0.8rem', fontWeight: 700, color: 'var(--lx-text)' }}>{p.label}</span>
@@ -1228,10 +1226,9 @@ function NavTile({ icon, label, value, sub, accent, onClick, badge }: {
   accent?: string; onClick: () => void; badge?: React.ReactNode
 }) {
   return (
-    <button className="iac-nav-tile" onClick={onClick} style={{
+    <button className="iac-nav-tile lx-card" onClick={onClick} style={{
       display: 'flex', flexDirection: 'column', gap: 6,
       padding: '1rem', width: '100%', textAlign: 'left', cursor: 'pointer',
-      background: 'var(--lx-surface-glass, var(--lx-surface))', backdropFilter: 'blur(16px) saturate(160%)', WebkitBackdropFilter: 'blur(16px) saturate(160%)', border: '1px solid var(--lx-border-soft)',
       borderRadius: 'var(--lx-radius-md)', transition: 'border-color 0.18s, background 0.18s',
     }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>

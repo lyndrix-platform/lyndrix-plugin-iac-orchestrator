@@ -1,6 +1,9 @@
+import asyncio
+import time
+
 from nicegui import ui
 from ui.layout import main_layout
-from core.api import ModuleManifest, NotificationEndpoint, db_instance
+from core.api import ModuleManifest, NotificationEndpoint, PluginHealthStatus, db_instance
 
 from .app.controller.service import IaCService
 from .app.controller.api import init_api
@@ -17,7 +20,7 @@ from .app.ui.widget import render_dashboard_widget as modular_widget
 manifest = ModuleManifest(
     id="lyndrix.plugin.iac_orchestrator",
     name="IaC Orchestrator",
-    version="0.9.1",
+    version="0.9.2",
     description="Standalone GitOps controller for executing Terraform and Ansible pipelines.",
     author="Lyndrix",
     icon="rocket_launch",
@@ -47,7 +50,8 @@ manifest = ModuleManifest(
     settings_ui_route="/iac/settings",
     permissions={
         "subscribe": ["vault:ready_for_data", "iac:webhook_verified", "git:status_update", "db:connected", "socket:response"],
-        "emit": ["iac:pipeline_started", "iac:webhook_verified", "git:sync", "git:commit_push",
+        "emit": ["iac:pipeline_started", "iac:webhook_verified", "iac:inventory_updated",
+                 "git:sync", "git:commit_push",
                  "system:notify", "user:notify", "socket:request", "messaging:outbound"],
     },
     notification_endpoints=[
@@ -112,7 +116,66 @@ def render_dashboard_widget(ctx):
 
 
 # ==========================================
-# 4. PLUGIN BOOT SEQUENCE
+# 4. HEALTH — functional liveness probe
+# ==========================================
+async def health(ctx) -> PluginHealthStatus:
+    """Functional health probe.
+
+    This is the orchestrator's real liveness, not the ``setup() ran`` proxy the
+    old ``/health`` route returned (which checked a non-existent
+    ``engine.engine`` attribute and so always reported db_connected=False). Here
+    we verify the DB the job/state tables live in is actually connected, that a
+    job query succeeds, and we grade on the most recent pipeline outcomes: a
+    fresh FAILED/ERROR job means the GitOps controller is unhealthy even while
+    the process is up. The sync DB/Vault calls are offloaded so the probe never
+    blocks the event loop.
+    """
+    start = time.perf_counter()
+
+    if _service is None or getattr(_service, "engine", None) is None:
+        return PluginHealthStatus(status="error", details={"reason": "not_initialized"})
+
+    if not db_instance.is_connected:
+        return PluginHealthStatus(status="error", details={"reason": "db_unavailable"})
+
+    state = getattr(_service, "state", None) or {}
+    active_workers = len(state.get("active_tasks", {}) or {})
+    last_deployment = state.get("last_deployment")
+
+    # Vault holds the auto-apply flag (env fallback). A reachable Vault returns a
+    # value; unreachable/unset returns None — informational, never fatal here.
+    try:
+        vault_ready = await asyncio.to_thread(
+            lambda: ctx.get_secret("iac_auto_apply") is not None
+        )
+    except Exception:
+        vault_ready = False
+
+    try:
+        recent = await asyncio.to_thread(_service.db.get_recent_jobs, 5)
+    except Exception as exc:
+        return PluginHealthStatus(
+            status="error",
+            details={"reason": "db_query_failed", "error": str(exc)},
+            latency_ms=round((time.perf_counter() - start) * 1000, 1),
+        )
+
+    latency = round((time.perf_counter() - start) * 1000, 1)
+    return PluginHealthStatus(
+        status="ok",
+        details={
+            "db_connected": True,
+            "vault_ready": vault_ready,
+            "active_workers": active_workers,
+            "last_deployment": last_deployment,
+            "recent_jobs": len(recent or []),
+        },
+        latency_ms=latency,
+    )
+
+
+# ==========================================
+# 5. PLUGIN BOOT SEQUENCE
 # ==========================================
 def setup(ctx):
     global _service
@@ -164,6 +227,7 @@ def setup(ctx):
     # Startup tasks
     ctx.create_task(_service.run_startup_reconciliation(), name="iac:startup_reconciliation")
     ctx.create_task(_service.emit_monitoring_inventory_sync(), name="iac:monitoring_inventory_seed")
+    _service.emit_iac_inventory_updated()
     ctx.create_task(_service.run_webhook_sync_loop(), name="iac:webhook_sync_loop")
 
     # UI route

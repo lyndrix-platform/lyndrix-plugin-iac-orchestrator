@@ -142,6 +142,10 @@ class IaCService:
         """Delegate to the engine."""
         await self.engine.emit_monitoring_inventory_sync()
 
+    def emit_iac_inventory_updated(self):
+        """Emit generic host inventory event so subscribed plugins can self-register."""
+        self.engine.emit_iac_inventory_updated()
+
     async def run_webhook_sync_loop(self):
         """Self-healing GitLab webhook registration.
 
