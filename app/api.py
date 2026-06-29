@@ -177,6 +177,14 @@ def build_plugin_router(service) -> APIRouter:
         identity: ApiIdentity = Depends(require_permission("api:write")),
     ):
         return await _api.do_sync_webhooks_authed()
+
+    @router.post("/maintenance/clear-stats")
+    async def clear_stats(identity: ApiIdentity = Depends(require_permission("api:write"))):
+        return await _api.do_clear_stats()
+
+    @router.post("/maintenance/sync-repos")
+    async def sync_repos(identity: ApiIdentity = Depends(require_permission("api:write"))):
+        return await _api.do_sync_repos()
     @router.post("/deploy/service/{service_name}")
     async def deploy_service(
         service_name: str,

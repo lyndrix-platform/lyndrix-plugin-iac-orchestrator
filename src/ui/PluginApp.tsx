@@ -1089,6 +1089,7 @@ function SettingsPage({ confirm, toast }: { confirm: ConfirmFn; toast: ToastFn }
   const [error, setError] = useState<string | null>(null)
   const [tokenInfo, setTokenInfo] = useState<{ configured: boolean; masked: string } | null>(null)
   const [tokenReveal, setTokenReveal] = useState<string | null>(null)
+  const [isSyncing, setIsSyncing] = useState(false)
 
   useEffect(() => {
     iacApi.getSettings().then(setCfg).catch((e) => setError(e instanceof Error ? e.message : t('settings.loadError', { defaultValue: 'Einstellungen konnten nicht geladen werden' })))
@@ -1204,6 +1205,55 @@ function SettingsPage({ confirm, toast }: { confirm: ConfirmFn; toast: ToastFn }
 
           {/* Schema-driven sections: Ansible, Terraform, Repository Roles + credentials. */}
           <AdvancedSettings toast={toast} confirm={confirm} />
+
+          <SectionCard title={t('settings.maintenance', { defaultValue: 'Maintenance' })}>
+            <div style={{ display: 'grid', gap: '1rem' }}>
+              <div>
+                <div style={{ fontSize: '0.78rem', fontWeight: 600, color: 'var(--lx-text)', marginBottom: 4 }}>
+                  {t('settings.syncReposTitle', { defaultValue: 'Sync Core Repositories' })}
+                </div>
+                <div style={{ fontSize: '0.66rem', color: 'var(--lx-text-muted)', marginBottom: 8 }}>
+                  {t('settings.syncReposDesc', { defaultValue: 'Pulls the latest commits for iac_controller, inventory_state, config_engine and aac_factory. Safe to run while idle.' })}
+                </div>
+                <Button
+                  label={isSyncing ? t('settings.syncReposBusy', { defaultValue: 'Syncing…' }) : t('settings.syncReposBtn', { defaultValue: 'Sync Repositories' })}
+                  icon="sync"
+                  disabled={isSyncing}
+                  onClick={() => {
+                    setIsSyncing(true)
+                    iacApi.syncRepos()
+                      .then((r) => toast(r.message ?? t('settings.syncReposQueued', { defaultValue: 'Repository sync started.' })))
+                      .catch((e) => toast(e instanceof Error ? e.message : t('settings.syncReposError', { defaultValue: 'Sync fehlgeschlagen' }), 'err'))
+                      .finally(() => setTimeout(() => setIsSyncing(false), 3000))
+                  }}
+                />
+              </div>
+
+              <div style={{ borderTop: '1px solid var(--lx-border-soft)', paddingTop: '1rem' }}>
+                <div style={{ fontSize: '0.78rem', fontWeight: 600, color: 'var(--lx-state-down)', marginBottom: 4 }}>
+                  {t('settings.clearStatsTitle', { defaultValue: 'Clear Statistics' })}
+                </div>
+                <div style={{ fontSize: '0.66rem', color: 'var(--lx-text-muted)', marginBottom: 8 }}>
+                  {t('settings.clearStatsDesc', { defaultValue: 'Deletes all finished job records from the database. Running jobs are preserved. This resets the Overview KPIs and charts.' })}
+                </div>
+                <Button
+                  label={t('settings.clearStatsBtn', { defaultValue: 'Clear Stats' })}
+                  icon="delete_sweep"
+                  variant="danger"
+                  onClick={() => confirm({
+                    title: t('settings.clearStatsConfirmTitle', { defaultValue: 'Clear all statistics?' }),
+                    body: t('settings.clearStatsConfirmBody', { defaultValue: 'This permanently deletes all finished job records. Running jobs are kept. The Overview KPIs and charts will reset to zero.' }),
+                    confirmLabel: t('settings.clearStatsConfirmLabel', { defaultValue: 'Clear' }),
+                    onConfirm: () => {
+                      iacApi.clearStats()
+                        .then((r) => toast(t('settings.clearStatsOk', { defaultValue: '{{count}} job record(s) cleared.', count: r.deleted })))
+                        .catch((e) => toast(e instanceof Error ? e.message : t('settings.clearStatsError', { defaultValue: 'Löschen fehlgeschlagen' }), 'err'))
+                    },
+                  })}
+                />
+              </div>
+            </div>
+          </SectionCard>
         </div>
       )}
     </div>

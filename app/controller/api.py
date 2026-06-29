@@ -1415,6 +1415,27 @@ async def do_generate_webhook_token():
     return {"status": "ok", "token": new_token}
 
 
+async def do_clear_stats():
+    """Clear job history records (keeps RUNNING jobs intact) and reset last_deployment state."""
+    if not _service or not _engine:
+        raise HTTPException(status_code=503, detail="Orchestrator not initialized")
+    deleted = await asyncio.to_thread(_engine.db.clear_all_jobs, True)
+    if deleted < 0:
+        raise HTTPException(status_code=500, detail="Failed to clear statistics (see logs)")
+    _service.state["last_deployment"] = "N/A"
+    return {"status": "ok", "deleted": deleted}
+
+
+async def do_sync_repos():
+    """Trigger a background sync of all core repositories (iac_controller, inventory_state, …)."""
+    if not _ctx or not _service or not _engine:
+        raise HTTPException(status_code=503, detail="Orchestrator not initialized")
+    if _service.state.get("is_running"):
+        raise HTTPException(status_code=409, detail="A pipeline is already running — try again afterwards")
+    _ctx.create_task(_engine.sync_core_repos())
+    return {"status": "accepted", "message": "Repository sync started in background"}
+
+
 async def do_sync_webhooks_authed():
     """Auth'd, idempotent re-registration of the group webhooks (Settings button)."""
     if not _ctx:

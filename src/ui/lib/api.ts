@@ -281,4 +281,10 @@ export const iacApi = {
   // Short-lived ticket so the SSE/raw-log URLs never carry the bearer token.
   streamTicket: () =>
     pluginApi.post<{ ticket: string; expires_in: number }>('stream/ticket'),
+
+  // Maintenance actions (ported from the NiceGUI settings page).
+  clearStats: () =>
+    pluginApi.post<{ status: string; deleted: number }>('maintenance/clear-stats'),
+  syncRepos: () =>
+    pluginApi.post<AcceptedResponse>('maintenance/sync-repos'),
 }
