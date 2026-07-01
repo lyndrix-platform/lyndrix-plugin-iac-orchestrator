@@ -771,6 +771,7 @@ class ComplianceStrategy(PipelineStrategy):
 
 
 class InfraPlanStrategy(PipelineStrategy):
+    sync_infra_engine = True
     commit_state = False
 
     def build_stages(self, engine, payload, context):
@@ -778,6 +779,8 @@ class InfraPlanStrategy(PipelineStrategy):
 
 
 class InfraApplyStrategy(PipelineStrategy):
+    sync_infra_engine = True
+
     def build_stages(self, engine, payload, context):
         return [InfraApplyStage(), DynamicRuleExecutionStage("infra_apply")]
 
