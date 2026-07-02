@@ -285,6 +285,8 @@ export const iacApi = {
   // Maintenance actions (ported from the NiceGUI settings page).
   clearStats: () =>
     pluginApi.post<{ status: string; deleted: number }>('maintenance/clear-stats'),
+  clearFailedJobs: () =>
+    pluginApi.post<{ status: string; deleted: number }>('maintenance/clear-failed-jobs'),
   syncRepos: () =>
     pluginApi.post<AcceptedResponse>('maintenance/sync-repos'),
 }

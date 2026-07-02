@@ -1426,6 +1426,16 @@ async def do_clear_stats():
     return {"status": "ok", "deleted": deleted}
 
 
+async def do_clear_failed_jobs():
+    """Delete only failed/errored/aborted job records, leaving successful and running jobs intact."""
+    if not _service or not _engine:
+        raise HTTPException(status_code=503, detail="Orchestrator not initialized")
+    deleted = await asyncio.to_thread(_engine.db.clear_failed_jobs)
+    if deleted < 0:
+        raise HTTPException(status_code=500, detail="Failed to clear failed jobs (see logs)")
+    return {"status": "ok", "deleted": deleted}
+
+
 async def do_sync_repos():
     """Trigger a background sync of all core repositories (iac_controller, inventory_state, …)."""
     if not _ctx or not _service or not _engine:

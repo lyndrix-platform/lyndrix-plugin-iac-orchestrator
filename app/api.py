@@ -182,6 +182,10 @@ def build_plugin_router(service) -> APIRouter:
     async def clear_stats(identity: ApiIdentity = Depends(require_permission("api:write"))):
         return await _api.do_clear_stats()
 
+    @router.post("/maintenance/clear-failed-jobs")
+    async def clear_failed_jobs(identity: ApiIdentity = Depends(require_permission("api:write"))):
+        return await _api.do_clear_failed_jobs()
+
     @router.post("/maintenance/sync-repos")
     async def sync_repos(identity: ApiIdentity = Depends(require_permission("api:write"))):
         return await _api.do_sync_repos()

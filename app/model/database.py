@@ -208,6 +208,37 @@ class JobDatabase:
             if session:
                 session.close()
 
+    def clear_failed_jobs(self) -> int:
+        """Deletes only job records with a failure status (FAILED, ERROR, ABORTED).
+
+        Running and successful jobs are left untouched. Returns the number of
+        deleted rows (-1 on failure).
+        """
+        session = self._get_session()
+        if not session:
+            return -1
+        try:
+            fail_statuses = ["FAILED", "ERROR", "ABORTED"]
+            job_ids = [
+                j.id for j in session.query(IaCJob)
+                .filter(IaCJob.status.in_(fail_statuses))
+                .all()
+            ]
+            if not job_ids:
+                return 0
+            session.query(IaCJobTask).filter(IaCJobTask.job_id.in_(job_ids)).delete(synchronize_session=False)
+            deleted = session.query(IaCJob).filter(IaCJob.id.in_(job_ids)).delete(synchronize_session=False)
+            session.commit()
+            log.info(f"Cleared {deleted} failed job record(s) from statistics.")
+            return int(deleted or 0)
+        except Exception as e:
+            log.error(f"Failed to clear failed job statistics: {e}")
+            session.rollback()
+            return -1
+        finally:
+            if session:
+                session.close()
+
     def clear_all_jobs(self, keep_running: bool = True) -> int:
         """Deletes job history (the data behind the Overview statistics).
 

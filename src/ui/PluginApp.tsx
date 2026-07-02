@@ -1230,6 +1230,30 @@ function SettingsPage({ confirm, toast }: { confirm: ConfirmFn; toast: ToastFn }
               </div>
 
               <div style={{ borderTop: '1px solid var(--lx-border-soft)', paddingTop: '1rem' }}>
+                <div style={{ fontSize: '0.78rem', fontWeight: 600, color: 'var(--lx-text)', marginBottom: 4 }}>
+                  {t('settings.clearFailedJobsTitle', { defaultValue: 'Clear Failed Jobs' })}
+                </div>
+                <div style={{ fontSize: '0.66rem', color: 'var(--lx-text-muted)', marginBottom: 8 }}>
+                  {t('settings.clearFailedJobsDesc', { defaultValue: 'Removes only FAILED, ERROR and ABORTED job records. Successful and running jobs are kept — useful for clearing test noise.' })}
+                </div>
+                <Button
+                  label={t('settings.clearFailedJobsBtn', { defaultValue: 'Clear Failed Jobs' })}
+                  icon="delete_forever"
+                  variant="danger"
+                  onClick={() => confirm({
+                    title: t('settings.clearFailedJobsConfirmTitle', { defaultValue: 'Clear failed jobs?' }),
+                    body: t('settings.clearFailedJobsConfirmBody', { defaultValue: 'Permanently deletes all FAILED, ERROR and ABORTED job records. Successful and running jobs are not affected.' }),
+                    confirmLabel: t('settings.clearFailedJobsConfirmLabel', { defaultValue: 'Clear Failed' }),
+                    onConfirm: () => {
+                      iacApi.clearFailedJobs()
+                        .then((r) => toast(t('settings.clearFailedJobsOk', { defaultValue: '{{count}} failed job(s) cleared.', count: r.deleted })))
+                        .catch((e) => toast(e instanceof Error ? e.message : t('settings.clearFailedJobsError', { defaultValue: 'Löschen fehlgeschlagen' }), 'err'))
+                    },
+                  })}
+                />
+              </div>
+
+              <div style={{ borderTop: '1px solid var(--lx-border-soft)', paddingTop: '1rem' }}>
                 <div style={{ fontSize: '0.78rem', fontWeight: 600, color: 'var(--lx-state-down)', marginBottom: 4 }}>
                   {t('settings.clearStatsTitle', { defaultValue: 'Clear Statistics' })}
                 </div>
