@@ -228,6 +228,19 @@ export interface AcceptedResponse {
   [k: string]: unknown
 }
 
+export interface PendingPlanEnv {
+  summary: string
+  hosts_to_create: string[]
+  hosts_to_destroy: string[]
+}
+
+export interface PendingPlanResponse {
+  pending: boolean
+  job_id?: number
+  planned_at?: string
+  envs?: Record<string, PendingPlanEnv>
+}
+
 // ─── Typed endpoint helpers ─────────────────────────────────────────────────
 
 export const iacApi = {
@@ -243,6 +256,11 @@ export const iacApi = {
     pluginApi.post<{ status: string; message: string }>(`deploy/service/${name}`, { branch }),
   infraPlan: () => pluginApi.post<AcceptedResponse>('infra/plan'),
   infraApply: () => pluginApi.post<AcceptedResponse>('infra/apply'),
+
+  // Review-and-approve flow: a push/plan with real changes awaits operator approval.
+  pendingPlan: () => pluginApi.get<PendingPlanResponse>('infra/pending-plan'),
+  applyPendingPlan: () => pluginApi.post<AcceptedResponse>('infra/pending-plan/apply'),
+  dismissPendingPlan: () => pluginApi.post<{ status: string }>('infra/pending-plan/dismiss'),
 
   // ── Parity additions ──────────────────────────────────────────────────────
   stats: () => pluginApi.get<OrchestratorStats>('stats'),

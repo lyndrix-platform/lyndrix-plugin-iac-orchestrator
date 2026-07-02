@@ -308,11 +308,16 @@ class InfraPlanStage(BaseStage):
             force_apply=False,
         )
         envs = data.get("environments", 0) if isinstance(data, dict) else 0
-        msg = (
-            f"Infrastructure plan completed across {envs} environment(s)."
-            if success
-            else "Infrastructure plan failed."
-        )
+        pending = data.get("pending_envs", 0) if isinstance(data, dict) else 0
+        if not success:
+            msg = "Infrastructure plan failed."
+        elif pending:
+            msg = (
+                f"Infrastructure plan completed across {envs} environment(s) — "
+                f"{pending} environment(s) have pending changes awaiting approval."
+            )
+        else:
+            msg = f"Infrastructure plan completed across {envs} environment(s) (no changes)."
         return StageResult(success, msg, data=data)
 
 
@@ -332,6 +337,9 @@ class InfraApplyStage(BaseStage):
             job_id=context.get("job_id", 0),
             force_apply=force_apply,
         )
+        # Hand the freshly created hosts to the follow-up bootstrap stage.
+        if isinstance(data, dict):
+            context["created_hosts"] = list(data.get("created_hosts") or [])
         envs = data.get("environments", 0) if isinstance(data, dict) else 0
         msg = (
             f"Infrastructure deploy completed across {envs} environment(s)."
@@ -339,6 +347,38 @@ class InfraApplyStage(BaseStage):
             else "Infrastructure deploy failed."
         )
         return StageResult(success, msg, data=data)
+
+
+class BootstrapNewHostsStage(BaseStage):
+    """After a fleet-wide apply, automatically bootstrap every host whose LXC
+    container was freshly (re)created — a brand-new CT has no ansible-agent yet
+    and would otherwise sit unmanaged until an operator clicks Bootstrap by hand.
+    Each bootstrapped host is then handed to the standard host rollout flow so
+    its services get deployed too (same chain host_provision uses)."""
+
+    def __init__(self):
+        super().__init__("Bootstrap New Hosts")
+
+    async def run(self, engine, context: dict) -> StageResult:
+        hosts = [str(h).strip().lower() for h in (context.get("created_hosts") or []) if str(h).strip()]
+        if not hosts:
+            return StageResult(True, "No newly created hosts; nothing to bootstrap.")
+        log.info("Auto-bootstrap: %d newly created host(s): %s", len(hosts), ", ".join(hosts))
+        failures: list[str] = []
+        for host in hosts:
+            res = await ComplianceBootstrapStage(host_name=host).run(engine, context)
+            if not res.success:
+                failures.append(f"{host}: {res.message}")
+                continue
+            # Queue the standard host-scoped rollout so services follow automatically.
+            await TriggerHostRolloutStage(host_name=host).run(engine, context)
+        if failures:
+            return StageResult(
+                False,
+                f"Auto-bootstrap failed for {len(failures)} of {len(hosts)} new host(s): "
+                + "; ".join(failures),
+            )
+        return StageResult(True, f"Bootstrapped {len(hosts)} new host(s): {', '.join(hosts)}.")
 
 
 class ComplianceBootstrapStage(BaseStage):
@@ -782,7 +822,10 @@ class InfraApplyStrategy(PipelineStrategy):
     sync_infra_engine = True
 
     def build_stages(self, engine, payload, context):
-        return [InfraApplyStage(), DynamicRuleExecutionStage("infra_apply")]
+        # BootstrapNewHostsStage picks up context["created_hosts"] set by the
+        # apply stage, so freshly created CTs get their compliance bootstrap and
+        # host rollout automatically instead of requiring a manual Bootstrap click.
+        return [InfraApplyStage(), BootstrapNewHostsStage(), DynamicRuleExecutionStage("infra_apply")]
 
 
 class RolloutStrategy(PipelineStrategy):
@@ -1758,9 +1801,17 @@ class DeploymentEngine:
         self.state["running_jobs"] = max(0, self.state.get("running_jobs", 0) - 1)
         self.state["is_running"] = self.state["running_jobs"] > 0
 
+    # Extracts the tfvars key (== hostname) from a container resource address like
+    # ``module.lxc_cerberus.proxmox_virtual_environment_container.ct["docker-dev"]``.
+    _TF_CT_HOST_RE = re.compile(r'proxmox_virtual_environment_container\.ct\["([^"]+)"\]')
+
     async def _watch_detached_runner(self, container_name: str, task_name: str, job_id: int):
         successful_hosts, failed_hosts = 0, 0
         containers_created = 0  # Terraform: count freshly (re)created LXC containers
+        created_hosts: list = []      # Terraform apply: hostnames whose CT was (re)created
+        hosts_to_create: list = []    # Terraform plan: hostnames a plan would create/replace
+        hosts_to_destroy: list = []   # Terraform plan: hostnames a plan would destroy
+        plan_summary = ""             # Terraform plan: the "Plan: X to add, ..." line
         log_file = self.config.get_log_path(job_id)
         ansible_progress = 50.0  # Base progress for Ansible phase
         tf_already_running = False  # Proxmox "CT already running" is a non-fatal drift condition
@@ -1801,6 +1852,24 @@ class DeploymentEngine:
                     # Terraform: a fresh LXC container was actually (re)created.
                     if "proxmox_virtual_environment_container.ct[" in decoded and "Creation complete" in decoded:
                         containers_created += 1
+                        m = self._TF_CT_HOST_RE.search(decoded)
+                        if m and m.group(1) not in created_hosts:
+                            created_hosts.append(m.group(1))
+
+                    # Terraform plan lines: capture which hosts a plan would touch, so a
+                    # gated plan can be surfaced for operator review-and-approve.
+                    if "proxmox_virtual_environment_container.ct[" in decoded:
+                        m = self._TF_CT_HOST_RE.search(decoded)
+                        if m:
+                            _h = m.group(1)
+                            if ("will be created" in decoded or "must be replaced" in decoded):
+                                if _h not in hosts_to_create:
+                                    hosts_to_create.append(_h)
+                            elif "will be destroyed" in decoded and _h not in hosts_to_destroy:
+                                hosts_to_destroy.append(_h)
+                    stripped = decoded.strip()
+                    if stripped.startswith("Plan:") and " to add" in stripped:
+                        plan_summary = stripped
 
                     # Terraform state drift: container exists and is already running on Proxmox.
                     # This is the desired end-state — treat it as a non-fatal warning, not a failure.
@@ -1836,7 +1905,15 @@ class DeploymentEngine:
             if "active_tasks" in self.state and task_name in self.state["active_tasks"]:
                 self.state["active_tasks"][task_name]["status"] = "success" if success else "failed"
             await asyncio.create_subprocess_exec("docker", "rm", "-f", container_name)
-            return success, {"successful_hosts": successful_hosts, "failed_hosts": failed_hosts, "containers_created": containers_created}
+            return success, {
+                "successful_hosts": successful_hosts,
+                "failed_hosts": failed_hosts,
+                "containers_created": containers_created,
+                "created_hosts": created_hosts,
+                "hosts_to_create": hosts_to_create,
+                "hosts_to_destroy": hosts_to_destroy,
+                "plan_summary": plan_summary,
+            }
             
         except Exception as e:
             if "active_tasks" in self.state and task_name in self.state["active_tasks"]:
@@ -2303,6 +2380,10 @@ class DeploymentEngine:
             "successful_hosts": 1 if success else 0,
             "failed_hosts": 0 if success else 1,
             "container_created": bool(_stats.get("containers_created", 0)),
+            "created_hosts": _stats.get("created_hosts") or [],
+            "hosts_to_create": _stats.get("hosts_to_create") or [],
+            "hosts_to_destroy": _stats.get("hosts_to_destroy") or [],
+            "plan_summary": _stats.get("plan_summary") or "",
         }
 
     async def execute_terraform_provision(
@@ -2537,6 +2618,8 @@ class DeploymentEngine:
         succeeded = 0
         failed = 0
         skipped = 0
+        created_hosts: list[str] = []
+        pending_envs: dict[str, dict] = {}
         for env_ctx in environments:
             log.info(
                 "Infra %s: environment '%s' (%d host(s))",
@@ -2564,9 +2647,24 @@ class DeploymentEngine:
                     continue
                 log.error("Infra %s failed for env '%s': %s", mode, env_ctx["env_name"], exc)
                 ok = False
+                _stats = {}
             except Exception as exc:  # noqa: BLE001
                 log.error("Infra %s failed for env '%s': %s", mode, env_ctx["env_name"], exc)
                 ok = False
+                _stats = {}
+            if isinstance(_stats, dict):
+                for h in _stats.get("created_hosts") or []:
+                    if h not in created_hosts:
+                        created_hosts.append(h)
+                # A "Plan: X to add, ..." line only appears when resources actually
+                # change (output-only diffs don't print one) — its presence is the
+                # signal that this environment has real changes awaiting approval.
+                if ok and mode == "plan" and _stats.get("plan_summary"):
+                    pending_envs[env_ctx["env_name"]] = {
+                        "summary": _stats.get("plan_summary"),
+                        "hosts_to_create": _stats.get("hosts_to_create") or [],
+                        "hosts_to_destroy": _stats.get("hosts_to_destroy") or [],
+                    }
             if ok:
                 succeeded += 1
             else:
@@ -2576,11 +2674,34 @@ class DeploymentEngine:
             "Infra %s summary: %d ok, %d failed, %d skipped (of %d env).",
             mode, succeeded, failed, skipped, len(environments),
         )
+
+        # Review-and-approve flow: a successful fleet plan with real changes is
+        # persisted as the pending plan (UIs surface an Apply button for it); a
+        # clean plan or a successful apply clears it.
+        if overall_ok:
+            if mode == "plan":
+                if pending_envs:
+                    self.db.update_state("pending_infra_plan", {
+                        "job_id": job_id,
+                        "planned_at": datetime.now(timezone.utc).isoformat(),
+                        "envs": pending_envs,
+                    }, "latest")
+                    log.info(
+                        "Infra plan left %d environment(s) with pending changes — awaiting operator approval.",
+                        len(pending_envs),
+                    )
+                else:
+                    self.db.update_state("pending_infra_plan", {}, "latest")
+            elif mode == "apply":
+                self.db.update_state("pending_infra_plan", {}, "latest")
+
         return overall_ok, {
             "successful_hosts": succeeded,
             "failed_hosts": failed,
             "skipped": skipped,
             "environments": len(environments),
+            "created_hosts": created_hosts,
+            "pending_envs": len(pending_envs),
         }
 
     async def execute_ansible_docker(self, playbook_subpath: str, inventory_subpath: str, limit: str = None, extra_vars: dict = None, task_name: str = "global", job_id: int = 0, ssh_key_secret: str = "ansible_ssh_key", remote_user: str = "ansible-agent"):

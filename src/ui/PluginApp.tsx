@@ -16,6 +16,7 @@ import {
   type IaCSettings,
   type PipelinePayload,
   type SettingField,
+  type PendingPlanResponse,
 } from './lib/api'
 import { useJobsSSE } from './lib/hooks'
 
@@ -1337,6 +1338,91 @@ function ViewHeader({ tab, onBack }: { tab: TabId; onBack: () => void }) {
   )
 }
 
+// ─── Pending infra plan banner (review-and-approve) ───────────────────────────
+
+function PendingPlanBanner({ statsTick, isRunning, confirm, toast, onLogs }: {
+  statsTick: number; isRunning: boolean; confirm: ConfirmFn; toast: ToastFn
+  onLogs: (id: number) => void
+}) {
+  const { t } = useTranslation('iac')
+  const [plan, setPlan] = useState<PendingPlanResponse | null>(null)
+
+  useEffect(() => {
+    let cancelled = false
+    iacApi.pendingPlan()
+      .then((p) => { if (!cancelled) setPlan(p) })
+      .catch(() => { /* banner is best-effort; never block the dashboard */ })
+    return () => { cancelled = true }
+  }, [statsTick])
+
+  if (!plan?.pending) return null
+  const envs = Object.entries(plan.envs || {})
+  const amber = '#f59e0b'
+
+  function applyNow() {
+    confirm({
+      title: t('pendingPlan.applyConfirmTitle', { defaultValue: 'Apply the reviewed plan?' }),
+      body: t('pendingPlan.applyConfirmBody', { defaultValue: 'This runs `tofu apply` across every environment with pending changes. New hosts are bootstrapped and rolled out automatically afterwards.' }),
+      confirmLabel: t('pendingPlan.applyConfirmLabel', { defaultValue: 'Apply Plan' }),
+      onConfirm: () => {
+        iacApi.applyPendingPlan()
+          .then((r) => toast(r.message ?? t('pendingPlan.applyQueued', { defaultValue: 'Approved — infrastructure deploy queued.' })))
+          .catch((e) => toast(e instanceof Error ? e.message : t('pendingPlan.applyError', { defaultValue: 'Apply fehlgeschlagen' }), 'err'))
+      },
+    })
+  }
+  function dismiss() {
+    iacApi.dismissPendingPlan()
+      .then(() => { setPlan({ pending: false }); toast(t('pendingPlan.dismissed', { defaultValue: 'Pending plan dismissed.' })) })
+      .catch((e) => toast(e instanceof Error ? e.message : t('pendingPlan.dismissError', { defaultValue: 'Verwerfen fehlgeschlagen' }), 'err'))
+  }
+
+  return (
+    <div className="lx-card" style={{
+      border: `1px solid color-mix(in srgb, ${amber} 45%, transparent)`,
+      borderLeft: `3px solid ${amber}`,
+      borderRadius: 'var(--lx-radius-md)', padding: '0.85rem 1rem', marginBottom: '1.25rem',
+    }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+        <span className="material-icons" style={{ fontSize: 18, color: amber }}>pending_actions</span>
+        <span style={{ fontSize: '0.82rem', fontWeight: 700, color: 'var(--lx-text)' }}>
+          {t('pendingPlan.title', { defaultValue: 'Infrastructure plan awaiting approval' })}
+        </span>
+        <span style={{ fontSize: '0.64rem', color: 'var(--lx-text-muted)' }}>
+          {plan.planned_at ? new Date(plan.planned_at).toLocaleString() : ''}
+          {plan.job_id ? ` · Job #${plan.job_id}` : ''}
+        </span>
+        <div style={{ marginLeft: 'auto', display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+          {typeof plan.job_id === 'number' && (
+            <Button label={t('pendingPlan.reviewLogs', { defaultValue: 'Review Logs' })} icon="plagiarism" onClick={() => onLogs(plan.job_id as number)} />
+          )}
+          <Button label={t('pendingPlan.dismiss', { defaultValue: 'Dismiss' })} icon="close" onClick={dismiss} />
+          <Button label={t('pendingPlan.apply', { defaultValue: 'Apply Plan' })} icon="rocket_launch" variant="danger" disabled={isRunning} onClick={applyNow}
+            title={isRunning ? t('pendingPlan.busy', { defaultValue: 'A pipeline is running' }) : t('pendingPlan.applyTitle', { defaultValue: 'Approve and apply this plan fleet-wide' })} />
+        </div>
+      </div>
+      <div style={{ display: 'grid', gap: 4, marginTop: 8 }}>
+        {envs.map(([env, info]) => (
+          <div key={env} style={{ display: 'flex', alignItems: 'baseline', gap: 8, flexWrap: 'wrap', fontSize: '0.7rem' }}>
+            <span style={{ fontFamily: 'monospace', fontWeight: 700, color: amber }}>{env}</span>
+            <span style={{ color: 'var(--lx-text-muted)' }}>{info.summary}</span>
+            {info.hosts_to_create.length > 0 && (
+              <span style={{ color: 'var(--lx-state-up)' }}>
+                {t('pendingPlan.newHosts', { defaultValue: '+ new: {{hosts}}', hosts: info.hosts_to_create.join(', ') })}
+              </span>
+            )}
+            {info.hosts_to_destroy.length > 0 && (
+              <span style={{ color: 'var(--lx-state-down)' }}>
+                {t('pendingPlan.destroyHosts', { defaultValue: '− destroy: {{hosts}}', hosts: info.hosts_to_destroy.join(', ') })}
+              </span>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
 function Dashboard() {
   const { t } = useTranslation('iac')
   const { snapshot, connected, error } = useJobsSSE()
@@ -1413,6 +1499,8 @@ function Dashboard() {
       </div>
 
       {error && <ErrorBox msg={error} />}
+
+      <PendingPlanBanner statsTick={statsTick} isRunning={isRunning} confirm={confirm} toast={toast} onLogs={setLogJob} />
 
       {tab !== 'overview' && <ViewHeader tab={tab} onBack={() => setTab('overview')} />}
 

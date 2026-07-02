@@ -217,6 +217,28 @@ def build_plugin_router(service) -> APIRouter:
     async def infra_plan(identity: ApiIdentity = Depends(require_permission("api:write"))):
         return await _api.do_trigger_infra_plan()
 
+    # ── Pending plan review-and-approve flow ─────────────────────────────────
+    @router.get("/infra/pending-plan")
+    async def get_pending_plan(
+        identity: ApiIdentity = Depends(require_permission("api:read")),
+    ):
+        return await _api.do_get_pending_plan()
+
+    # Approving a pending plan IS a fleet-wide apply, so it carries the same
+    # high-privilege permission as /infra/apply.
+    @router.post("/infra/pending-plan/apply")
+    async def apply_pending_plan(
+        identity: ApiIdentity = Depends(require_permission("api:write")),
+        _apply: ApiIdentity = Depends(require_permission("iac:infra_apply")),
+    ):
+        return await _api.do_apply_pending_plan()
+
+    @router.post("/infra/pending-plan/dismiss")
+    async def dismiss_pending_plan(
+        identity: ApiIdentity = Depends(require_permission("api:write")),
+    ):
+        return await _api.do_dismiss_pending_plan()
+
     # Fleet-wide `tofu apply` can create/change/DESTROY real infrastructure, so it
     # requires a dedicated high-privilege permission in addition to generic write —
     # operating a single service must not implicitly grant destroying the fleet.

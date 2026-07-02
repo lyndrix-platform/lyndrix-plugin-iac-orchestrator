@@ -704,6 +704,59 @@ async def do_trigger_infra_apply():
     return {"status": "accepted", "message": "Infrastructure deploy queued."}
 
 
+# ── Pending infra plan (review-and-approve flow) ────────────────────────────
+# A successful fleet plan with real resource changes persists a
+# "pending_infra_plan" record (see engine.execute_terraform_infra). The UIs
+# surface it with an Apply button; a successful apply clears it automatically.
+
+async def do_get_pending_plan():
+    """Returns the pending infra plan awaiting operator approval (if any)."""
+    if not _engine:
+        raise HTTPException(status_code=503, detail="Orchestrator not initialized")
+    record = await asyncio.to_thread(_engine.db.get_state, "pending_infra_plan")
+    data = (record or {}).get("data") or {}
+    if not data.get("envs"):
+        return {"pending": False}
+    return {
+        "pending": True,
+        "job_id": data.get("job_id"),
+        "planned_at": data.get("planned_at"),
+        "envs": data.get("envs") or {},
+    }
+
+
+async def do_apply_pending_plan():
+    """Approves the pending plan: triggers the fleet apply (approve=True)."""
+    if not _ctx or not _engine:
+        raise HTTPException(status_code=503, detail="Orchestrator not initialized")
+    record = await asyncio.to_thread(_engine.db.get_state, "pending_infra_plan")
+    data = (record or {}).get("data") or {}
+    if not data.get("envs"):
+        raise HTTPException(status_code=409, detail="No pending infrastructure plan to apply")
+    payload = {
+        "pipeline_type": "infra_apply",
+        "approve": True,
+        "manual": True,
+        "trigger": "pending_plan_approval",
+        "plan_job_id": data.get("job_id"),
+    }
+    _ctx.emit("iac:webhook_verified", payload)
+    _emit_webhook_verified(payload)
+    return {
+        "status": "accepted",
+        "message": "Approved — infrastructure deploy queued.",
+        "plan_job_id": data.get("job_id"),
+    }
+
+
+async def do_dismiss_pending_plan():
+    """Dismisses the pending plan without applying it."""
+    if not _engine:
+        raise HTTPException(status_code=503, detail="Orchestrator not initialized")
+    await asyncio.to_thread(_engine.db.update_state, "pending_infra_plan", {}, "latest")
+    return {"status": "ok"}
+
+
 async def do_list_jobs(limit: int = 20):
     """Returns a list of recent and active jobs."""
     if not _engine:

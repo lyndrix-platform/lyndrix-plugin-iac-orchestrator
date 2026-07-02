@@ -210,9 +210,10 @@ class DynamicRuleExecutionStage(BaseStage):
         intent = "apply-eligible (gated by auto_apply)" if apply else "plan-only"
         log.info(f"Terraform rule -> {intent} for changed host(s): {', '.join(hosts)}")
         adopt = bool(action.get("adopt_existing", False))
+        created_hosts: list[str] = []
         for host in hosts:
             try:
-                ok, _ = await engine.execute_terraform_provision(
+                ok, stats = await engine.execute_terraform_provision(
                     host_name=host,
                     job_id=context.get("job_id", 0),
                     mode=mode,            # 'plan' is a hard gate; 'apply' still needs auto_apply/approve
@@ -223,6 +224,19 @@ class DynamicRuleExecutionStage(BaseStage):
                 return StageResult(False, f"Terraform {verb} failed for '{host}': {e}")
             if not ok:
                 return StageResult(False, f"Terraform {verb} failed for host '{host}'.")
+            if isinstance(stats, dict) and stats.get("container_created"):
+                created_hosts.append(host)
+        # A rule-driven apply that actually created a CT must bootstrap it too —
+        # a fresh container has no ansible-agent and would sit unmanaged otherwise.
+        # (Lazy import: engine.py imports this module at load time.)
+        if created_hosts:
+            from ..app.controller.engine import ComplianceBootstrapStage, TriggerHostRolloutStage
+            log.info(f"Terraform rule created {len(created_hosts)} host(s); auto-bootstrapping: {', '.join(created_hosts)}")
+            for host in created_hosts:
+                res = await ComplianceBootstrapStage(host_name=host).run(engine, context)
+                if not res.success:
+                    return StageResult(False, f"Auto-bootstrap failed for new host '{host}': {res.message}")
+                await TriggerHostRolloutStage(host_name=host).run(engine, context)
         return StageResult(True, f"Terraform {verb} completed for {len(hosts)} host(s).")
 
     async def _run_service_rollout_action(self, engine, context, action, changed_services, path_vars):

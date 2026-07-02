@@ -212,6 +212,64 @@ def render_terraform_panel(ctx, service):
                         ],
                     ).props("unelevated rounded size=sm")
 
+        # Pending infra plan (review-and-approve): a push/plan with real changes
+        # persisted a pending record — surface it with Apply/Dismiss actions.
+        pending_record = service.engine.db.get_state("pending_infra_plan") or {}
+        pending = (pending_record.get("data") or {})
+        if pending.get("envs"):
+            def _apply_pending():
+                _emit({
+                    "pipeline_type": "infra_apply",
+                    "approve": True,
+                    "manual": True,
+                    "trigger": "pending_plan_approval",
+                    "plan_job_id": pending.get("job_id"),
+                })
+                ui.notify("Approved — infrastructure deploy queued.", type="positive")
+
+            def _dismiss_pending():
+                service.engine.db.update_state("pending_infra_plan", {}, "latest")
+                ui.notify("Pending plan dismissed.", type="info")
+                _panel.refresh()
+
+            with ui.card().classes(
+                f"{UIStyles.CARD_BASE} w-full border border-amber-500/40 border-l-4 border-l-amber-500"
+            ):
+                with ui.row().classes("w-full items-center gap-2 flex-wrap"):
+                    ui.icon("pending_actions", size="20px").classes("text-amber-400")
+                    ui.label("Infrastructure plan awaiting approval").classes(
+                        "text-sm font-bold text-slate-100"
+                    )
+                    _meta = []
+                    if pending.get("planned_at"):
+                        _meta.append(str(pending["planned_at"])[:19].replace("T", " "))
+                    if pending.get("job_id"):
+                        _meta.append(f"Job #{pending['job_id']}")
+                    if _meta:
+                        ui.label(" · ".join(_meta)).classes("text-xs text-slate-500")
+                    with ui.row().classes("ml-auto items-center gap-2"):
+                        ui.button("Dismiss", icon="close", on_click=_dismiss_pending).props(
+                            "flat rounded size=sm color=zinc"
+                        )
+                        ui.button(
+                            "Apply Plan", icon="rocket_launch", color="amber",
+                            on_click=_apply_pending,
+                        ).props("unelevated rounded size=sm").bind_enabled_from(
+                            state, "is_running", backward=lambda x: not x
+                        )
+                for env_name, info in (pending.get("envs") or {}).items():
+                    with ui.row().classes("items-baseline gap-2 flex-wrap"):
+                        ui.label(env_name).classes("text-xs font-mono font-bold text-amber-400")
+                        ui.label(str(info.get("summary") or "")).classes("text-xs text-slate-400")
+                        if info.get("hosts_to_create"):
+                            ui.label("+ new: " + ", ".join(info["hosts_to_create"])).classes(
+                                "text-xs text-emerald-400"
+                            )
+                        if info.get("hosts_to_destroy"):
+                            ui.label("− destroy: " + ", ".join(info["hosts_to_destroy"])).classes(
+                                "text-xs text-red-400"
+                            )
+
         # Header + actions
         with ui.row().classes("w-full justify-between items-end"):
             c.section_header(
