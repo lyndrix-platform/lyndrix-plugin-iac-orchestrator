@@ -1570,11 +1570,27 @@ class DeploymentEngine:
         future = asyncio.get_event_loop().create_future()
         self.pending_syncs[request_id] = (role_slug, future)
 
+        raw_config = self.ctx.get_secret(f"repo_{role_slug}_config")
+        auth_type = "none"
+        secret_value = None
+        if raw_config:
+            try:
+                cfg = json.loads(raw_config)
+                url = cfg.get("url", "")
+                token_key = cfg.get("token_key", "")
+                if token_key:
+                    secret_value = self.ctx.get_secret(token_key)
+                    auth_type = "ssh" if url.startswith("git@") else "token"
+            except Exception:
+                pass
+
         self.ctx.emit("git:commit_push", {
             "request_id": request_id,
             "repo_id": role_slug,
             "message": message,
-            "is_local": False
+            "is_local": False,
+            "auth_type": auth_type,
+            "secret_value": secret_value,
         })
         try: return (await asyncio.wait_for(future, timeout=240.0)).get("status", "failed")
         except asyncio.TimeoutError: return "timeout"
