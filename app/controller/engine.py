@@ -147,7 +147,7 @@ class NativeGenerateStage:
         try:
             await engine._generate_inventory_and_snapshot(context.get("job_id", 0))
             await engine.emit_monitoring_inventory_sync()
-            engine.emit_iac_inventory_updated()
+            await engine.emit_iac_inventory_updated()
             return StageResult(True, "Native artifacts generated.")
         except Exception as e:
             return StageResult(False, f"Native generation failed: {e}")
@@ -1126,40 +1126,158 @@ class DeploymentEngine:
     # Generic inventory event — consumed by any interested plugin
     # ------------------------------------------------------------------
 
-    def emit_iac_inventory_updated(self) -> None:
-        """Emit ``iac:inventory_updated`` with the current managed host list.
+    # Credentials never leave the plugin on the bus: the merged terraform block
+    # can carry the Proxmox password/token and the SSH key.
+    _TERRAFORM_SECRET_KEYS = {"password", "token", "ssh_key", "api_token", "secret", "private_key"}
 
-        The payload is intentionally generic — groups, roles, and IPs — so any
-        plugin can subscribe and apply its own filtering logic without the
-        orchestrator needing to know about that plugin.
+    @classmethod
+    def _public_terraform(cls, block: dict | None) -> dict:
+        """Copy of a host's terraform block without any credential-like keys."""
+        out: dict = {}
+        for key, value in (block or {}).items():
+            lk = str(key).lower()
+            if (
+                lk in cls._TERRAFORM_SECRET_KEYS
+                or "password" in lk
+                or "secret" in lk
+                or lk.endswith("_token")
+                or lk.endswith("_key")
+            ):
+                continue
+            out[key] = value
+        return out
+
+    def _build_inventory_hosts(self) -> list[dict]:
+        """Generic host list from the generated inventory (sync — YAML read)."""
+        inventory = self._load_generated_inventory()
+        if not inventory:
+            return []
+        all_hosts = (inventory.get("all") or {}).get("hosts") or {}
+        children = (inventory.get("all") or {}).get("children") or {}
+
+        host_groups: dict[str, list[str]] = {}
+        for group_name, group_data in children.items():
+            for host_name in (group_data.get("hosts") or {}).keys():
+                host_groups.setdefault(host_name, []).append(group_name)
+
+        hosts: list[dict] = []
+        for host_name, host_data in all_hosts.items():
+            groups = sorted(
+                set(host_groups.get(host_name, [])) | set(host_data.get("ansible_groups") or [])
+            )
+            is_hypervisor = (
+                "physical_infrastructure" in groups or host_data.get("type") == "hypervisor"
+            )
+            hosts.append({
+                "name": host_name,
+                "hostname": host_data.get("hostname") or host_name,
+                "ip": host_data.get("ansible_host"),
+                "groups": groups,
+                "baseline_roles": host_data.get("baseline_roles") or [],
+                "terraform": self._public_terraform(host_data.get("terraform")),
+                "entity_type": "hypervisor" if is_hypervisor else "host",
+                "site": next((g[len("site_"):] for g in groups if g.startswith("site_")), None),
+                "stage": next((g[len("stage_"):] for g in groups if g.startswith("stage_")), None),
+                "ci_id": None,  # filled in by the Entity Registry when it is present
+            })
+        return hosts
+
+    async def _attach_ci_ids(self, hosts: list[dict]) -> None:
+        """Ask the Entity Registry for every host's CI UUID (best effort).
+
+        Identifiers: ``iac.host`` (inventory key), ``pve.vm`` (node/vmid for
+        managed guests — survives a rename) and ``fqdn``. No registry → no
+        ci_id; the next publish fills it in.
+        """
+        request = getattr(self.ctx, "request", None)
+        if request is None:  # core API < 1.4
+            return
+        items = []
+        for host in hosts:
+            tf = host.get("terraform") or {}
+            identifiers = {"iac.host": host["name"]}
+            if tf.get("node_name") and tf.get("vm_id"):
+                identifiers["pve.vm"] = f"{tf['node_name']}/{tf['vm_id']}"
+            if "." in (host.get("hostname") or ""):
+                identifiers["fqdn"] = host["hostname"]
+            attributes = {
+                k: v for k, v in {
+                    "ip": host.get("ip"), "site": host.get("site"),
+                    "stage": host.get("stage"), "groups": host.get("groups"),
+                }.items() if v
+            }
+            items.append({
+                "entity_type": host["entity_type"], "identifiers": identifiers,
+                "display_name": host["name"], "attributes": attributes,
+                "source": "iac-orchestrator",
+            })
+        reply = await request(
+            "entity_registry:identify", {"items": items},
+            reply_topic="entity_registry:identified", timeout=10,
+        )
+        if not reply or not reply.get("ok"):
+            log.info("IAC: Entity Registry not available — inventory published without ci_id.")
+            return
+        conflicts = 0
+        for host, result in zip(hosts, reply.get("results") or []):
+            if result.get("ok"):
+                host["ci_id"] = result.get("uuid")
+                conflicts += 1 if result.get("conflict") else 0
+            else:
+                log.warning(f"IAC: Entity Registry rejected host '{host['name']}': {result.get('error')}")
+        if conflicts:
+            log.warning(
+                f"IAC: Entity Registry reported {conflicts} identity conflict(s) — "
+                "review them in the Registry UI."
+            )
+
+    def _register_servers(self, hosts: list[dict]) -> None:
+        """Push every host into the Server Manager (read-only there, we are the SSoT)."""
+        for host in hosts:
+            tf = host.get("terraform") or {}
+            if host["entity_type"] == "hypervisor":
+                server_type = "physical"
+            elif tf.get("vm_id"):
+                server_type = "container"  # Proxmox LXC — the IaC default guest type
+            else:
+                server_type = "vm"
+            self.ctx.emit("server_manager:register_server", {
+                "source": "iac-orchestrator",
+                "external_id": host["name"],
+                "name": host["name"],
+                "hostname": host.get("hostname"),
+                "environment_id": f"{host.get('site') or 'unknown'}:{host.get('stage') or 'prod'}",
+                "server_type": server_type,
+                "status": "active",
+                "writeback": False,
+                "ci_id": host.get("ci_id"),
+                "tags": sorted(
+                    g for g in host.get("groups", []) if not g.startswith(("site_", "stage_"))
+                )[:25],
+                "notes": "Managed by the IaC orchestrator (SSoT) — edit in the IaC repository.",
+            })
+
+    async def emit_iac_inventory_updated(self) -> None:
+        """Publish the current managed host list.
+
+        1. ``iac:inventory_updated`` — generic ``{hosts: [...]}`` for any plugin
+           (docker-manager, monitoring, ...), now with the Entity Registry
+           ``ci_id`` per host and WITHOUT credentials in ``terraform``.
+        2. ``server_manager:register_server`` per host — the Server Manager
+           lists IaC hosts read-only, keyed by (iac-orchestrator, <host key>).
+        Both degrade gracefully when the target plugin is absent.
         """
         try:
-            inventory = self._load_generated_inventory()
-            if not inventory:
+            hosts = await asyncio.to_thread(self._build_inventory_hosts)
+            if not hosts:
                 return
-            all_hosts = (inventory.get("all") or {}).get("hosts") or {}
-            children = (inventory.get("all") or {}).get("children") or {}
-
-            host_groups: dict[str, list[str]] = {}
-            for group_name, group_data in children.items():
-                for host_name in (group_data.get("hosts") or {}).keys():
-                    host_groups.setdefault(host_name, []).append(group_name)
-
-            hosts = [
-                {
-                    "name": host_name,
-                    "hostname": host_data.get("hostname") or host_name,
-                    "ip": host_data.get("ansible_host"),
-                    "groups": sorted(host_groups.get(host_name, [])),
-                    "baseline_roles": host_data.get("baseline_roles") or [],
-                    "terraform": host_data.get("terraform") or {},
-                }
-                for host_name, host_data in all_hosts.items()
-            ]
+            await self._attach_ci_ids(hosts)
             self.ctx.emit("iac:inventory_updated", {"hosts": hosts})
-            log.debug(f"IAC: Emitted iac:inventory_updated with {len(hosts)} host(s).")
+            self._register_servers(hosts)
+            with_ci = sum(1 for h in hosts if h.get("ci_id"))
+            log.debug(f"IAC: Published inventory — {len(hosts)} host(s), {with_ci} with ci_id.")
         except Exception as exc:
-            log.error(f"IAC: Failed to emit iac:inventory_updated: {exc}")
+            log.error(f"IAC: Failed to publish inventory: {exc}")
 
     # ------------------------------------------------------------------
     # Notification helpers — use messaging:outbound instead of system:notify

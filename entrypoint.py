@@ -20,12 +20,12 @@ from .app.ui.widget import render_dashboard_widget as modular_widget
 manifest = ModuleManifest(
     id="lyndrix.plugin.iac_orchestrator",
     name="IaC Orchestrator",
-    version="1.1.2",
+    version="1.2.0",
     description="Standalone GitOps controller for executing Terraform and Ansible pipelines.",
     author="Lyndrix",
     icon="rocket_launch",
     type="PLUGIN",
-    min_core_version="0.1.1",
+    min_core_version="1.4.0",
     auto_enable_on_install=True,
     repo_url="https://github.com/lyndrix-platform/lyndrix-plugin-iac-orchestrator",
     # Identity 2.0: fine-grained infra-apply permission (replaces the old
@@ -84,8 +84,10 @@ manifest = ModuleManifest(
     ],
     settings_ui_route="/iac/settings",
     permissions={
-        "subscribe": ["vault:ready_for_data", "iac:webhook_verified", "git:status_update", "db:connected", "socket:response"],
+        "subscribe": ["vault:ready_for_data", "iac:webhook_verified", "git:status_update", "db:connected", "socket:response",
+                      "entity_registry:identified"],
         "emit": ["iac:pipeline_started", "iac:webhook_verified", "iac:inventory_updated",
+                 "entity_registry:identify", "server_manager:register_server",
                  "git:sync", "git:commit_push",
                  "system:notify", "user:notify", "socket:request", "messaging:outbound"],
     },
@@ -262,7 +264,7 @@ def setup(ctx):
     # Startup tasks
     ctx.create_task(_service.run_startup_reconciliation(), name="iac:startup_reconciliation")
     ctx.create_task(_service.emit_monitoring_inventory_sync(), name="iac:monitoring_inventory_seed")
-    _service.emit_iac_inventory_updated()
+    ctx.create_task(_service.emit_iac_inventory_updated(), name="iac:inventory_publish")
     ctx.create_task(_service.run_webhook_sync_loop(), name="iac:webhook_sync_loop")
 
     # UI route

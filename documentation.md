@@ -87,6 +87,7 @@ Alle Routen unter `/api/plugins/lyndrix.plugin.iac_orchestrator/` erfordern eine
 | subscribe | `iac:webhook_verified` | Verifizierter Webhook — Pipeline starten |
 | subscribe | `git:status_update` | Git-Sync-Status-Update |
 | subscribe | `socket:response` | Socket-Antwort empfangen |
+| subscribe | `entity_registry:identified` | Antwort der Entity Registry auf `entity_registry:identify` (Request/Response via `ctx.request`) |
 | emit | `iac:pipeline_started` | Pipeline wurde gestartet |
 | emit | `iac:webhook_verified` | Webhook akzeptiert und weitergeleitet |
 | emit | `git:sync` | Git-Sync anfordern |
@@ -94,8 +95,32 @@ Alle Routen unter `/api/plugins/lyndrix.plugin.iac_orchestrator/` erfordern eine
 | emit | `system:notify` | Plattform-Benachrichtigung |
 | emit | `user:notify` | Benutzer-Benachrichtigung |
 | emit | `monitoring:inventory_sync` | Inventar-Sync an Monitoring-Plugin |
+| emit | `iac:inventory_updated` | Generische Host-Liste `{hosts: [...]}` für alle interessierten Plugins — je Host `name`, `hostname`, `ip`, `groups`, `baseline_roles`, `terraform` (**ohne** Zugangsdaten), `entity_type`, `site`, `stage`, `ci_id` |
+| emit | `entity_registry:identify` | Batch-Anfrage an die Entity Registry: UUID je Host über `iac.host`, `pve.vm` (`node/vmid`), `fqdn` |
+| emit | `server_manager:register_server` | Je Host ein Upsert im Server-Manager (`source=iac-orchestrator`, `external_id=<Host-Key>`, `writeback=false` → dort schreibgeschützt, mit `ci_id`) |
 | emit | `socket:request` | Socket-Anfrage senden |
 | emit | `messaging:outbound` | Ausgehende Nachricht über Messaging Gateway |
+
+### Inventar-Veröffentlichung
+
+Nach jeder Inventar-Generierung (und beim Start) veröffentlicht der Orchestrator die Host-Liste
+aus `inventory_state/global/ansible/inventory.yml`:
+
+1. **Zugangsdaten werden entfernt.** Der zusammengeführte `terraform`-Block eines Hosts kann
+   Proxmox-Passwort/-Token und den SSH-Key enthalten; alle Schlüssel, die `password`, `secret`,
+   `*_token` oder `*_key` heißen (sowie `token`, `ssh_key`, `api_token`, `private_key`), gehen
+   nicht auf den Bus.
+2. **CI-UUIDs.** Über `ctx.request("entity_registry:identify", {items})` erhält jeder Host seine
+   Entity-Registry-UUID (`ci_id`). Hypervisoren (`physical_infrastructure` bzw. `type: hypervisor`)
+   werden als `hypervisor`, alles andere als `host` identifiziert. Fehlt die Registry (Timeout),
+   bleibt `ci_id` leer — der nächste Lauf holt es nach.
+3. **Server-Manager.** Jeder Host wird per `server_manager:register_server` eingespielt:
+   `environment_id = <site>:<stage>` (aus den Gruppen `site_*`/`stage_*`), `server_type`
+   `physical` (Hypervisor) / `container` (Gast mit `vm_id`) / `vm`, `writeback=false`, Tags = Gruppen.
+   Die Datensätze sind dort schreibgeschützt — Änderungen gehören ins IaC-Repository.
+
+Voraussetzung: Core-API ≥ 1.4 (`ctx.request`); ohne Registry- bzw. Server-Manager-Plugin laufen
+die Schritte ins Leere, der Orchestrator selbst bleibt unbeeinträchtigt.
 
 ---
 

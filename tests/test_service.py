@@ -5,9 +5,7 @@ These tests verify that IaCService can be constructed with a minimal stub
 context (matching the ModuleContext interface) without raising errors.
 No database or plugin runtime is required.
 """
-import asyncio
-from types import SimpleNamespace
-from unittest.mock import MagicMock, AsyncMock, patch
+from unittest.mock import MagicMock
 
 
 def _make_stub_ctx():
@@ -31,7 +29,7 @@ def _make_stub_ctx():
 
 def test_iac_service_construction():
     """IaCService must compose without raising given a valid stub context."""
-    from app.controller.service import IaCService
+    from iac_plugin.app.controller.service import IaCService
 
     ctx = _make_stub_ctx()
     service = IaCService(ctx)
@@ -45,7 +43,7 @@ def test_iac_service_construction():
 
 def test_iac_service_has_required_methods():
     """IaCService must expose the expected public interface."""
-    from app.controller.service import IaCService
+    from iac_plugin.app.controller.service import IaCService
 
     ctx = _make_stub_ctx()
     service = IaCService(ctx)
@@ -65,7 +63,7 @@ def test_iac_service_has_required_methods():
 
 def test_iac_service_initial_state():
     """The shared state dict must be pre-populated with the expected keys."""
-    from app.controller.service import IaCService
+    from iac_plugin.app.controller.service import IaCService
 
     ctx = _make_stub_ctx()
     service = IaCService(ctx)
