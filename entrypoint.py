@@ -20,12 +20,18 @@ from .app.ui.widget import render_dashboard_widget as modular_widget
 manifest = ModuleManifest(
     id="lyndrix.plugin.iac_orchestrator",
     name="IaC Orchestrator",
-    version="1.2.0",
+    version="1.3.0",
     description="Standalone GitOps controller for executing Terraform and Ansible pipelines.",
     author="Lyndrix",
     icon="rocket_launch",
     type="PLUGIN",
     min_core_version="1.4.0",
+    # Cluster placement (core API ≥ 1.7, ignored by older cores): the orchestrator
+    # needs the Docker socket, git working trees and job logs of ONE host — it runs
+    # only on instances with LYNDRIX_INSTANCE_ROLES including "runner"; the other
+    # instances answer 503 "remote" for its routes (route /api/plugins/<id>/* and
+    # the webhooks to the runner at the load balancer). Single mode has every role.
+    placement="pinned:runner",
     auto_enable_on_install=True,
     repo_url="https://github.com/lyndrix-platform/lyndrix-plugin-iac-orchestrator",
     # Identity 2.0: fine-grained infra-apply permission (replaces the old

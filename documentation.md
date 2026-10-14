@@ -35,6 +35,26 @@ lyndrix-plugin-iac-orchestrator/
 
 ---
 
+## Cluster-Platzierung (Core-API ≥ 1.7)
+
+Der Orchestrator ist **hostgebunden**: Docker-Socket, Git-Working-Trees unter
+`/data/storage/git_repos`, Job-Logs und Terraform-Provider liegen auf genau einem Host. Das
+Manifest deklariert deshalb `placement="pinned:runner"`:
+
+- `setup()` läuft nur auf Core-Instanzen, deren `LYNDRIX_INSTANCE_ROLES` die Rolle `runner`
+  enthält (im Single-Modus hat eine Instanz alle Rollen — nichts ändert sich).
+- Alle anderen Instanzen registrieren das Plugin als `remote`: seine Routen antworten dort mit
+  `503` und `X-Plugin-Runtime: {"phase": "remote", "role": "runner"}`, die React-Shell zeigt
+  „läuft auf der Runner-Instanz“.
+- Der Load Balancer sollte `/api/plugins/lyndrix.plugin.iac_orchestrator/*` sowie die
+  öffentlichen Webhook-Routen auf die Runner-Instanz leiten (Core-Doku *High Availability →
+  Building blocks → Plugin artifacts & placement*). Der Preflight des Cores meldet `fail`, wenn
+  kein lebender Runner existiert.
+- Noch offen (Core-Fahrplan M4): `owner_instance` auf Jobs, Trigger von API-Instanzen per
+  Cluster-Event, Job-Logs in DB/Shared Storage — damit ein Runner-Wechsel ohne Job-Verlust geht.
+
+---
+
 ## API-Referenz
 
 ### Öffentliche Routen (kein Core-Auth)
