@@ -1846,6 +1846,85 @@ class DeploymentEngine:
             self.db.update_job(job_id, final_status)
             await self._close_log_writer(job_id)
 
+    async def finalize_from_containers(self, job_id: int, *, reason: str = "runner restarted") -> bool:
+        """A job whose runner process died (self-deploy, restart) may still have
+        its ``aac-runner-*`` containers on this host: re-attach to running ones,
+        read the exit code of finished ones, append their log tail to the job log
+        and close the row. Returns True when the job was handled here."""
+        if not shutil.which("docker"):
+            return False
+        try:
+            ps = await asyncio.create_subprocess_exec(
+                "docker", "ps", "-a", "--filter", f"label=iac_job_id={job_id}",
+                "--format", "{{.ID}}\t{{.Names}}\t{{.State}}\t{{.Label \"iac_task_name\"}}",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+            )
+            out, _ = await ps.communicate()
+        except Exception as exc:
+            log.debug(f"finalize_from_containers: docker ps failed: {exc}")
+            return False
+        rows = [ln.split("\t") for ln in out.decode(errors="replace").splitlines() if ln.strip()]
+        if not rows:
+            return False
+
+        running = [r for r in rows if len(r) >= 3 and r[2] == "running"]
+        if running:
+            # Still executing: re-attach exactly like the startup reconciliation does.
+            for cid, name, _state, *rest in running:
+                task_name = (rest[0] if rest and rest[0] else name.replace("aac-runner-", ""))
+                self.state.setdefault("active_tasks", {})
+                self.state["active_tasks"].setdefault(task_name, {"status": "running_ansible", "logs": [], "job_id": job_id})
+                self._sync_runners(job_id, force=True)
+                self.ctx.create_task(self._reconcile_and_finalize(name, task_name, job_id),
+                                     name=f"iac:reconcile:{job_id}:{task_name}")
+            log.info(f"RECOVERY: job #{job_id} — re-attached to {len(running)} running container(s) after {reason}.")
+            return True
+
+        # Everything finished while nobody watched: decide from the exit codes.
+        success = True
+        for cid, name, _state, *rest in rows:
+            task_name = (rest[0] if rest and rest[0] else name.replace("aac-runner-", ""))
+            try:
+                insp = await asyncio.create_subprocess_exec(
+                    "docker", "inspect", "--format", "{{.State.ExitCode}}", cid,
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+                )
+                code_out, _ = await insp.communicate()
+                exit_code = int(code_out.decode().strip() or "1")
+            except Exception:
+                exit_code = 1
+            try:
+                lg = await asyncio.create_subprocess_exec(
+                    "docker", "logs", "--tail", "400", cid,
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+                )
+                log_out, _ = await lg.communicate()
+                for line in log_out.decode(errors="replace").splitlines():
+                    if line.strip():
+                        self._log_line(job_id, f"[{task_name}] {line.rstrip()}")
+            except Exception:
+                pass
+            self._log_line(job_id, f"[SYSTEM] Runner container '{name}' finished with exit code {exit_code} "
+                                   f"while the orchestrator was {reason} — recovered from the container.")
+            success = success and exit_code == 0
+            try:
+                rm = await asyncio.create_subprocess_exec("docker", "rm", "-f", cid,
+                                                          stdout=asyncio.subprocess.DEVNULL,
+                                                          stderr=asyncio.subprocess.DEVNULL)
+                await rm.wait()
+            except Exception:
+                pass
+
+        final = "SUCCESS" if success else "FAILED"
+        self.db.update_progress(job_id, progress=100 if success else None,
+                                current_step="Recovered after runner restart" + ("" if success else " (failed)"))
+        self.db.update_job(job_id, final)
+        await self._close_log_writer(job_id)
+        self._notify(f"Pipeline #{job_id}", f"Recovered after runner restart: {final}.",
+                     "positive" if success else "negative", notification_id=f"job_{job_id}")
+        log.info(f"RECOVERY: job #{job_id} closed as {final} from {len(rows)} finished container(s).")
+        return True
+
     async def abort_job(self, job_id: int, *, reason: str = "Aborted by User") -> int:
         """Kill this host's runner containers of ``job_id`` and close its row as ABORTED.
         Returns the number of containers removed."""
@@ -2097,9 +2176,13 @@ class DeploymentEngine:
     async def _reconcile_and_finalize(self, c_name: str, task_name: str, job_id: int):
         """Wrapper to safely close out a recovered job in the database after the runner finishes."""
         success, _ = await self._watch_detached_runner(c_name, task_name, job_id)
-        
+
         if job_id != 0:
+            # The row may already have been closed as FAILED by an orphan sweep while
+            # this container was still running — a successful container wins then.
             job = next((j for j in self.db.get_jobs_by_status("RUNNING") if j.id == job_id), None)
+            if job is None and success:
+                job = next((j for j in self.db.get_jobs_by_status("FAILED") if j.id == job_id), None)
             if job:
                 final_status = "SUCCESS" if success else "FAILED"
                 self.state["last_deployment"] = final_status

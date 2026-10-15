@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.1] - 2026-10-15
+
+### Fixed
+- **A job interrupted by a runner restart (self-deploy of the Lyndrix stack) is no longer
+  marked FAILED although its Ansible run succeeded.** The worker's orphan sweep ran six
+  seconds after boot, before the coordinator listed the restarted instance, and judged the
+  instance's own job orphaned. Now: own jobs are never orphan candidates, the first sweep
+  waits 90 s, the live-instance set is only trusted once it contains this instance, and a
+  job whose runner process died is closed from its ``aac-runner-*`` containers (re-attach
+  while running, exit code + log tail when finished — `finalize_from_containers`) before
+  "Runner lost" is ever written. A successful container also wins over a row that was
+  closed as FAILED meanwhile.
+
 ## [1.4.0] - 2026-10-15
 
 ### Changed

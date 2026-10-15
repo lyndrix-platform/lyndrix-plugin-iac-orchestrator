@@ -287,42 +287,65 @@ class JobQueue:
         finally:
             session.close()
 
-    def fail_orphans(self, alive_instances: set[str] | None, stale_seconds: int = 180) -> list[int]:
-        """RUNNING jobs whose runner is gone → FAILED.
+    def orphan_candidates(self, alive_instances: set[str] | None, stale_seconds: int = 180,
+                          self_instance: str | None = None) -> list[dict]:
+        """RUNNING jobs whose runner looks gone: owner not among the live instances
+        (when the caller knows them) or heartbeat older than ``stale_seconds``.
 
-        A job is orphaned when its owner is not among the live instances (when
-        the caller knows them) or its heartbeat is older than ``stale_seconds``.
-        Rows without an owner (pre-1.4 or resumed legacy jobs) are left alone —
-        the owning runner's startup reconciliation handles those.
+        Never this instance's own jobs (``self_instance``) — those are handled by
+        its worker/startup reconciliation, and right after a restart the
+        coordinator may not list this instance yet. Rows without an owner (pre-1.4
+        or resumed legacy jobs) are left alone as well.
         """
         session = self._session()
         if not session:
             return []
-        failed: list[int] = []
         try:
             cutoff = datetime.now() - timedelta(seconds=stale_seconds)
             rows = session.execute(
                 select(IaCJob.id, IaCJob.owner_instance, IaCJob.heartbeat_at)
                 .where(IaCJob.status == STATUS_RUNNING, IaCJob.owner_instance.isnot(None))
             ).all()
+            out = []
             for job_id, owner, hb in rows:
+                if self_instance and owner == self_instance:
+                    continue
                 dead_owner = alive_instances is not None and owner not in alive_instances
                 stale = hb is not None and hb.replace(tzinfo=None) < cutoff
                 if dead_owner or stale:
-                    session.execute(
-                        update(IaCJob).where(IaCJob.id == job_id, IaCJob.status == STATUS_RUNNING)
-                        .values(status=STATUS_FAILED, end_time=datetime.now(),
-                                current_step=f"Runner '{owner}' lost")
-                    )
-                    failed.append(int(job_id))
-            if failed:
-                session.commit()
-                log.warning("QUEUE: marked orphaned job(s) FAILED: %s", failed)
-        except Exception as exc:
-            session.rollback()
-            log.debug("QUEUE: orphan sweep failed: %s", exc)
+                    out.append({"id": int(job_id), "owner_instance": owner, "heartbeat_at": hb})
+            return out
         finally:
             session.close()
+
+    def mark_failed(self, job_id: int, reason: str) -> bool:
+        """RUNNING → FAILED with ``reason`` as the last step (no-op when not RUNNING)."""
+        session = self._session()
+        if not session:
+            return False
+        try:
+            res = session.execute(
+                update(IaCJob).where(IaCJob.id == job_id, IaCJob.status == STATUS_RUNNING)
+                .values(status=STATUS_FAILED, end_time=datetime.now(), current_step=reason[:250])
+            )
+            session.commit()
+            return res.rowcount == 1
+        except Exception as exc:
+            session.rollback()
+            log.debug("QUEUE: mark_failed failed: %s", exc)
+            return False
+        finally:
+            session.close()
+
+    def fail_orphans(self, alive_instances: set[str] | None, stale_seconds: int = 180,
+                     self_instance: str | None = None) -> list[int]:
+        """Mark every orphan candidate FAILED ("Runner '<owner>' lost")."""
+        failed = []
+        for row in self.orphan_candidates(alive_instances, stale_seconds, self_instance):
+            if self.mark_failed(row["id"], f"Runner '{row['owner_instance']}' lost"):
+                failed.append(row["id"])
+        if failed:
+            log.warning("QUEUE: marked orphaned job(s) FAILED: %s", failed)
         return failed
 
     def own_running(self, instance_id: str) -> list[IaCJob]:
@@ -622,7 +645,8 @@ class JobWorker:
 
     def __init__(self, ctx, queue: JobQueue, run_job, *, max_parallel: int = 3,
                  poll_seconds: float = 2.0, heartbeat_seconds: float = 10.0,
-                 orphan_sweep_seconds: float = 60.0, stale_seconds: int = 180):
+                 orphan_sweep_seconds: float = 60.0, stale_seconds: int = 180,
+                 first_sweep_delay: float = 90.0, finalize_orphan=None):
         self.ctx = ctx
         self.queue = queue
         self.run_job = run_job
@@ -631,11 +655,19 @@ class JobWorker:
         self.heartbeat_seconds = heartbeat_seconds
         self.orphan_sweep_seconds = orphan_sweep_seconds
         self.stale_seconds = stale_seconds
+        # The first sweep waits: right after a (re)start the coordinator does not list
+        # every live instance yet, and a job this host was running may still have a
+        # container going — finalize it from its exit code instead of failing it.
+        self.first_sweep_delay = first_sweep_delay
+        # async (job_id, owner) -> bool: True when the job was finalized from a local
+        # runner container (exit code), so it must NOT be marked "Runner lost".
+        self.finalize_orphan = finalize_orphan
         self.tasks: dict[int, asyncio.Task] = {}
         self._wake = asyncio.Event()
         self._stopped = False
         self._tick_task: asyncio.Task | None = None
         self._hb_task: asyncio.Task | None = None
+        self._started_at = time.monotonic()
 
     # -- lifecycle ---------------------------------------------------------
     def start(self) -> None:
@@ -658,7 +690,7 @@ class JobWorker:
 
     # -- loops --------------------------------------------------------------
     async def _loop(self) -> None:
-        last_sweep = 0.0
+        last_sweep = self._started_at - self.orphan_sweep_seconds + self.first_sweep_delay
         while not self._stopped:
             try:
                 self.tasks = {j: t for j, t in self.tasks.items() if not t.done()}
@@ -671,7 +703,7 @@ class JobWorker:
                     self.tasks[job_id] = self.ctx.create_task(self._run(job_id, payload), name=f"iac:job:{job_id}")
                 if time.monotonic() - last_sweep >= self.orphan_sweep_seconds:
                     last_sweep = time.monotonic()
-                    await asyncio.to_thread(self.queue.fail_orphans, self._alive_instances(), self.stale_seconds)
+                    await self.sweep_orphans()
             except Exception as exc:
                 self.ctx.log.warning(f"WORKER: loop error: {exc}")
             try:
@@ -698,15 +730,42 @@ class JobWorker:
                 except Exception as exc:
                     self.ctx.log.debug(f"WORKER: heartbeat failed: {exc}")
 
+    async def sweep_orphans(self) -> list[int]:
+        """RUNNING jobs of dead/stale runners: finalize from a local container when
+        possible, otherwise FAILED "Runner '<owner>' lost". Returns the failed ids."""
+        candidates = await asyncio.to_thread(
+            self.queue.orphan_candidates, self._alive_instances(), self.stale_seconds, self.ctx.instance_id,
+        )
+        failed: list[int] = []
+        for row in candidates:
+            if self.owns(row["id"]):
+                continue
+            if self.finalize_orphan is not None:
+                try:
+                    if await self.finalize_orphan(row["id"], row["owner_instance"]):
+                        continue
+                except Exception as exc:
+                    self.ctx.log.debug(f"WORKER: finalize of orphan #{row['id']} failed: {exc}")
+            if await asyncio.to_thread(self.queue.mark_failed, row["id"], f"Runner '{row['owner_instance']}' lost"):
+                failed.append(row["id"])
+        if failed:
+            self.ctx.log.warning(f"WORKER: marked orphaned job(s) FAILED: {failed}")
+        return failed
+
     def _alive_instances(self) -> set[str] | None:
-        """Live instance ids from the core (API ≥ 1.7.1), else ``None`` (heartbeat-only sweep)."""
+        """Live instance ids from the core (API ≥ 1.7.1), else ``None`` (heartbeat-only
+        sweep). Also ``None`` while the coordinator does not list THIS instance yet —
+        its view is not trustworthy right after a (re)start."""
         instances = getattr(self.ctx, "cluster_instances", None)
         if not instances:
             return None
         try:
-            return {i["instance_id"] for i in instances if i.get("alive")}
+            alive = {i["instance_id"] for i in instances if i.get("alive")}
         except Exception:
             return None
+        if self.ctx.instance_id not in alive:
+            return None
+        return alive
 
     def owns(self, job_id: int) -> bool:
         return job_id in self.tasks and not self.tasks[job_id].done()

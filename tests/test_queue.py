@@ -210,3 +210,59 @@ def test_worker_claims_and_runs_jobs(q):
     with queue_mod.db_instance.SessionLocal() as s:
         assert {s.get(IaCJob, a).status, s.get(IaCJob, b).status} == {"SUCCESS"}
         assert s.get(IaCJob, a).owner_instance == "runner-x"
+
+
+# --- orphan sweep: never own jobs, finalize hook first --------------------------
+
+def test_orphan_candidates_skip_own_instance_and_mark_failed(q):
+    a = q.enqueue({"pipeline_type": "connectivity"})
+    b = q.enqueue({"pipeline_type": "connectivity"})
+    q.claim_next("me")
+    q.claim_next("other")
+    # "other" is not alive; "me" is excluded by self_instance even though not in the alive set
+    cands = q.orphan_candidates({"someone-else"}, 180, self_instance="me")
+    assert [c["id"] for c in cands] == [b]
+    assert q.mark_failed(b, "Runner 'other' lost") is True
+    assert q.mark_failed(b, "again") is False  # no longer RUNNING
+    with queue_mod.db_instance.SessionLocal() as s:
+        assert s.get(IaCJob, a).status == "RUNNING" and s.get(IaCJob, b).status == "FAILED"
+
+
+def test_worker_sweep_uses_finalize_hook_before_failing(q):
+    a = q.enqueue({"pipeline_type": "connectivity"})
+    b = q.enqueue({"pipeline_type": "connectivity"})
+    q.claim_next("dead-1")
+    q.claim_next("dead-2")
+    finalized = []
+
+    async def finalize(job_id, owner):
+        finalized.append((job_id, owner))
+        if job_id == a:  # pretend a's containers were found and closed
+            with queue_mod.db_instance.SessionLocal() as s:
+                s.execute(update(IaCJob).where(IaCJob.id == a).values(status="SUCCESS"))
+                s.commit()
+            return True
+        return False
+
+    async def noop(payload, job_id):
+        return None
+
+    async def scenario():
+        w = JobWorker(_Ctx(), q, noop, finalize_orphan=finalize)
+        return await w.sweep_orphans()
+
+    failed = asyncio.run(scenario())
+    assert failed == [b] and sorted(finalized) == sorted([(a, "dead-1"), (b, "dead-2")])
+    with queue_mod.db_instance.SessionLocal() as s:
+        assert s.get(IaCJob, a).status == "SUCCESS" and s.get(IaCJob, b).status == "FAILED"
+
+
+def test_alive_set_untrusted_until_it_lists_this_instance(q):
+    class _Ctx2(_Ctx):
+        cluster_instances = [{"instance_id": "someone", "roles": ["api"], "alive": True, "is_self": False}]
+
+    async def noop(payload, job_id):
+        return None
+
+    assert JobWorker(_Ctx2(), q, noop)._alive_instances() is None
+    assert JobWorker(_Ctx(), q, noop)._alive_instances() == {"runner-x"}

@@ -97,7 +97,8 @@ class IaCService:
             max_parallel = int(str(self.ctx.get_secret("iac_max_parallel_jobs") or "3").strip() or "3")
         except (ValueError, Exception):
             max_parallel = 3
-        self.worker = JobWorker(self.ctx, self.queue, self.run_claimed, max_parallel=max_parallel)
+        self.worker = JobWorker(self.ctx, self.queue, self.run_claimed, max_parallel=max_parallel,
+                                finalize_orphan=self._finalize_orphan)
         self.worker.start()
         log.info(f"IaC Orchestrator: job worker started on '{getattr(self.ctx, 'instance_id', 'local')}' "
                  f"(max {max_parallel} parallel).")
@@ -106,6 +107,12 @@ class IaCService:
         if self.worker is not None:
             await self.worker.stop()
             self.worker = None
+
+    async def _finalize_orphan(self, job_id: int, owner: str | None) -> bool:
+        """Orphan sweep hook: the dead owner may have been THIS host's previous
+        process (restart, self-deploy, or the former combined api+runner instance)
+        — its runner containers are still here, so close the job from them."""
+        return await self.engine.finalize_from_containers(job_id, reason=f"restarted (owner '{owner}')")
 
     async def run_claimed(self, payload: dict, job_id: int):
         """Execute a job this instance's worker claimed."""
@@ -299,6 +306,14 @@ class IaCService:
                 t.get("job_id") == job.id
                 for t in self.engine.state.get("active_tasks", {}).values()
             ):
+                # The runner process died mid-job (restart / self-deploy). Its containers
+                # may have finished meanwhile — close the job from their exit codes
+                # before giving up on it.
+                try:
+                    if await self.engine.finalize_from_containers(job.id, reason="restarted"):
+                        continue
+                except Exception as exc:
+                    log.debug(f"IaC Orchestrator: container recovery for job #{job.id} failed: {exc}")
                 log.warning(
                     f"IaC Orchestrator: Job #{job.id} is RUNNING but has no active runners. Marking as FAILED."
                 )
