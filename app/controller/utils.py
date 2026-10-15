@@ -18,10 +18,16 @@ class StageResult:
         self.data = data or {}
 
 class JobFileLogBridge(logging.Handler):
-    def __init__(self, log_path: Path, job_id: int | None = None):
+    """Persists one job's engine log records to its host file and, when a ``sink``
+    is given (``JobLogWriter.append``), to the shared database as well — the file
+    stays for host-side debugging, the database is what every cluster instance
+    serves to the UI."""
+
+    def __init__(self, log_path: Path, job_id: int | None = None, sink=None):
         super().__init__()
         self.log_path = log_path
         self.job_id = job_id
+        self.sink = sink
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         self.setFormatter(logging.Formatter('%(message)s'))
 
@@ -35,8 +41,14 @@ class JobFileLogBridge(logging.Handler):
             return
         log_entry = self.format(record)
         component = record.name.split(':')[-1]
+        line = f"[{component}] {log_entry}"
         try:
             with open(self.log_path, 'a', encoding='utf-8') as f:
-                f.write(f"[{component}] {log_entry}\n")
+                f.write(line + "\n")
         except Exception:
             pass
+        if self.sink is not None:
+            try:
+                self.sink(line)
+            except Exception:
+                pass

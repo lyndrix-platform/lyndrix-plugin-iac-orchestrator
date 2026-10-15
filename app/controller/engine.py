@@ -17,6 +17,7 @@ import re
 
 from ...stages.base import BaseStage
 from .utils import StageResult, JobFileLogBridge, current_job_id as _job_id_ctxvar
+from .queue import JobLogWriter
 from ...stages.git import (
     SyncRepoStage,
     CommitPushStage,
@@ -921,6 +922,12 @@ class DeploymentEngine:
         # Held only around generation; deploys then read an immutable per-job snapshot.
         self._shared_state_lock = asyncio.Lock()
         ctx.subscribe("git:status_update")(self._on_git_status)
+        # Cluster control plane (plugin ≥ 1.4): the shared JobQueue (set by the
+        # service) receives log lines and runner snapshots so every instance can
+        # show them; per-job log writers and the last runner push per job.
+        self.queue = None
+        self._log_writers: dict[int, "JobLogWriter"] = {}
+        self._runners_last_push: dict[int, float] = {}
 
     def get_default_ansible_stages(self, pipeline_type: str = "connectivity"):
         if pipeline_type == "rollout":
@@ -1332,7 +1339,12 @@ class DeploymentEngine:
         )
         self.ctx.emit("messaging:outbound", msg.model_dump(mode="json"))
 
-    async def run_pipeline(self, payload: dict):
+    async def run_pipeline(self, payload: dict, job_id: int | None = None):
+        """Execute a pipeline. ``job_id`` is set when a :class:`JobWorker` claimed a
+        QUEUED row (cluster control plane) — the row then already exists and is
+        RUNNING; without it (legacy direct call) the job row is created here."""
+        if job_id and (payload.get("pipeline_type") == "repo_sync"):
+            return await self._run_repo_sync_job(job_id)
         if not payload.get("pipeline_type") and payload.get("object_kind") == "push":
             name, ref = payload.get("project", {}).get("name"), payload.get("ref", "")
             if name and ref.startswith("refs/heads/"):
@@ -1366,15 +1378,15 @@ class DeploymentEngine:
                     if not incoming_limit or incoming_limit == "all":
                         # Global (no-limit) rollout: block if ANY rollout is in flight.
                         log.warning("ENGINE: A rollout is already in progress — global rollout blocked.")
-                        return
+                        return self._skip_claimed(job_id, "a rollout is already in progress")
                     # Host-scoped rollout: block if the SAME host is already rolling out.
                     if rollout_key in active_rollout_types:
                         log.warning(f"ENGINE: Rollout for host '{incoming_limit}' is already running — duplicate blocked.")
-                        return
+                        return self._skip_claimed(job_id, f"rollout for '{incoming_limit}' already running")
                     # Also block if a global (no-limit) rollout is in flight to avoid conflicts.
                     if "rollout:all" in active_rollout_types or "rollout" in active_rollout_types:
                         log.warning(f"ENGINE: Global rollout in progress — host rollout for '{incoming_limit}' blocked.")
-                        return
+                        return self._skip_claimed(job_id, "global rollout in progress")
                 self._active_rollout_keys.add(rollout_key)
             if pipeline_type == "single_service":
                 service_name = str(payload.get("service_name") or "").strip().lower()
@@ -1384,16 +1396,16 @@ class DeploymentEngine:
                     if single_key in self._active_single_service_keys:
                         log.warning(f"ENGINE: Duplicate single_service pipeline ignored for '{service_name}' (in-memory lock).")
                         self._notify("Pipeline Ignored", f"A deployment for {service_name} is already being started.", "warning")
-                        return
+                        return self._skip_claimed(job_id, f"deployment for {service_name} already starting")
 
                     active_service_jobs = [
                         j for j in self.db.get_jobs_by_status("RUNNING")
-                        if j.pipeline_type == single_key
+                        if j.pipeline_type == single_key and j.id != job_id
                     ]
                     if active_service_jobs:
                         log.warning(f"ENGINE: Duplicate single_service pipeline ignored for '{service_name}'.")
                         self._notify("Pipeline Ignored", f"A deployment for {service_name} is already running.", "warning")
-                        return
+                        return self._skip_claimed(job_id, f"deployment for {service_name} already running")
 
                     self._active_single_service_keys.add(single_key)
             if pipeline_type in ("host_provision", "bootstrap_compliance", "init_host", "compliance", "state_check"):
@@ -1406,32 +1418,32 @@ class DeploymentEngine:
                 if not host_name:
                     log.warning(f"ENGINE: {pipeline_type} ignored (missing host_name).")
                     self._notify("Pipeline Ignored", f"{pipeline_type} requires host_name.", "warning")
-                    return
+                    return self._skip_claimed(job_id, f"{pipeline_type} requires host_name")
                 payload["host_name"] = host_name
                 terraform_key = f"{pipeline_type}:{host_name}"
                 if terraform_key in self._active_terraform_host_keys:
                     log.warning(f"ENGINE: Duplicate {pipeline_type} ignored for '{host_name}' (in-memory lock).")
                     self._notify("Pipeline Ignored", f"A {pipeline_type} run for {host_name} is already being started.", "warning")
-                    return
+                    return self._skip_claimed(job_id, f"{pipeline_type} for {host_name} already starting")
 
                 active_tf_jobs = [
                     j for j in self.db.get_jobs_by_status("RUNNING")
-                    if j.pipeline_type == terraform_key
+                    if j.pipeline_type == terraform_key and j.id != job_id
                 ]
                 if active_tf_jobs:
                     log.warning(f"ENGINE: Duplicate {pipeline_type} ignored for '{host_name}'.")
                     self._notify("Pipeline Ignored", f"A {pipeline_type} run for {host_name} is already running.", "warning")
-                    return
+                    return self._skip_claimed(job_id, f"{pipeline_type} for {host_name} already running")
                 self._active_terraform_host_keys.add(terraform_key)
             if pipeline_type in ("infra_plan", "infra_apply"):
                 active_infra_jobs = [
                     j for j in self.db.get_jobs_by_status("RUNNING")
-                    if str(j.pipeline_type or "").startswith(("infra_plan", "infra_apply"))
+                    if str(j.pipeline_type or "").startswith(("infra_plan", "infra_apply")) and j.id != job_id
                 ]
                 if active_infra_jobs:
                     log.warning("ENGINE: An infrastructure plan/apply is already in progress.")
                     self._notify("Pipeline Ignored", "An infrastructure plan/apply is already running.", "warning")
-                    return
+                    return self._skip_claimed(job_id, "an infrastructure plan/apply is already running")
 
         # Safely increment running job counter
         self.state["running_jobs"] = self.state.get("running_jobs", 0) + 1
@@ -1442,14 +1454,23 @@ class DeploymentEngine:
         strategy = get_pipeline_strategy(pipeline_type)
         db_type = strategy.db_tag(payload)
 
-        current_job_id = self.db.create_job(db_type)
-        
+        if job_id:
+            # Claimed from the queue: the row exists (RUNNING, owned by this instance).
+            current_job_id = job_id
+            self.db.update_progress(current_job_id, progress=0, current_step="Pending Start")
+        else:
+            current_job_id = self.db.create_job(db_type)
+
         # FILE LOGGING SETUP. Tag this execution context with the job id so the
         # bridge persists only this job's records (concurrent pipelines share the
-        # "IaC:Engine" logger), and bind the same id to the handler.
+        # "IaC:Engine" logger), and bind the same id to the handler. The same lines
+        # also go to the database (JobLogWriter) so every instance can serve them.
         _job_ctx_token = _job_id_ctxvar.set(current_job_id)
-        bridge = JobFileLogBridge(self.config.get_log_path(current_job_id), job_id=current_job_id)
+        _writer = self._log_writer(current_job_id)
+        bridge = JobFileLogBridge(self.config.get_log_path(current_job_id), job_id=current_job_id,
+                                  sink=_writer.append if _writer else None)
         logging.getLogger("IaC:Engine").addHandler(bridge)
+        final_status = "FAILED"
 
         log.info("[SYSTEM] Pipeline Started")
         log.info(f"[SYSTEM] Job #{current_job_id} registered in database.")
@@ -1533,7 +1554,8 @@ class DeploymentEngine:
                         break
             
             log.info("[SYSTEM] Pipeline completed successfully.")
-            self.state["last_deployment"] = "SUCCESS"
+            final_status = "SUCCESS"
+            self.state["last_deployment"] = final_status
             self.db.update_progress(current_job_id, progress=100, current_step="Completed Successfully")
             
             # Upsert the sticky bell entry in-place with the success result.
@@ -1568,12 +1590,20 @@ class DeploymentEngine:
                 body=success_message,
                 severity="success",
             )
+        except asyncio.CancelledError:
+            # Abort (do_abort → worker.cancel): the row is closed as ABORTED by the
+            # finally below; the containers were killed by abort_job().
+            final_status = "ABORTED"
+            self.state["last_deployment"] = final_status
+            log.warning("[SYSTEM] Pipeline aborted.")
+            raise
         except Exception as e:
             import traceback
             error_detail = str(e) if str(e) else f"{type(e).__name__}: (no message)"
             log.error(f"!!! [FATAL] {error_detail}")
             log.debug(f"Exception traceback:\n{traceback.format_exc()}")
-            self.state["last_deployment"] = "FAILED"
+            final_status = "FAILED"
+            self.state["last_deployment"] = final_status
             self.db.update_progress(current_job_id, progress=None, current_step="Failed")
             
             # Upsert the sticky bell entry in-place with the failure result.
@@ -1614,8 +1644,13 @@ class DeploymentEngine:
             _job_id_ctxvar.reset(_job_ctx_token)
             self.state["running_jobs"] = max(0, self.state.get("running_jobs", 0) - 1)
             self.state["is_running"] = self.state["running_jobs"] > 0
-            self.db.update_job(job_id=current_job_id, status=self.state["last_deployment"])
+            # Per-job result (never the shared last_deployment: concurrent pipelines
+            # used to overwrite each other's final status through it).
+            self.db.update_job(job_id=current_job_id, status=final_status)
+            self._sync_runners(current_job_id, force=True)
+            await self._close_log_writer(current_job_id)
             self._cleanup_inventory_snapshot(current_job_id)
+            await self._publish_snapshots()
             if single_key:
                 async with self._pipeline_dispatch_lock:
                     self._active_single_service_keys.discard(single_key)
@@ -1634,8 +1669,11 @@ class DeploymentEngine:
         
         self.db.update_progress(job_id, progress=50, current_step="Resuming Bulk Rollout...")
         _job_ctx_token = _job_id_ctxvar.set(job_id)
-        bridge = JobFileLogBridge(self.config.get_log_path(job_id), job_id=job_id)
+        _writer = self._log_writer(job_id)
+        bridge = JobFileLogBridge(self.config.get_log_path(job_id), job_id=job_id,
+                                  sink=_writer.append if _writer else None)
         logging.getLogger("IaC:Engine").addHandler(bridge)
+        final_status = "FAILED"
         log.info(f"[SYSTEM] Resuming {len(pending_services)} pending services from job #{job_id}")
         
         self.ctx.emit(
@@ -1656,7 +1694,8 @@ class DeploymentEngine:
         try:
             res = await stage.run(self, context)
             log.info("[SYSTEM] Resumed Pipeline completed.")
-            self.state["last_deployment"] = "SUCCESS" if res.success else "FAILED"
+            final_status = "SUCCESS" if res.success else "FAILED"
+            self.state["last_deployment"] = final_status
             if res.success:
                 self.db.update_progress(job_id, progress=100, current_step="Resume Completed")
                 self._notify_clear(f"job_{job_id}")
@@ -1668,7 +1707,8 @@ class DeploymentEngine:
                 )
         except Exception as e:
             log.error(f"!!! [FATAL] {str(e)}")
-            self.state["last_deployment"] = "FAILED"
+            final_status = "FAILED"
+            self.state["last_deployment"] = final_status
             self.db.update_progress(job_id, progress=None, current_step="Resume Failed")
             self._notify(f"Pipeline #{job_id} Resume Failed", str(e), "negative", notification_id=f"job_{job_id}")
         finally:
@@ -1676,7 +1716,9 @@ class DeploymentEngine:
             _job_id_ctxvar.reset(_job_ctx_token)
             self.state["running_jobs"] = max(0, self.state.get("running_jobs", 0) - 1)
             self.state["is_running"] = self.state["running_jobs"] > 0
-            self.db.update_job(job_id=job_id, status=self.state["last_deployment"])
+            self.db.update_job(job_id=job_id, status=final_status)
+            self._sync_runners(job_id, force=True)
+            await self._close_log_writer(job_id)
 
     async def sync_core_repos(self):
         """Periodic/Startup task to keep core repositories up to date."""
@@ -1690,6 +1732,148 @@ class DeploymentEngine:
                 all_success = False
         if not all_success:
             log.warning("[SYSTEM] Core repository sync completed with failures. Check logs.")
+        return all_success
+
+    # ------------------------------------------------------------------
+    # Cluster control plane (plugin ≥ 1.4): queue-aware helpers
+    # ------------------------------------------------------------------
+
+    def _skip_claimed(self, job_id, reason: str):
+        """The dispatch guard rejected a job the worker already claimed: the row
+        must not stay RUNNING forever — close it as ABORTED with the reason."""
+        if job_id:
+            self.db.update_progress(job_id, progress=None, current_step=f"Skipped: {reason}"[:250])
+            self.db.update_job(job_id, "ABORTED")
+        return None
+
+    def _log_writer(self, job_id):
+        """The database log writer of ``job_id`` (created on first use; None without a queue)."""
+        if self.queue is None or job_id in (None, -1, 0):
+            return None
+        writer = self._log_writers.get(job_id)
+        if writer is None:
+            writer = JobLogWriter(self.queue, job_id)
+            try:
+                writer.start(self.ctx.create_task)
+            except Exception as exc:
+                log.debug("Job log writer not started: %s", exc)
+            self._log_writers[job_id] = writer
+        return writer
+
+    async def _close_log_writer(self, job_id):
+        writer = self._log_writers.pop(job_id, None)
+        if writer is not None:
+            try:
+                await writer.close()
+            except Exception as exc:
+                log.debug("Job log writer close failed: %s", exc)
+
+    def _log_line(self, job_id, text: str) -> None:
+        """Append one line to the job log: the host file (as before) and the database."""
+        try:
+            with open(self.config.get_log_path(job_id), "a", encoding="utf-8") as f:
+                f.write(text + "\n")
+        except Exception:
+            pass
+        writer = self._log_writer(job_id)
+        if writer is not None:
+            writer.append(text)
+
+    def _sync_runners(self, job_id, force: bool = False) -> None:
+        """Publish this job's runner/task state (status + last 50 log lines per
+        task) to the database — throttled to one write per second per job unless
+        ``force``. The SSE stream of every instance composes ``active_tasks`` from it."""
+        if self.queue is None or job_id in (None, -1, 0):
+            return
+        now = time.monotonic()
+        if not force and now - self._runners_last_push.get(job_id, 0.0) < 1.0:
+            return
+        self._runners_last_push[job_id] = now
+        snapshot = {
+            name: {"status": data.get("status"), "logs": list(data.get("logs") or [])[-50:], "job_id": job_id}
+            for name, data in (self.state.get("active_tasks") or {}).items()
+            if isinstance(data, dict) and data.get("job_id") == job_id
+        }
+        try:
+            self.ctx.create_task(asyncio.to_thread(self.queue.set_runners, job_id, snapshot),
+                                 name=f"iac:runners:{job_id}")
+        except Exception as exc:
+            log.debug("Runner snapshot not scheduled: %s", exc)
+
+    async def _publish_snapshots(self) -> None:
+        """Store the disk-derived read models (catalog, assignments, terraform hosts,
+        generated inventory) in the database so instances without the git working
+        trees can serve them. Runs on the executing instance after every pipeline."""
+        try:
+            from . import api as _api
+
+            await asyncio.to_thread(_api.publish_repo_snapshots)
+        except Exception as exc:
+            log.debug("Repo snapshot publish skipped: %s", exc)
+
+    async def _run_repo_sync_job(self, job_id: int) -> None:
+        """``repo_sync`` job: pull the core repositories and refresh the snapshots."""
+        self.state["running_jobs"] = self.state.get("running_jobs", 0) + 1
+        self.state["is_running"] = True
+        final_status = "FAILED"
+        writer = self._log_writer(job_id)
+        # Same per-job log capture as run_pipeline, so the git sync output lands in the job log.
+        _job_ctx_token = _job_id_ctxvar.set(job_id)
+        bridge = JobFileLogBridge(self.config.get_log_path(job_id), job_id=job_id,
+                                  sink=writer.append if writer else None)
+        logging.getLogger("IaC:Engine").addHandler(bridge)
+        try:
+            self.db.update_progress(job_id, progress=10, current_step="Syncing core repositories")
+            log.info("[SYSTEM] Repository sync started.")
+            ok = await self.sync_core_repos()
+            self.db.update_progress(job_id, progress=80, current_step="Publishing snapshots")
+            await self._publish_snapshots()
+            final_status = "SUCCESS" if ok else "FAILED"
+            self.db.update_progress(job_id, progress=100 if ok else None,
+                                    current_step="Repositories synced" if ok else "Sync completed with failures")
+            log.info(f"[SYSTEM] Repository sync finished: {final_status}.")
+        except asyncio.CancelledError:
+            final_status = "ABORTED"
+            raise
+        except Exception as exc:
+            log.error(f"Repository sync job #{job_id} failed: {exc}")
+            self.db.update_progress(job_id, progress=None, current_step=f"Failed: {exc}"[:250])
+        finally:
+            logging.getLogger("IaC:Engine").removeHandler(bridge)
+            _job_id_ctxvar.reset(_job_ctx_token)
+            self.state["running_jobs"] = max(0, self.state.get("running_jobs", 0) - 1)
+            self.state["is_running"] = self.state["running_jobs"] > 0
+            self.db.update_job(job_id, final_status)
+            await self._close_log_writer(job_id)
+
+    async def abort_job(self, job_id: int, *, reason: str = "Aborted by User") -> int:
+        """Kill this host's runner containers of ``job_id`` and close its row as ABORTED.
+        Returns the number of containers removed."""
+        killed = 0
+        if shutil.which("docker"):
+            try:
+                ps = await asyncio.create_subprocess_exec(
+                    "docker", "ps", "-q", "--filter", f"label=iac_job_id={job_id}",
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+                )
+                out, _ = await ps.communicate()
+                ids = out.decode().split()
+                if ids:
+                    rm = await asyncio.create_subprocess_exec(
+                        "docker", "rm", "-f", *ids,
+                        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+                    )
+                    await rm.wait()
+                    killed = len(ids)
+            except Exception as exc:
+                log.debug(f"abort_job: container cleanup failed: {exc}")
+        for data in list((self.state.get("active_tasks") or {}).values()):
+            if isinstance(data, dict) and data.get("job_id") == job_id:
+                data["status"] = "aborted"
+        self._sync_runners(job_id, force=True)
+        self.db.update_progress(job_id, progress=None, current_step=reason)
+        self.db.update_job(job_id, "ABORTED")
+        return killed
 
     async def _on_git_status(self, payload: dict):
         request_id = payload.get("request_id")
@@ -1897,11 +2081,12 @@ class DeploymentEngine:
                 if "active_tasks" not in self.state: self.state["active_tasks"] = {}
                 if task_name not in self.state["active_tasks"]:
                     self.state["active_tasks"][task_name] = {
-                        "status": "running_ansible", 
+                        "status": "running_ansible",
                         "logs": [],
                         "job_id": recovered_job_id
                     }
-                
+                    self._sync_runners(recovered_job_id, force=True)
+
                 self.state["running_jobs"] = self.state.get("running_jobs", 0) + 1
                 self.ctx.create_task(
                     self._reconcile_and_finalize(c_name, task_name, recovered_job_id),
@@ -1937,7 +2122,6 @@ class DeploymentEngine:
         hosts_to_create: list = []    # Terraform plan: hostnames a plan would create/replace
         hosts_to_destroy: list = []   # Terraform plan: hostnames a plan would destroy
         plan_summary = ""             # Terraform plan: the "Plan: X to add, ..." line
-        log_file = self.config.get_log_path(job_id)
         ansible_progress = 50.0  # Base progress for Ansible phase
         tf_already_running = False  # Proxmox "CT already running" is a non-fatal drift condition
         no_hosts_matched = False  # Empty --limit intersection is a no-op skip, not a failure
@@ -1949,9 +2133,8 @@ class DeploymentEngine:
                 if not line: break
                 decoded = line.decode('utf-8', errors='replace').rstrip()
                 if decoded:
-                    # 1. WRITE TO DISK DIRECTLY (Solves the memory freeze)
-                    with open(log_file, "a", encoding="utf-8") as f:
-                        f.write(f"[{task_name}] {decoded}\n")
+                    # 1. WRITE TO DISK + DATABASE (file for the host, DB for every instance)
+                    self._log_line(job_id, f"[{task_name}] {decoded}")
 
                     # 2. MICRO-PROGRESS SNIFFER
                     if "TASK [" in decoded:
@@ -1964,6 +2147,7 @@ class DeploymentEngine:
                         self.state["active_tasks"][task_name]["logs"].append(decoded)
                         if len(self.state["active_tasks"][task_name]["logs"]) > 50:
                             self.state["active_tasks"][task_name]["logs"].pop(0)
+                        self._sync_runners(job_id)  # throttled DB snapshot for the other instances
 
                     if "ok=" in decoded and "failed=" in decoded and ":" in decoded:
                         try:
@@ -2003,8 +2187,7 @@ class DeploymentEngine:
                     if re.search(r"CT\s+\d+\b.*already running", decoded, re.IGNORECASE):
                         tf_already_running = True
                         log.warning("[TF] Proxmox state drift detected (%s): container is already running. Treating as success.", task_name)
-                        with open(log_file, "a", encoding="utf-8") as f:
-                            f.write(f"[{task_name}] [WARNING] State drift: container already running — desired state achieved, continuing.\n")
+                        self._log_line(job_id, f"[{task_name}] [WARNING] State drift: container already running — desired state achieved, continuing.")
 
                     # Ansible "no hosts to target": the --limit intersection matched zero
                     # hosts (e.g. a service group not present on the limited host, or an
@@ -2029,6 +2212,7 @@ class DeploymentEngine:
             
             if "active_tasks" in self.state and task_name in self.state["active_tasks"]:
                 self.state["active_tasks"][task_name]["status"] = "success" if success else "failed"
+                self._sync_runners(job_id, force=True)
             await asyncio.create_subprocess_exec("docker", "rm", "-f", container_name)
             return success, {
                 "successful_hosts": successful_hosts,
@@ -2043,6 +2227,7 @@ class DeploymentEngine:
         except Exception as e:
             if "active_tasks" in self.state and task_name in self.state["active_tasks"]:
                 self.state["active_tasks"][task_name]["status"] = "error"
+                self._sync_runners(job_id, force=True)
             return False, {"successful_hosts": 0, "failed_hosts": 0}
 
     def _resolve_host_ip(self, host_name: str) -> str | None:
@@ -2385,6 +2570,7 @@ class DeploymentEngine:
             "logs": [],
             "job_id": job_id,
         }
+        self._sync_runners(job_id, force=True)
 
         safe_task_name = "".join(c if c.isalnum() or c in ".-_" else "-" for c in task_name).strip("-")
         c_name = f"iac-tf-{safe_task_name}"[:62]
@@ -2481,6 +2667,7 @@ class DeploymentEngine:
             host_name or "(env)",
         )
         self.state["active_tasks"][task_name]["status"] = "running_terraform"
+        self._sync_runners(job_id, force=True)
 
         async with self._terraform_run_semaphore:
             log.info("[TF] Acquired terraform run slot for '%s'.", host_name or "(env)")
@@ -2836,10 +3023,11 @@ class DeploymentEngine:
 
         if "active_tasks" not in self.state: self.state["active_tasks"] = {}
         self.state["active_tasks"][task_name] = {
-            "status": "pulling_image", 
+            "status": "pulling_image",
             "logs": [],
-            "job_id": job_id 
+            "job_id": job_id
         }
+        self._sync_runners(job_id, force=True)
 
         reg_url, reg_user, reg_token = self.ctx.get_secret("ansible_registry_url"), self.ctx.get_secret("ansible_registry_user"), self.ctx.get_secret("ansible_registry_token")
         if reg_url and reg_user and reg_token:
@@ -2916,6 +3104,7 @@ class DeploymentEngine:
 
             log.info(f"Executing: {playbook_subpath} (Limit: {limit or 'None'})")
             self.state["active_tasks"][task_name]["status"] = "running_ansible"
+            self._sync_runners(job_id, force=True)
 
             proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
             stdout, _ = await proc.communicate()
@@ -2929,6 +3118,7 @@ class DeploymentEngine:
             log.error(f"Docker Execution Error: {e}")
             if "active_tasks" in self.state and task_name in self.state["active_tasks"]:
                 self.state["active_tasks"][task_name]["status"] = "error"
+                self._sync_runners(job_id, force=True)
             return False, {"successful_hosts": 0, "failed_hosts": 0}
         finally:
             if key_path and os.path.exists(key_path):

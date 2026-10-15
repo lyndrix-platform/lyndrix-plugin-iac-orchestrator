@@ -22,7 +22,8 @@ import { useJobsSSE } from './lib/hooks'
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-const RUNNING_STATES = new Set(['RUNNING', 'PENDING'])
+// QUEUED (plugin ≥ 1.4): accepted by the control plane, waiting for a runner instance to claim it.
+const RUNNING_STATES = new Set(['RUNNING', 'PENDING', 'QUEUED'])
 const FAIL_STATES = new Set(['FAILED', 'ERROR', 'ABORTED'])
 
 // In-SPA navigation the shell's BrowserRouter picks up — NOT a full page reload.

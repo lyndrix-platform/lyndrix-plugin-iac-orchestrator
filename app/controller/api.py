@@ -31,6 +31,7 @@ from fastapi import Request, Header, HTTPException
 from pydantic import BaseModel, Field
 
 from .settings_schema import OrchestratorSettings
+from .queue import DuplicateJob as _DuplicateJob
 
 # Internal references to be set by init_api
 _ctx = None
@@ -144,10 +145,21 @@ def _validate_stream_token(token: str | None, permission: str = "api:read") -> b
 
 
 # ── Short-lived stream tickets ───────────────────────────────────────────────
-# Process-lifetime signing key for stream tickets. Tickets are only ever valid
-# within this process, which is fine given their short TTL: a restart simply
-# invalidates outstanding tickets and the client transparently mints a new one.
-_STREAM_TICKET_KEY = secrets.token_bytes(32)
+# Signing key for stream tickets. Derived from STORAGE_SECRET so a ticket minted
+# on one cluster instance validates on every other one (the load balancer may
+# send the EventSource request to a different pod than the POST that minted it).
+# Without a STORAGE_SECRET (dev) it falls back to a process-lifetime random key.
+def _stream_ticket_key() -> bytes:
+    import hashlib
+    import os
+
+    secret = (os.environ.get("STORAGE_SECRET") or "").strip()
+    if secret and secret != "dev_secret_only":
+        return hashlib.sha256(b"iac-orchestrator:stream-ticket:" + secret.encode()).digest()
+    return secrets.token_bytes(32)
+
+
+_STREAM_TICKET_KEY = _stream_ticket_key()
 _STREAM_TICKET_TTL = 60  # seconds
 
 
@@ -451,7 +463,8 @@ def _load_generated_inventory_hosts() -> set[str]:
         return set()
     inventory_path = _engine.config.git_repos_dir / "inventory_state" / "global" / "ansible" / "inventory.yml"
     if not inventory_path.exists():
-        return set()
+        # No working tree on this instance (control plane only) → the runner's snapshot.
+        return set(_snapshot_items("inventory_hosts") or [])
     try:
         with open(inventory_path, "r", encoding="utf-8") as handle:
             inv = yaml.safe_load(handle) or {}
@@ -460,18 +473,70 @@ def _load_generated_inventory_hosts() -> set[str]:
     return set(((inv.get("all") or {}).get("hosts") or {}).keys())
 
 
+# ── Repo-derived read models shared with instances that have no git working trees ──
+# The runner (the only instance with iac_controller / inventory_state checked out)
+# publishes these after every pipeline and repo sync; every other instance serves
+# them from the database instead of answering "empty".
+
+_SNAPSHOT_PREFIX = "snapshot:"
+
+
+def _has_repo_checkout() -> bool:
+    return bool(_engine) and (_engine.config.git_repos_dir / "iac_controller").exists()
+
+
+def _snapshot_items(name: str):
+    """Snapshot ``name`` from the shared DB (``None`` when there is none)."""
+    if not _engine:
+        return None
+    try:
+        rec = _engine.db.get_state(f"{_SNAPSHOT_PREFIX}{name}")
+    except Exception:
+        return None
+    if not rec or not isinstance(rec.get("data"), dict):
+        return None
+    return rec["data"].get("items")
+
+
+def publish_repo_snapshots() -> dict:
+    """Store catalog, assignments, terraform host metadata and generated inventory
+    hosts in the database. Called on the executing instance (which has the repos).
+    Returns the item counts; a no-op when this instance has no checkout."""
+    if not _engine or not _has_repo_checkout():
+        return {}
+    counts = {}
+    for name, loader in (
+        ("catalog", _read_catalog_from_disk),
+        ("assignments", _load_assignments_from_disk),
+        ("terraform_hosts", _collect_terraform_hosts_from_disk),
+        ("inventory_hosts", lambda: sorted(_load_generated_inventory_hosts())),
+    ):
+        try:
+            items = loader()
+            _engine.db.update_state(f"{_SNAPSHOT_PREFIX}{name}", {"items": items}, commit_hash="")
+            counts[name] = len(items)
+        except Exception as exc:
+            _ctx and _ctx.log.debug(f"API: snapshot '{name}' not published: {exc}")
+    return counts
+
+
 # ── Handler logic (router-agnostic) ─────────────────────────────────────────
 
 async def do_health():
     """Returns a lightweight health snapshot for the orchestrator plugin."""
     if not _ctx or not _engine:
         raise HTTPException(status_code=503, detail="Orchestrator not initialized")
+    live = _live_summary()
     return {
         "status": "healthy",
         "version": getattr(_ctx.manifest, "version", "unknown"),
         "db_connected": bool(getattr(_engine.db, "engine", None)),
         "vault_ready": _ctx.get_secret("iac_auto_apply") is not None,
-        "active_workers": len((_engine.state or {}).get("active_tasks", {})),
+        "active_workers": len(live.get("active_tasks") or {}),
+        "queued_jobs": live.get("queued", 0),
+        "runner_online": bool(_service.runner_online()) if _service else True,
+        "is_runner": bool(_service.is_runner) if _service else True,
+        "instance_id": getattr(_ctx, "instance_id", None),
     }
 
 
@@ -540,16 +605,22 @@ async def do_sync_webhooks(x_gitlab_token: str | None):
     return {"status": "ok", **result}
 
 
-async def do_get_catalog():
-    """Returns the parsed global service catalog."""
-    if not _engine:
-        raise HTTPException(status_code=500, detail="Engine offline")
+def _read_catalog_from_disk() -> list:
     catalog_file = _engine.config.git_repos_dir / "iac_controller" / "environments" / "global" / "02_service_catalog.yml"
     if catalog_file.exists():
         with open(catalog_file, 'r') as f:
             data = yaml.safe_load(f) or {}
-            return data.get("service_catalog", {}).get("services", [])
+            return data.get("service_catalog", {}).get("services", []) or []
     return []
+
+
+async def do_get_catalog():
+    """Returns the parsed global service catalog (disk on the runner, snapshot elsewhere)."""
+    if not _engine:
+        raise HTTPException(status_code=500, detail="Engine offline")
+    if _has_repo_checkout():
+        return _read_catalog_from_disk()
+    return _snapshot_items("catalog") or []
 
 
 async def do_trigger_service_deployment(service_name: str, payload: DeployRequest):
@@ -838,6 +909,29 @@ async def do_job_logs(
     if not _engine:
         raise HTTPException(status_code=500, detail="Engine offline")
 
+    # Cluster: the executing runner streams every line into the shared database;
+    # serve from there first so any instance can answer, regardless of which host
+    # holds the log file.
+    queue = getattr(_service, "queue", None)
+    if queue is not None:
+        try:
+            has_db_log = await asyncio.to_thread(queue.has_log, job_id)
+        except Exception:
+            has_db_log = False
+        if has_db_log:
+            res = await asyncio.to_thread(
+                queue.read_log, job_id, offset=offset, tail=max(1, tail or 600), grep=grep, grep_max=_LOG_GREP_MAX,
+            )
+            return {
+                "job_id": job_id,
+                "lines": res["lines"],
+                "source": "db",
+                "offset": res["offset"],
+                "size": res["size"],
+                "tail": tail,
+                "grep": grep,
+            }
+
     log_path = _engine.config.get_log_path(job_id)
     if not log_path or not Path(log_path).exists():
         # Fall back to any legacy logs stored in the DB row.
@@ -918,37 +1012,70 @@ async def do_job_log_raw(job_id: int, download: bool = False):
     stream router with ``?token=`` auth because the browser opens this URL directly
     (a new tab / download) and cannot send a Bearer header.
     """
-    from fastapi.responses import FileResponse
+    from fastapi.responses import FileResponse, StreamingResponse
 
     if not _engine:
         raise HTTPException(status_code=500, detail="Engine offline")
+
+    disposition = "attachment" if download else "inline"
+    headers = {
+        "Content-Disposition": f'{disposition}; filename="job_{job_id}.log"',
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",
+    }
+
+    # Shared database log (cluster): stream it in chunks from whichever instance answers.
+    queue = getattr(_service, "queue", None)
+    if queue is not None and await asyncio.to_thread(queue.has_log, job_id):
+        def _iter():
+            for line in queue.iter_log(job_id):
+                yield line + "\n"
+
+        return StreamingResponse(_iter(), media_type="text/plain; charset=utf-8", headers=headers)
 
     log_path = _engine.config.get_log_path(job_id)
     if not log_path or not Path(log_path).exists():
         raise HTTPException(status_code=404, detail="Log file not found")
 
-    disposition = "attachment" if download else "inline"
-    return FileResponse(
-        str(log_path),
-        media_type="text/plain; charset=utf-8",
-        headers={
-            "Content-Disposition": f'{disposition}; filename="job_{job_id}.log"',
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-        },
-    )
+    return FileResponse(str(log_path), media_type="text/plain; charset=utf-8", headers=headers)
+
+
+def _live_summary() -> dict:
+    """``active_tasks`` / ``is_running`` / ``queued`` from the shared database (the
+    runner publishes them), merged with this process' own in-memory state when it
+    is the executing instance (fresher by up to a second)."""
+    summary = {"active_tasks": {}, "is_running": False, "queued": 0}
+    queue = getattr(_service, "queue", None)
+    if queue is not None:
+        try:
+            summary = queue.live_summary()
+        except Exception as exc:
+            _ctx and _ctx.log.debug(f"API: live summary from DB failed: {exc}")
+    state = (_engine.state if _engine else None) or {}
+    local = state.get("active_tasks") or {}
+    if local:
+        merged = dict(summary.get("active_tasks") or {})
+        merged.update({k: v for k, v in local.items() if isinstance(v, dict)})
+        summary["active_tasks"] = merged
+    summary["is_running"] = bool(summary.get("is_running")) or bool(state.get("is_running"))
+    return summary
 
 
 async def do_job_runners(job_id: int):
-    """Return the in-memory active runner tasks attributed to a job."""
+    """Return the runner tasks attributed to a job (shared DB snapshot, local state on the runner)."""
     if not _engine:
         raise HTTPException(status_code=500, detail="Engine offline")
+    runners: dict = {}
+    queue = getattr(_service, "queue", None)
+    if queue is not None:
+        try:
+            runners = await asyncio.to_thread(queue.runners_for, job_id)
+        except Exception:
+            runners = {}
     active = (_engine.state or {}).get("active_tasks", {}) or {}
-    runners = {
-        name: data
-        for name, data in active.items()
-        if isinstance(data, dict) and data.get("job_id") == job_id
-    }
+    for name, data in active.items():
+        if isinstance(data, dict) and data.get("job_id") == job_id:
+            runners[name] = data
     return {"job_id": job_id, "runners": runners}
 
 
@@ -1011,32 +1138,49 @@ async def do_abort():
     state = _service.state
     _ctx.log.warning("API: ABORT SEQUENCE INITIATED BY USER.")
 
-    for task_name in list((state.get("active_tasks", {}) or {}).keys()):
-        safe_task_name = "".join(
-            ch if ch.isalnum() or ch in ".-_" else "-" for ch in task_name
-        ).strip("-")
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "docker", "rm", "-f", f"aac-runner-{safe_task_name}",
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            await proc.wait()
-        except Exception:
-            pass
-
     aborted: list[int] = []
+    queue = getattr(_service, "queue", None)
+
+    # 1. Nothing executes a QUEUED job yet — close those rows directly.
+    if queue is not None:
+        try:
+            aborted.extend(await asyncio.to_thread(queue.abort_queued))
+        except Exception as exc:
+            _ctx.log.debug(f"ABORT: abort_queued failed: {exc}")
+
+    # 2. RUNNING jobs: the owning runner cancels its pipeline task and kills its
+    #    containers. Ask every instance (cluster bus; the local bus delivers to this
+    #    process too), and close rows whose owner is no longer alive ourselves.
     try:
-        running_jobs = _engine.db.get_jobs_by_status("RUNNING")
+        running = await asyncio.to_thread(queue.running_jobs) if queue is not None else [
+            {"id": getattr(j, "id", None), "owner_instance": getattr(j, "owner_instance", None)}
+            for j in _engine.db.get_jobs_by_status("RUNNING")
+        ]
     except Exception:
-        running_jobs = []
-    for job in running_jobs:
-        job_id = getattr(job, "id", None)
-        if job_id is None:
-            continue
-        _engine.db.update_job(job_id, "ABORTED")
-        _engine.db.update_progress(job_id, progress=None, current_step="Aborted by User")
-        aborted.append(job_id)
+        running = []
+    running_ids = [int(r["id"]) for r in running if r.get("id") is not None]
+    if running_ids:
+        try:
+            _ctx.emit("iac:job_abort_requested", {"job_ids": running_ids}, cluster=True)
+        except TypeError:
+            _ctx.emit("iac:job_abort_requested", {"job_ids": running_ids})
+        await _service.on_abort_requested({"job_ids": running_ids})
+        alive = None
+        instances = getattr(_ctx, "cluster_instances", None)
+        if instances:
+            try:
+                alive = {i["instance_id"] for i in instances if i.get("alive")}
+            except Exception:
+                alive = None
+        for r in running:
+            job_id = int(r["id"])
+            owner = r.get("owner_instance")
+            local = any(isinstance(t, dict) and t.get("job_id") == job_id
+                        for t in (state.get("active_tasks") or {}).values())
+            if local or not owner or (alive is not None and owner not in alive):
+                _engine.db.update_job(job_id, "ABORTED")
+                _engine.db.update_progress(job_id, progress=None, current_step="Aborted by User")
+        aborted.extend(running_ids)
 
     if aborted:
         try:
@@ -1062,9 +1206,16 @@ async def do_abort():
 # ── Infrastructure inventory (assignments + terraform hosts) ─────────────────
 
 def _load_assignments() -> list:
-    """Flatten site→stage→host service assignments. Ports dashboard.load_assignments."""
+    """Flatten site→stage→host service assignments (disk on the runner, snapshot elsewhere)."""
     if not _engine:
         return []
+    if not _has_repo_checkout():
+        return _snapshot_items("assignments") or []
+    return _load_assignments_from_disk()
+
+
+def _load_assignments_from_disk() -> list:
+    """Ports dashboard.load_assignments — reads the iac_controller working tree."""
     config = _engine.config
     assignments: list[dict] = []
     base_dir = config.git_repos_dir / "iac_controller" / "environments"
@@ -1177,7 +1328,26 @@ def _host_state_from_jobs(jobs: list, host: str) -> str:
 
 
 def _scan_terraform_hosts() -> list:
-    """Parse site host YAML → per-host terraform metadata. Ports terraform._scan_terraform_hosts."""
+    """Per-host terraform metadata + job-derived state. The static part comes from
+    the working tree (runner) or the published snapshot (other instances); the
+    ``state`` of tfvars-managed hosts is always derived from the shared job table."""
+    hosts = _collect_terraform_hosts_from_disk() if _has_repo_checkout() else (_snapshot_items("terraform_hosts") or [])
+    try:
+        recent_jobs = _engine.db.get_jobs_for_stats(500)
+    except Exception:
+        recent_jobs = []
+    results = []
+    for entry in hosts:
+        entry = dict(entry)
+        if entry.pop("_state_from_jobs", False):
+            entry["state"] = _host_state_from_jobs(recent_jobs, entry["host"])
+        results.append(entry)
+    return sorted(results, key=lambda x: (not x["managed"], x["site"], x["stage"], x["host"]))
+
+
+def _collect_terraform_hosts_from_disk() -> list:
+    """Parse site host YAML → per-host terraform metadata. Ports terraform._scan_terraform_hosts.
+    Entries of tfvars-managed hosts carry ``_state_from_jobs=True`` instead of a state."""
     config = _engine.config
     base_dir = config.git_repos_dir / "iac_controller" / "environments"
     sites_dir = base_dir / "sites"
@@ -1186,10 +1356,6 @@ def _scan_terraform_hosts() -> list:
         return results
 
     tf_index = _tfvars_host_index(config)
-    try:
-        recent_jobs = _engine.db.get_jobs_for_stats(500)
-    except Exception:
-        recent_jobs = []
 
     for yaml_file in sites_dir.rglob("*.yml"):
         parts = yaml_file.parts
@@ -1205,6 +1371,7 @@ def _scan_terraform_hosts() -> list:
                 tf = host_data.get("terraform") if isinstance(host_data.get("terraform"), dict) else {}
                 tf_meta = tf_index.get(host_name)
                 managed = bool(tf) or tf_meta is not None
+                state_from_jobs = False
                 if tf_meta is not None:
                     node = tf_meta.get("node") or ""
                     provider = _TF_PROVIDER
@@ -1212,7 +1379,8 @@ def _scan_terraform_hosts() -> list:
                         f'module.lxc_{node}.proxmox_virtual_environment_container.ct["{host_name}"]'
                         if node else 'proxmox_virtual_environment_container.ct'
                     )
-                    state = _host_state_from_jobs(recent_jobs, host_name)
+                    state = "unknown"
+                    state_from_jobs = True
                 else:
                     provider = tf.get("provider", "—")
                     resource = tf.get("resource", tf.get("type", "—"))
@@ -1222,13 +1390,14 @@ def _scan_terraform_hosts() -> list:
                     "ansible_host": host_data.get("ansible_host") or host_data.get("address") or "—",
                     "managed": managed, "provider": provider, "resource": resource,
                     "workspace": tf.get("workspace", "default"), "state": state,
+                    "_state_from_jobs": state_from_jobs,
                 })
         except (ValueError, IndexError):
             continue
         except Exception as exc:
             _ctx and _ctx.log.error(f"API: Terraform scan failed for {yaml_file}: {exc}")
 
-    return sorted(results, key=lambda x: (not x["managed"], x["site"], x["stage"], x["host"]))
+    return results
 
 
 async def do_terraform_hosts():
@@ -1312,8 +1481,9 @@ async def do_get_settings():
     """Return the orchestrator settings surface. Ports settings.py reads."""
     if not _ctx or not _service:
         raise HTTPException(status_code=503, detail="Orchestrator not initialized")
+    # Read through to Vault (shared) — the in-memory flag is per instance.
     return {
-        "auto_apply": bool(_service.state.get("auto_apply_enabled", False)),
+        "auto_apply": bool(_service.config.auto_apply),
         "test_deploy_allowed_hosts": _ctx.get_secret("iac_test_deploy_allowed_hosts") or "",
         "gitlab_url": _ctx.get_secret("iac_gitlab_url") or "https://gitlab.int.fam-feser.de",
         "group_id": _ctx.get_secret("iac_gitlab_group_id") or "",
@@ -1540,10 +1710,14 @@ async def do_sync_repos():
     """Trigger a background sync of all core repositories (iac_controller, inventory_state, …)."""
     if not _ctx or not _service or not _engine:
         raise HTTPException(status_code=503, detail="Orchestrator not initialized")
-    if _service.state.get("is_running"):
-        raise HTTPException(status_code=409, detail="A pipeline is already running — try again afterwards")
-    _ctx.create_task(_engine.sync_core_repos())
-    return {"status": "accepted", "message": "Repository sync started in background"}
+    # Runs on a runner instance (the one with the working trees) via the queue, like
+    # every other piece of execution; the job shows up in the history as "repo_sync".
+    try:
+        job_id = await asyncio.to_thread(_service.enqueue_pipeline, {"pipeline_type": "repo_sync", "manual": True},
+                                         requested_by="ui")
+    except _DuplicateJob as exc:
+        raise HTTPException(status_code=409, detail=f"A repository sync is already queued/running (job #{exc.existing_id})")
+    return {"status": "accepted", "message": "Repository sync queued", "job_id": job_id}
 
 
 async def do_sync_webhooks_authed():
@@ -1566,11 +1740,13 @@ def _job_stream_snapshot() -> dict:
     if not _engine:
         return {"jobs": [], "active_tasks": {}, "is_running": False, "ts": time.time()}
     jobs = _engine.db.get_recent_jobs(30)
-    state = _engine.state or {}
+    live = _live_summary()
     return {
         "jobs": jobs,
-        "active_tasks": state.get("active_tasks", {}) or {},
-        "is_running": bool(state.get("is_running", False)),
+        "active_tasks": live.get("active_tasks") or {},
+        "is_running": bool(live.get("is_running", False)),
+        "queued": live.get("queued", 0),
+        "runner_online": bool(_service.runner_online()) if _service else True,
         "ts": time.time(),
     }
 

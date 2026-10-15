@@ -20,18 +20,18 @@ from .app.ui.widget import render_dashboard_widget as modular_widget
 manifest = ModuleManifest(
     id="lyndrix.plugin.iac_orchestrator",
     name="IaC Orchestrator",
-    version="1.3.0",
+    version="1.4.0",
     description="Standalone GitOps controller for executing Terraform and Ansible pipelines.",
     author="Lyndrix",
     icon="rocket_launch",
     type="PLUGIN",
     min_core_version="1.4.0",
-    # Cluster placement (core API ≥ 1.7, ignored by older cores): the orchestrator
-    # needs the Docker socket, git working trees and job logs of ONE host — it runs
-    # only on instances with LYNDRIX_INSTANCE_ROLES including "runner"; the other
-    # instances answer 503 "remote" for its routes (route /api/plugins/<id>/* and
-    # the webhooks to the runner at the load balancer). Single mode has every role.
-    placement="pinned:runner",
+    # Cluster placement (core API ≥ 1.7): the CONTROL PLANE — API, UI data, webhook
+    # ingest, job queue, logs — runs on every instance from the shared database.
+    # EXECUTION (git working trees, Docker runner containers, ansible/terraform)
+    # happens only on instances whose LYNDRIX_INSTANCE_ROLES include "runner": they
+    # claim QUEUED jobs (app/controller/queue.py). Single mode has every role.
+    placement="any",
     auto_enable_on_install=True,
     repo_url="https://github.com/lyndrix-platform/lyndrix-plugin-iac-orchestrator",
     # Identity 2.0: fine-grained infra-apply permission (replaces the old
@@ -91,11 +91,12 @@ manifest = ModuleManifest(
     settings_ui_route="/iac/settings",
     permissions={
         "subscribe": ["vault:ready_for_data", "iac:webhook_verified", "git:status_update", "db:connected", "socket:response",
-                      "entity_registry:identified"],
+                      "entity_registry:identified", "iac:job_queued", "iac:job_abort_requested"],
         "emit": ["iac:pipeline_started", "iac:webhook_verified", "iac:inventory_updated",
                  "entity_registry:identify", "server_manager:register_server",
                  "git:sync", "git:commit_push",
-                 "system:notify", "user:notify", "socket:request", "messaging:outbound"],
+                 "system:notify", "user:notify", "socket:request", "messaging:outbound",
+                 "iac:job_queued", "iac:job_abort_requested"],
     },
     notification_endpoints=[
         NotificationEndpoint(
@@ -184,6 +185,7 @@ async def health(ctx) -> PluginHealthStatus:
     state = getattr(_service, "state", None) or {}
     active_workers = len(state.get("active_tasks", {}) or {})
     last_deployment = state.get("last_deployment")
+    runner_online = _service.runner_online()
 
     # Vault holds the auto-apply flag (env fallback). A reachable Vault returns a
     # value; unreachable/unset returns None — informational, never fatal here.
@@ -205,13 +207,17 @@ async def health(ctx) -> PluginHealthStatus:
 
     latency = round((time.perf_counter() - start) * 1000, 1)
     return PluginHealthStatus(
-        status="ok",
+        # Control plane without any live runner: the API works, jobs queue up but
+        # nothing executes them — degraded, not an error.
+        status="ok" if runner_online else "degraded",
         details={
             "db_connected": True,
             "vault_ready": vault_ready,
             "active_workers": active_workers,
             "last_deployment": last_deployment,
             "recent_jobs": len(recent or []),
+            "is_runner": _service.is_runner,
+            "runner_online": runner_online,
         },
         latency_ms=latency,
     )
@@ -262,16 +268,47 @@ def setup(ctx):
     async def _on_db(_):
         _service.bootstrap_db(Base)
 
-    # Event wiring
+    # Event wiring — every trigger (UI, webhook, CI, NiceGUI, the engine's own
+    # host-rollout hand-off) emits iac:webhook_verified on the local bus; it is
+    # ENQUEUED here and executed by whichever runner instance claims it.
     @ctx.subscribe('iac:webhook_verified')
     async def _on_webhook(payload):
-        ctx.create_task(_service.run_pipeline(payload), name="iac:run_pipeline")
+        if (payload or {}).get("_origin"):
+            return  # relayed copy — the origin instance already queued it
+        await _service.enqueue_from_event(payload or {})
 
-    # Startup tasks
-    ctx.create_task(_service.run_startup_reconciliation(), name="iac:startup_reconciliation")
-    ctx.create_task(_service.emit_monitoring_inventory_sync(), name="iac:monitoring_inventory_seed")
-    ctx.create_task(_service.emit_iac_inventory_updated(), name="iac:inventory_publish")
-    ctx.create_task(_service.run_webhook_sync_loop(), name="iac:webhook_sync_loop")
+    # A peer queued a job → poke this instance's worker (runner instances only).
+    @ctx.subscribe('iac:job_queued')
+    async def _on_job_queued(payload):
+        if _service.worker is not None:
+            _service.worker.wake()
+
+    # Abort requested on any instance → the owning runner cancels + kills containers.
+    @ctx.subscribe('iac:job_abort_requested')
+    async def _on_abort(payload):
+        await _service.on_abort_requested(payload or {})
+
+    # Execution plane (runner role): worker, startup reconciliation, the
+    # repo-derived publishes (they read the git working trees of this host).
+    if _service.is_runner:
+        _service.start_runner()
+        ctx.create_task(_service.run_startup_reconciliation(), name="iac:startup_reconciliation")
+        ctx.create_task(_service.emit_monitoring_inventory_sync(), name="iac:monitoring_inventory_seed")
+        ctx.create_task(_service.emit_iac_inventory_updated(), name="iac:inventory_publish")
+        ctx.create_task(_service.publish_snapshots_on_boot(), name="iac:snapshots_publish")
+    else:
+        ctx.log.info("IaC Orchestrator: control plane only on this instance (no 'runner' role).")
+
+    # Exactly one instance keeps the GitLab webhooks registered (needs only the
+    # GitLab API, not the working trees). Older cores without leases: run it here.
+    on_lease = getattr(ctx, "on_lease", None)
+    if callable(on_lease):
+        on_lease("iac:webhook_sync", acquired=_service.start_webhook_sync, lost=_service.stop_webhook_sync)
+    else:
+        _service.start_webhook_sync()
+
+    # Cluster: tell the operator when no runner is online (jobs would only queue).
+    ctx.create_task(_service.watch_runner_presence(), name="iac:runner_watch")
 
     # UI route
     @ui.page('/iac')
@@ -282,4 +319,10 @@ def setup(ctx):
 
 def teardown(ctx):
     global _service
-    _service = None
+    svc, _service = _service, None
+    if svc is not None:
+        try:
+            svc.stop_webhook_sync()
+            ctx.create_task(svc.stop_runner(), name="iac:worker_stop")
+        except Exception:
+            pass

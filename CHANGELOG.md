@@ -5,6 +5,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.0] - 2026-10-15
+
+### Changed
+- **Cluster control plane** (`placement="any"`, core API ≥ 1.7): the REST API, React data,
+  GitLab webhooks/CI triggers, SSE stream and job logs now run on every core instance from the
+  shared database. Triggers no longer execute in-process: they enqueue a job (`QUEUED`, with
+  `payload` and a `dedupe_key`) and runner instances (`LYNDRIX_INSTANCE_ROLES` incl. `runner`)
+  claim it atomically (`app/controller/queue.py`: `JobQueue`, `JobWorker`). Heartbeats every
+  10 s; jobs of a dead runner are marked `FAILED` ("Runner lost").
+- Job logs are streamed into `iac_orchestrator_job_logs` (the file on the runner host stays);
+  `GET /jobs/{id}/logs` and the raw download serve from the database. Runner/task state is
+  published to `iac_orchestrator_jobs.runners`; the SSE snapshot keeps its shape.
+- Catalog, assignments, terraform hosts and generated inventory hosts are published as
+  snapshots (`iac_orchestrator_state` `snapshot:*`) so instances without git working trees
+  answer the same data.
+- Stream tickets are signed with a key derived from `STORAGE_SECRET` (valid on every instance).
+- `POST /abort` aborts queued jobs directly and asks the owning runner (cluster event) to cancel
+  and kill its containers (`iac_job_id` label); the pipeline task is actually cancelled now.
+- `POST /maintenance/sync-repos` is a `repo_sync` job executed by a runner.
+- Webhook auto-sync runs on exactly one instance (lease `iac:webhook_sync`).
+- `health()` reports `degraded` (and the plugin status banner says so) while no runner is online.
+- Settings `auto_apply` reads through to Vault instead of a per-process flag.
+
+### Fixed
+- Concurrent pipelines no longer overwrite each other's final status through the shared
+  `last_deployment` flag; every job records its own result.
+- Startup reconciliation touches only this runner's jobs (plus ownerless legacy rows), never a
+  peer's running jobs.
+
 ## [1.1.2] - 2026-08-03
 
 ### Fixed

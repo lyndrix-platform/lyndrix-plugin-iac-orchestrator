@@ -1,9 +1,12 @@
-from sqlalchemy import Column, Integer, String, DateTime, ForeignKey
+from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Text
 from sqlalchemy.sql import func
 from sqlalchemy.orm import declarative_base
-from sqlalchemy.dialects.mysql import LONGTEXT 
+from sqlalchemy.dialects.mysql import LONGTEXT
 
 Base = declarative_base()
+
+# LONGTEXT on MariaDB/MySQL (as before), plain TEXT elsewhere (SQLite in tests).
+LONGTEXT = Text().with_variant(LONGTEXT, "mysql", "mariadb")
 
 class IaCJob(Base):
     __tablename__ = "iac_orchestrator_jobs"
@@ -19,10 +22,34 @@ class IaCJob(Base):
     start_time = Column(DateTime(timezone=True), server_default=func.now())
     end_time = Column(DateTime(timezone=True), nullable=True)
     
-    # We will keep 'logs' temporarily to avoid breaking old records, 
-    # but we won't use it for new jobs. 
-    logs = Column(LONGTEXT, default="[]") 
+    # We will keep 'logs' temporarily to avoid breaking old records,
+    # but we won't use it for new jobs.
+    logs = Column(LONGTEXT, default="[]")
     pending_tasks = Column(LONGTEXT, default="[]")
+
+    # --- CLUSTER QUEUE (plugin 1.4): control plane enqueues, runner instances claim ---
+    payload = Column(LONGTEXT, nullable=True)            # trigger payload (JSON) for the executor
+    dedupe_key = Column(String(255), nullable=True)      # concurrency key (single_service:<svc>, rollout:all, …)
+    owner_instance = Column(String(100), nullable=True)  # LYNDRIX_INSTANCE_ID of the executing runner
+    claimed_at = Column(DateTime(timezone=True), nullable=True)
+    heartbeat_at = Column(DateTime(timezone=True), nullable=True)
+    runners = Column(LONGTEXT, nullable=True)            # live runner/task snapshot (JSON) for every instance's UI
+
+
+class IaCJobLog(Base):
+    """One log line per row — written by the executing runner, read by every instance.
+
+    The job log used to be a file on the runner host (``logs_dir/job_<id>.log``);
+    the file is still written for debugging, but the UI reads from here so the
+    control plane can show logs regardless of which instance answers.
+    """
+    __tablename__ = "iac_orchestrator_job_logs"
+
+    id = Column(Integer, primary_key=True)
+    job_id = Column(Integer, ForeignKey("iac_orchestrator_jobs.id"), nullable=False, index=True)
+    seq = Column(Integer, nullable=False)
+    ts = Column(DateTime(timezone=True), server_default=func.now())
+    line = Column(LONGTEXT, nullable=False)
 
 class IaCJobTask(Base):
     __tablename__ = "iac_orchestrator_job_tasks"

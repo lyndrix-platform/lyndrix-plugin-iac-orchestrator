@@ -35,23 +35,53 @@ lyndrix-plugin-iac-orchestrator/
 
 ---
 
-## Cluster-Platzierung (Core-API ≥ 1.7)
+## Cluster-Betrieb: Control Plane und Runner (ab 1.4, Core-API ≥ 1.7)
 
-Der Orchestrator ist **hostgebunden**: Docker-Socket, Git-Working-Trees unter
-`/data/storage/git_repos`, Job-Logs und Terraform-Provider liegen auf genau einem Host. Das
-Manifest deklariert deshalb `placement="pinned:runner"`:
+Das Plugin ist in zwei Ebenen geteilt, die über die gemeinsame Datenbank zusammenarbeiten.
+Das Manifest deklariert `placement="any"`:
 
-- `setup()` läuft nur auf Core-Instanzen, deren `LYNDRIX_INSTANCE_ROLES` die Rolle `runner`
-  enthält (im Single-Modus hat eine Instanz alle Rollen — nichts ändert sich).
-- Alle anderen Instanzen registrieren das Plugin als `remote`: seine Routen antworten dort mit
-  `503` und `X-Plugin-Runtime: {"phase": "remote", "role": "runner"}`, die React-Shell zeigt
-  „läuft auf der Runner-Instanz“.
-- Der Load Balancer sollte `/api/plugins/lyndrix.plugin.iac_orchestrator/*` sowie die
-  öffentlichen Webhook-Routen auf die Runner-Instanz leiten (Core-Doku *High Availability →
-  Building blocks → Plugin artifacts & placement*). Der Preflight des Cores meldet `fail`, wenn
-  kein lebender Runner existiert.
-- Noch offen (Core-Fahrplan M4): `owner_instance` auf Jobs, Trigger von API-Instanzen per
-  Cluster-Event, Job-Logs in DB/Shared Storage — damit ein Runner-Wechsel ohne Job-Verlust geht.
+**Control Plane — auf jeder Core-Instanz.** REST-API, React-Daten, GitLab-Webhooks und
+CI-Trigger (`/api/iac/*`), SSE-Stream und Job-Logs. Jeder Trigger (UI, Webhook, CI, NiceGUI,
+die Rollout-Übergabe der Engine) landet weiterhin als `iac:webhook_verified` auf dem lokalen
+Bus und wird dort **eingereiht**: Zeile in `iac_orchestrator_jobs` mit Status `QUEUED`,
+`payload` (JSON) und `dedupe_key`. Ein zweiter Trigger für dasselbe Ziel (gleicher Service,
+gleicher Host, laufender Rollout, Infra-Plan/Apply) wird mit „Pipeline Ignored“ abgewiesen,
+solange ein Job dazu `QUEUED` oder `RUNNING` ist. `iac:job_queued` (`cluster=True`) weckt die
+Runner sofort.
+
+**Execution Plane — nur Instanzen mit Rolle `runner`** (`LYNDRIX_INSTANCE_ROLES`; im
+Single-Modus hat die Instanz alle Rollen). Der `JobWorker` (`app/controller/queue.py`) claimt
+den ältesten `QUEUED`-Job atomar (`UPDATE … WHERE status='QUEUED'`, `owner_instance`,
+`claimed_at`), führt die Engine aus (bis zu `iac_max_parallel_jobs`, Default 3), sendet alle
+10 s einen Heartbeat und markiert jede Minute verwaiste Jobs (Owner nicht mehr lebend oder
+Heartbeat älter als 3 min) als `FAILED` „Runner lost“. Beim Start kümmert sich ein Runner nur um
+eigene `RUNNING`-Jobs (Resume oder Abbruch) und um verwaiste `aac-runner-*`-Container des Hosts.
+
+**Was alle Instanzen aus der Datenbank sehen:**
+
+- Job-Logs: der ausführende Runner schreibt jede Zeile zusätzlich in `iac_orchestrator_job_logs`
+  (Batches alle 0,5 s). `GET /jobs/{id}/logs` liest zuerst von dort (`source: "db"`,
+  `offset` = nächste Sequenznummer), die Datei `logs/job_<id>.log` bleibt auf dem Runner-Host.
+- Runner-Status: `active_tasks` (Status + letzte 50 Zeilen je Task) steht als JSON in
+  `iac_orchestrator_jobs.runners`; der SSE-Stream baut daraus dieselbe Antwort wie bisher.
+- Repo-Snapshots: Service-Katalog, Assignments, Terraform-Hosts und Inventar-Hosts werden vom
+  Runner nach jedem Lauf in `iac_orchestrator_state` (`snapshot:*`) veröffentlicht; Instanzen ohne
+  Git-Working-Trees antworten daraus.
+- Stream-Tickets werden mit einem aus `STORAGE_SECRET` abgeleiteten Schlüssel signiert und gelten
+  damit auf jeder Instanz hinter dem Load Balancer.
+
+**Abbruch:** `POST /abort` setzt `QUEUED` direkt auf `ABORTED` und sendet
+`iac:job_abort_requested` (`cluster=True`); der besitzende Runner bricht seinen Pipeline-Task ab
+und entfernt die Container mit Label `iac_job_id=<id>`. Jobs eines toten Runners schließt die
+aufrufende Instanz selbst.
+
+**Repo-Sync** (`POST /maintenance/sync-repos`) ist ein Job vom Typ `repo_sync` und läuft damit
+ebenfalls auf einem Runner. Die GitLab-Webhook-Registrierung läuft genau einmal im Cluster
+(Lease `iac:webhook_sync`). Ist kein Runner online, meldet das Plugin `degraded` („pipelines are
+queued, not executed“) und `health()` ebenso — die API bleibt nutzbar, Jobs warten.
+
+Noch offen: eigenständiges `lyndrix-runner`-Image und ein Kubernetes-Executor (Jobs statt
+Docker-Socket), Job-Logs und Working-Trees weg vom lokalen Host des Runners.
 
 ---
 
