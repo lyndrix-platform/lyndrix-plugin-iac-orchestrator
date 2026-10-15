@@ -80,6 +80,17 @@ ebenfalls auf einem Runner. Die GitLab-Webhook-Registrierung läuft genau einmal
 (Lease `iac:webhook_sync`). Ist kein Runner online, meldet das Plugin `degraded` („pipelines are
 queued, not executed“) und `health()` ebenso — die API bleibt nutzbar, Jobs warten.
 
+**Dedizierter Runner-Container (Deployment-Muster, ab 1.4.1).** Der Runner läuft als eigener
+Container auf dem Docker-Host: dasselbe Core-Image mit `LYNDRIX_INSTANCE_ROLES=runner`, eigener
+Instanz-ID, eigenem Plugin-Verzeichnis, Docker-Socket und den Volumes `storage`
+(`git_repos`, `services`, Job-Logs) und `security` (SSH-Key). Die API-Instanz desselben Hosts
+braucht dafür keinen Socket mehr. In der aac-Welt ist das die Dependency `aac-lyndrix-runner`
+in der SSoT `aac-lyndrix-core` (Controller-Override `LYNDRIX_RUNNER_INSTANCE_ID`, Core-Rollen
+`api`). Ein Redeploy des Stacks startet auch den Runner neu; ein dabei unterbrochener Job wird
+nach dem Start aus seinen `aac-runner-*`-Containern geschlossen (laufend → wieder angehängt,
+beendet → Exit-Code und Log-Tail), nie pauschal als „Runner lost“ markiert. Eigene Jobs sind
+nie Verwaisten-Kandidaten, der erste Sweep wartet 90 s.
+
 Noch offen: eigenständiges `lyndrix-runner`-Image und ein Kubernetes-Executor (Jobs statt
 Docker-Socket), Job-Logs und Working-Trees weg vom lokalen Host des Runners.
 
