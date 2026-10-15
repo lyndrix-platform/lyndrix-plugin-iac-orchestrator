@@ -121,9 +121,17 @@ class JobQueue:
     cheap; callers off-load them with ``asyncio.to_thread`` where it matters."""
 
     def _session(self):
-        if not db_instance.is_connected or not db_instance.SessionLocal:
-            return None
-        return db_instance.SessionLocal()
+        # READ COMMITTED: several writers (progress, heartbeat, runner snapshot, claim)
+        # touch one job row concurrently — see database.read_committed_session.
+        from ..model.database import read_committed_session
+
+        return read_committed_session()
+
+    @staticmethod
+    def _retry(fn):
+        from ..model.database import retry_write
+
+        return retry_write(fn)
 
     # ------------------------------------------------------------------ schema
     def ensure_schema(self) -> None:
@@ -270,22 +278,29 @@ class JobQueue:
     def heartbeat(self, instance_id: str, job_ids: list[int]) -> None:
         if not job_ids:
             return
-        session = self._session()
-        if not session:
-            return
+
+        def _tx():
+            session = self._session()
+            if not session:
+                return
+            try:
+                session.execute(
+                    update(IaCJob)
+                    .where(IaCJob.id.in_(job_ids), IaCJob.owner_instance == instance_id,
+                           IaCJob.status == STATUS_RUNNING)
+                    .values(heartbeat_at=datetime.now())
+                )
+                session.commit()
+            except Exception:
+                session.rollback()
+                raise
+            finally:
+                session.close()
+
         try:
-            session.execute(
-                update(IaCJob)
-                .where(IaCJob.id.in_(job_ids), IaCJob.owner_instance == instance_id,
-                       IaCJob.status == STATUS_RUNNING)
-                .values(heartbeat_at=datetime.now())
-            )
-            session.commit()
+            self._retry(_tx)
         except Exception as exc:
-            session.rollback()
             log.debug("QUEUE: heartbeat failed: %s", exc)
-        finally:
-            session.close()
 
     def orphan_candidates(self, alive_instances: set[str] | None, stale_seconds: int = 180,
                           self_instance: str | None = None) -> list[dict]:
@@ -405,19 +420,27 @@ class JobQueue:
 
     # ----------------------------------------------------------------- runners
     def set_runners(self, job_id: int, runners: dict) -> None:
-        session = self._session()
-        if not session or job_id in (None, -1):
+        if job_id in (None, -1):
             return
+        blob = json.dumps(runners, default=str)
+
+        def _tx():
+            session = self._session()
+            if not session:
+                return
+            try:
+                session.execute(update(IaCJob).where(IaCJob.id == job_id).values(runners=blob))
+                session.commit()
+            except Exception:
+                session.rollback()
+                raise
+            finally:
+                session.close()
+
         try:
-            session.execute(
-                update(IaCJob).where(IaCJob.id == job_id).values(runners=json.dumps(runners, default=str))
-            )
-            session.commit()
+            self._retry(_tx)
         except Exception as exc:
-            session.rollback()
             log.debug("QUEUE: set_runners failed: %s", exc)
-        finally:
-            session.close()
 
     def runners_for(self, job_id: int) -> dict:
         session = self._session()

@@ -7,13 +7,54 @@ from sqlalchemy import or_
 
 log = logging.getLogger("IaC:Database")
 
+# MariaDB ≥ 11.6 runs innodb_snapshot_isolation=ON: a REPEATABLE READ transaction that
+# updates a row another transaction changed since its first read fails with error 1020
+# instead of waiting. Several writers touch one job row at once (progress per Ansible
+# task, the worker heartbeat, the runner snapshot) — so every session here runs READ
+# COMMITTED and the short writers retry on 1020/1205/1213.
+_RETRY_CODES = ("1020", "1205", "1213")
+
+
+def _is_retryable(exc: Exception) -> bool:
+    return any(code in str(getattr(exc, "orig", exc)) for code in _RETRY_CODES)
+
+
+def read_committed_session():
+    """A core session pinned to READ COMMITTED (no-op on SQLite). ``None`` when the
+    core database is not connected."""
+    if not db_instance.is_connected or not db_instance.SessionLocal:
+        return None
+    session = db_instance.SessionLocal()
+    try:
+        bind = session.get_bind()
+        if bind is not None and getattr(bind.dialect, "name", "") in ("mysql", "mariadb"):
+            session.connection(execution_options={"isolation_level": "READ COMMITTED"})
+    except Exception as exc:  # isolation is an optimisation, never a reason to fail
+        log.debug("read_committed_session: isolation not applied: %s", exc)
+    return session
+
+
+def retry_write(fn, *, attempts: int = 4, pause: float = 0.05):
+    """Run ``fn()`` (a complete short transaction) again on 1020/1205/1213."""
+    import time as _time
+
+    for attempt in range(attempts):
+        try:
+            return fn()
+        except Exception as exc:
+            if attempt + 1 < attempts and _is_retryable(exc):
+                _time.sleep(pause * (attempt + 1))
+                continue
+            raise
+
+
 class JobDatabase:
     def _get_session(self):
         """Safely retrieves a database session if the central engine is connected."""
-        if not db_instance.is_connected or not db_instance.SessionLocal:
+        session = read_committed_session()
+        if session is None:
             log.error("JobDatabase: Cannot get session, Core Database is disconnected.")
-            return None
-        return db_instance.SessionLocal()
+        return session
 
     def create_job(self, pipeline_type: str) -> int:
         """Creates a new job record and returns its ID."""
@@ -48,24 +89,28 @@ class JobDatabase:
         if job_id == -1:
             return
 
-        session = self._get_session()
-        if not session:
-            return
+        def _tx():
+            session = self._get_session()
+            if not session:
+                return
+            try:
+                job = session.query(IaCJob).filter(IaCJob.id == job_id).first()
+                if job:
+                    job.status = status
+                    if status in ["SUCCESS", "FAILED", "ERROR", "ABORTED"]: # Added ABORTED for the Kill Switch
+                        job.end_time = datetime.now()
+                        job.progress = 100 if status == "SUCCESS" else job.progress # Snap to 100% on success
+                    session.commit()
+            except Exception:
+                session.rollback()
+                raise
+            finally:
+                session.close()
 
         try:
-            job = session.query(IaCJob).filter(IaCJob.id == job_id).first()
-            if job:
-                job.status = status
-                if status in ["SUCCESS", "FAILED", "ERROR", "ABORTED"]: # Added ABORTED for the Kill Switch
-                    job.end_time = datetime.now()
-                    job.progress = 100 if status == "SUCCESS" else job.progress # Snap to 100% on success
-                session.commit()
+            retry_write(_tx)
         except Exception as e:
             log.error(f"Failed to update job {job_id} in DB: {e}")
-            session.rollback()
-        finally:
-            if session:
-                session.close()
 
     def get_recent_jobs(self, limit: int = 20) -> list:
         """Fetches metadata for the UI table."""
@@ -313,24 +358,31 @@ class JobDatabase:
                 
     def update_progress(self, job_id: int, progress: int = None, current_step: str = None):
         """Live updates the progress bar and current action text."""
-        session = self._get_session()
-        if not session or job_id == -1:
+        if job_id in (None, -1):
             return
 
+        def _tx():
+            session = self._get_session()
+            if not session:
+                return
+            try:
+                job = session.query(IaCJob).filter(IaCJob.id == job_id).first()
+                if job:
+                    if progress is not None:
+                        job.progress = progress
+                    if current_step:
+                        job.current_step = str(current_step)[:250]
+                    session.commit()
+            except Exception:
+                session.rollback()
+                raise
+            finally:
+                session.close()
+
         try:
-            job = session.query(IaCJob).filter(IaCJob.id == job_id).first()
-            if job:
-                if progress is not None: 
-                    job.progress = progress
-                if current_step:
-                    job.current_step = str(current_step)[:250] 
-                session.commit()
+            retry_write(_tx)
         except Exception as e:
             log.error(f"Failed to update progress for job {job_id}: {e}")
-            session.rollback()
-        finally:
-            if session:
-                session.close()
 
     def insert_job_task(self, job_id: int, task_num: int, task_name: str, task_label: str, 
                        start_time: float, end_time: float, duration_ms: int, status: str, error: str = None):

@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.2] - 2026-10-15
+
+### Fixed
+- **MariaDB error 1020 on the job row** — progress updates (per Ansible task), the worker
+  heartbeat and the runner snapshot write the same `iac_orchestrator_jobs` row concurrently;
+  under `innodb_snapshot_isolation=ON` that failed with "Record has changed since last read"
+  and dropped progress updates. Every job/queue session now runs READ COMMITTED and the short
+  writers retry on 1020/1205/1213 (`app/model/database.py`: `read_committed_session`,
+  `retry_write`).
+
 ## [1.4.1] - 2026-10-15
 
 ### Fixed
