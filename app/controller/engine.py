@@ -2,7 +2,6 @@ import asyncio
 import json
 import sys
 import os
-import importlib
 import logging
 import shutil
 import time
@@ -766,7 +765,12 @@ class AdoptHostStrategy(PipelineStrategy):
     def build_stages(self, engine, payload, context):
         # Import existing CT(s) into Terraform state (then plan to verify) so
         # manually-created containers come under management without recreation.
-        host_name = payload.get("host_name")
+        host_name = str(payload.get("host_name") or "").strip()
+        if host_name and not engine.is_known_host(host_name) and engine.is_known_site(host_name):
+            # A caller handed the SITE as host_name ("Adopt Host onprem" failed with
+            # "No terraform.tfvars.json contains host 'onprem'"): adopt the scope.
+            log.info("Adopt: '%s' is a site, not a host — adopting the whole site.", host_name)
+            return [TerraformAdoptScopeStage(limit=host_name)]
         if host_name:
             context["host_name"] = host_name
             return [TerraformAdoptStage(host_name=host_name)]
@@ -2307,7 +2311,7 @@ class DeploymentEngine:
                 "plan_summary": plan_summary,
             }
             
-        except Exception as e:
+        except Exception:
             if "active_tasks" in self.state and task_name in self.state["active_tasks"]:
                 self.state["active_tasks"][task_name]["status"] = "error"
                 self._sync_runners(job_id, force=True)
@@ -2689,19 +2693,7 @@ class DeploymentEngine:
         # already tracked) and non-fatal (a not-yet-existing CT falls through to apply).
         import_cmd = ""
         if import_specs and (mode == "import" or do_apply):
-            parts = []
-            for spec in import_specs:
-                addr, ref = spec.get("addr", ""), spec.get("ref", "")
-                if not addr or not ref:
-                    continue
-                parts.append(
-                    f"if ! {tf_bin} state list 2>/dev/null | grep -qxF '{addr}'; then "
-                    f"echo '[adopt] importing {addr}'; "
-                    f"{tf_bin} import -input=false -no-color '{addr}' '{ref}' || "
-                    f"echo '[adopt] import skipped for {addr} (not present yet)'; "
-                    f"else echo '[adopt] {addr} already in state'; fi; "
-                )
-            import_cmd = "".join(parts)
+            import_cmd = self._build_import_cmd(tf_bin, import_specs)
         shell_cmd = (
             "set -euo pipefail; "
             f"cd '{run_dir}'; "
@@ -2780,6 +2772,61 @@ class DeploymentEngine:
             "hosts_to_destroy": _stats.get("hosts_to_destroy") or [],
             "plan_summary": _stats.get("plan_summary") or "",
         }
+
+    @staticmethod
+    def _build_import_cmd(tf_bin: str, import_specs: list[dict]) -> str:
+        """Shell for the guarded adopt step, one block per spec.
+
+        A CT that moved to another Proxmox node (``node_name`` changed) is still
+        tracked under the OLD per-node module (``module.lxc_<old>…ct["<host>"]``):
+        importing it under the new module would create a second state entry and
+        the old one — now without a for_each key — breaks ``output "info"`` on
+        refresh (``var.containers[name]`` → Invalid index) and would be planned
+        for destruction. So: already at the target address → nothing; tracked
+        under another ``lxc_*`` module → ``state mv``; tracked nowhere → import.
+        The OpenTofu image has sh+grep but no bash/jq — keep it POSIX.
+        """
+        parts = []
+        for spec in import_specs:
+            addr, ref = spec.get("addr", ""), spec.get("ref", "")
+            if not addr or not ref:
+                continue
+            host = str(spec.get("host") or "").strip()
+            ct_suffix = f'.proxmox_virtual_environment_container.ct["{host}"]' if host else ""
+            move_block = (
+                f"OLD=$({tf_bin} state list 2>/dev/null | grep -F '{ct_suffix}' | grep -vxF '{addr}' | head -n 1); "
+                "if [ -n \"$OLD\" ]; then "
+                f"echo \"[adopt] moving $OLD -> \"'{addr}'\" (node changed)\"; "
+                f"{tf_bin} state mv -no-color \"$OLD\" '{addr}' || echo \"[adopt] state mv failed for $OLD\"; "
+                "else "
+            ) if ct_suffix else ""
+            import_block = (
+                f"echo '[adopt] importing {addr}'; "
+                f"{tf_bin} import -input=false -no-color '{addr}' '{ref}' || "
+                f"echo '[adopt] import skipped for {addr} (not present yet)'; "
+            )
+            close_move = "fi; " if ct_suffix else ""
+            parts.append(
+                f"if ! {tf_bin} state list 2>/dev/null | grep -qxF '{addr}'; then "
+                f"{move_block}{import_block}{close_move}"
+                f"else echo '[adopt] {addr} already in state'; fi; "
+            )
+        return "".join(parts)
+
+    def is_known_site(self, name: str) -> bool:
+        """``name`` is a site directory under inventory_state (and not a host)."""
+        name = str(name or "").strip()
+        if not name or name == "all":
+            return False
+        site_dir = self.base_git_dir / "inventory_state" / name
+        return site_dir.is_dir()
+
+    def is_known_host(self, name: str) -> bool:
+        try:
+            self._find_terraform_context_for_host(str(name or "").strip().lower())
+            return True
+        except Exception:
+            return False
 
     async def execute_terraform_provision(
         self, host_name: str, job_id: int, force_apply: bool = False,
@@ -2865,6 +2912,7 @@ class DeploymentEngine:
                     import_specs = [{
                         "addr": f'module.lxc_{node_name}.proxmox_virtual_environment_container.ct["{host_name}"]',
                         "ref": f"{node_name}/{_vmid}",
+                        "host": host_name,
                     }]
                 else:
                     log.warning("adopt_existing: no vm_id for host '%s' in tfvars; skipping import.", host_name)
@@ -3210,7 +3258,6 @@ class DeploymentEngine:
 
     def _organize_host_provision_tasks(self, pipeline, context):
         """Group host_provision stages into named tasks for tracking."""
-        import time
         tasks = []
         
         # Group stages into logical tasks

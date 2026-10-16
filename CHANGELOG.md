@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.3] - 2026-10-16
+### Fixed
+- Adopt/import of a container that moved to another Proxmox node: the guarded import step now finds the CT under its old per-node module (`module.lxc_<old>…ct["<host>"]`) and runs `tofu state mv` to the new address instead of importing a second entry — the old orphan broke `output "info"` on refresh (`var.containers[name]` → Invalid index) and would have been planned for destruction. Import still happens only when the CT is tracked nowhere.
+- "Adopt Host" with a site name as `host_name` (job "Adopt Host onprem" → "No terraform.tfvars.json contains host 'onprem'") now runs the site-scoped adopt.
+
 ## [1.4.2] - 2026-10-15
 
 ### Fixed
