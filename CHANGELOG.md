@@ -5,6 +5,10 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.0] - 2026-10-16
+### Added
+- AI assistant (core API 1.12): manifest `ai_instructions` (purpose) + `ai_instructions_route`; the full operating guide is served live at `GET /ai/instructions` from `ai/INSTRUCTIONS.md` (concepts, trigger model, adopt/plan/apply operations, guardrails).
+
 ## [1.4.3] - 2026-10-16
 ### Fixed
 - Adopt/import of a container that moved to another Proxmox node: the guarded import step now finds the CT under its old per-node module (`module.lxc_<old>…ct["<host>"]`) and runs `tofu state mv` to the new address instead of importing a second entry — the old orphan broke `output "info"` on refresh (`var.containers[name]` → Invalid index) and would have been planned for destruction. Import still happens only when the CT is tracked nowhere.

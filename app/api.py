@@ -32,6 +32,7 @@ PLUGIN_ID = "lyndrix.plugin.iac_orchestrator"
 # versa — so gating on the bare ids would lock out groups holding only this
 # plugin's qualified viewer/operator role permissions. Gate on the scoped ids:
 # scoped grants unlock exactly this plugin, global grants keep working.
+PLUGIN_VERSION = "1.5.0"   # mirrors entrypoint.manifest.version
 PERM_READ = f"plugin:{PLUGIN_ID}:api:read"
 PERM_WRITE = f"plugin:{PLUGIN_ID}:api:write"
 
@@ -45,6 +46,16 @@ def build_plugin_router(service) -> APIRouter:
     @router.get("/catalog")
     async def get_catalog(identity: ApiIdentity = Depends(require_permission(PERM_READ))):
         return await _api.do_get_catalog()
+
+    @router.get("/ai/instructions")
+    async def ai_instructions(identity: ApiIdentity = Depends(require_permission(PERM_READ))):
+        """Full AI operating guide (core API 1.12 contract) — served live from ai/INSTRUCTIONS.md."""
+        import asyncio
+        from pathlib import Path
+
+        path = Path(__file__).resolve().parents[1] / "ai" / "INSTRUCTIONS.md"
+        text = await asyncio.to_thread(lambda: path.read_text(encoding="utf-8") if path.is_file() else "")
+        return {"plugin_id": PLUGIN_ID, "version": PLUGIN_VERSION, "format": "markdown", "markdown": text}
 
     @router.get("/jobs")
     async def list_jobs(

@@ -20,7 +20,7 @@ from .app.ui.widget import render_dashboard_widget as modular_widget
 manifest = ModuleManifest(
     id="lyndrix.plugin.iac_orchestrator",
     name="IaC Orchestrator",
-    version="1.4.3",
+    version="1.5.0",
     description="Standalone GitOps controller for executing Terraform and Ansible pipelines.",
     author="Lyndrix",
     icon="rocket_launch",
@@ -32,6 +32,15 @@ manifest = ModuleManifest(
     # happens only on instances whose LYNDRIX_INSTANCE_ROLES include "runner": they
     # claim QUEUED jobs (app/controller/queue.py). Single mode has every role.
     placement="any",
+    # AI assistant (core API 1.12): short purpose here, the full operating guide is
+    # served live from ai/INSTRUCTIONS.md at /ai/instructions (single source of truth).
+    ai_instructions=(
+        "GitOps control plane for infrastructure: Terraform/OpenTofu plans, applies and state "
+        "adoption for Proxmox/Hetzner containers plus Ansible service rollouts, all rendered from "
+        "the iac-controller SSoT. Reach for it to inspect Terraform state, adopt existing containers, "
+        "plan or apply infrastructure and roll out a single AAC service — never to hand-edit live infra."
+    ),
+    ai_instructions_route="/ai/instructions",
     auto_enable_on_install=True,
     repo_url="https://github.com/lyndrix-platform/lyndrix-plugin-iac-orchestrator",
     # Identity 2.0: fine-grained infra-apply permission (replaces the old
