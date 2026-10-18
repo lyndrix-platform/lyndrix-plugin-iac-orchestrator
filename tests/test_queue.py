@@ -266,3 +266,174 @@ def test_alive_set_untrusted_until_it_lists_this_instance(q):
 
     assert JobWorker(_Ctx2(), q, noop)._alive_instances() is None
     assert JobWorker(_Ctx(), q, noop)._alive_instances() == {"runner-x"}
+
+
+# --- maintenance windows (1.6): SCHEDULED, park/promote, coalesce, overrides ------
+
+from iac_plugin.app.controller.queue import from_queue_clock, to_queue_clock  # noqa: E402
+from iac_plugin.app.model.database import JobDatabase  # noqa: E402
+
+WEBHOOK = {"pipeline_type": "single_service", "service_name": "svc-a", "service_branch": "main", "trigger": "gitlab-ci"}
+
+
+def _row(jid):
+    with queue_mod.db_instance.SessionLocal() as s:
+        return s.get(IaCJob, jid)
+
+
+def test_clock_helpers_roundtrip():
+    from datetime import timezone
+    aware = datetime(2026, 10, 25, 2, 0, tzinfo=timezone.utc)
+    naive = to_queue_clock(aware)
+    assert naive.tzinfo is None and from_queue_clock(naive) == aware
+    assert from_queue_clock(None) is None and to_queue_clock(naive) is naive
+
+
+def test_park_releases_claim_and_due_claim_takes_it_again(q):
+    jid = q.enqueue(WEBHOOK)
+    assert q.claim_next("r1")[0] == jid
+    future = datetime.now() + timedelta(days=3)
+    assert q.park(jid, not_before=future, window_ci_ids=["u-s", "u-h"], reason="window later", instance_id="r1")
+    row = _row(jid)
+    assert row.status == "SCHEDULED" and row.owner_instance is None and row.claimed_at is None
+    assert row.heartbeat_at is None and row.progress == 0 and row.current_step == "Scheduled"
+    assert row.schedule_reason == "window later" and "u-s" in row.window_ci_ids
+    assert q.park(jid, not_before=future, window_ci_ids=[], reason="again") is False  # not RUNNING any more
+    assert q.claim_next("r2") is None                       # not due
+    assert q.scheduled_count() == 1 and q.queued_count() == 0
+    assert q.orphan_candidates(set(), 0) == []              # no owner → never an orphan
+    sched = q.job_schedule(jid)
+    assert sched["status"] == "SCHEDULED" and sched["window_ci_ids"] == ["u-s", "u-h"]
+    assert sched["not_before"] == from_queue_clock(to_queue_clock(from_queue_clock(future)))
+
+    # make it due → the claim takes it, not_before stays on the row
+    with queue_mod.db_instance.SessionLocal() as s:
+        s.execute(update(IaCJob).where(IaCJob.id == jid).values(not_before=datetime.now() - timedelta(minutes=1)))
+        s.commit()
+    claimed = q.claim_next("r2")
+    assert claimed and claimed[0] == jid and claimed[1]["service_name"] == "svc-a"
+    row = _row(jid)
+    assert row.status == "RUNNING" and row.owner_instance == "r2" and row.not_before is not None
+
+
+def test_due_scheduled_comes_before_plain_queue(q):
+    q.enqueue({"pipeline_type": "connectivity"})
+    b = q.enqueue(WEBHOOK)
+    q.claim_next("r1")  # a RUNNING
+    q.claim_next("r1")  # b RUNNING
+    assert q.park(b, not_before=datetime.now() - timedelta(minutes=5), window_ci_ids=None, reason="due")
+    c = q.enqueue({"pipeline_type": "state_check", "host_name": "h1"})
+    assert q.claim_next("r1")[0] == b   # due scheduled first
+    assert q.claim_next("r1")[0] == c
+
+
+def test_promote_runs_now_with_force(q):
+    jid = q.enqueue(WEBHOOK)
+    q.claim_next("r1")
+    q.park(jid, not_before=datetime.now() + timedelta(days=1), window_ci_ids=["u"], reason="later")
+    before = _row(jid).start_time
+    assert q.promote(jid, override=True) is True
+    row = _row(jid)
+    assert row.status == "QUEUED" and row.not_before is None and row.start_time >= before
+    assert q.promote(jid) is False  # no longer SCHEDULED
+    claimed = q.claim_next("r1")
+    assert claimed[0] == jid and claimed[1]["force"] is True
+
+
+def test_newer_webhook_is_coalesced_into_scheduled_job(q):
+    jid = q.enqueue(WEBHOOK)
+    q.claim_next("r1")
+    q.park(jid, not_before=datetime.now() + timedelta(days=1), window_ci_ids=None, reason="later")
+    with queue_mod.db_instance.SessionLocal() as s:
+        s.execute(update(IaCJob).where(IaCJob.id == jid).values(start_time=datetime.now() - timedelta(days=2)))
+        s.commit()
+    res = q.enqueue_ex({**WEBHOOK, "service_branch": "release-2"}, requested_by="webhook")
+    assert res.job_id == jid and res.coalesced and not res.promoted
+    row = _row(jid)
+    assert row.status == "SCHEDULED" and row.not_before is not None
+    assert "release-2" in row.payload and row.start_time >= datetime.now() - timedelta(minutes=1)
+    assert q.scheduled_count() == 1  # still exactly one job for the service
+
+
+def test_ui_deploy_promotes_scheduled_job(q):
+    jid = q.enqueue(WEBHOOK)
+    q.claim_next("r1")
+    q.park(jid, not_before=datetime.now() + timedelta(days=1), window_ci_ids=None, reason="later")
+    res = q.enqueue_ex({"pipeline_type": "single_service", "service_name": "svc-a", "manual": True, "trigger": "ui"},
+                       requested_by="ui")
+    assert res.job_id == jid and res.promoted and not res.coalesced
+    row = _row(jid)
+    assert row.status == "QUEUED" and row.not_before is None and '"force": true' in row.payload
+    # QUEUED now → a further trigger is a duplicate again (first wins, as before)
+    with pytest.raises(DuplicateJob):
+        q.enqueue(WEBHOOK)
+
+
+def test_abort_queued_keeps_scheduled_unless_asked(q):
+    a = q.enqueue(WEBHOOK)
+    q.claim_next("r1")
+    q.park(a, not_before=datetime.now() + timedelta(days=1), window_ci_ids=None, reason="later")
+    b = q.enqueue({"pipeline_type": "connectivity"})
+    assert q.abort_queued() == [b]
+    assert _row(a).status == "SCHEDULED"
+    assert q.abort_queued(include_scheduled=True) == [a]
+    assert _row(a).status == "ABORTED" and _row(a).not_before is None
+
+
+def test_abort_scheduled_and_listing(q):
+    a = q.enqueue(WEBHOOK)
+    q.claim_next("r1")
+    nb = datetime.now() + timedelta(days=1)
+    q.park(a, not_before=nb, window_ci_ids=["u-s"], reason="later")
+    rows = q.scheduled_jobs()
+    assert len(rows) == 1 and rows[0]["id"] == a and rows[0]["service"] == "svc-a" and rows[0]["branch"] == "main"
+    assert rows[0]["trigger"] == "gitlab-ci" and rows[0]["window_ci_ids"] == ["u-s"]
+    assert rows[0]["not_before"].tzinfo is not None and rows[0]["schedule_reason"] == "later"
+    assert q.live_summary()["scheduled"] == 1
+    assert q.abort_scheduled(a) is True and q.abort_scheduled(a) is False
+    assert _row(a).status == "ABORTED" and q.scheduled_jobs() == []
+
+
+def test_clear_all_jobs_keeps_scheduled_and_running(q):
+    a = q.enqueue(WEBHOOK)
+    q.claim_next("r1")
+    q.park(a, not_before=datetime.now() + timedelta(days=1), window_ci_ids=None, reason="later")
+    b = q.enqueue({"pipeline_type": "connectivity"})
+    q.claim_next("r1")  # b RUNNING
+    c = q.enqueue({"pipeline_type": "state_check", "host_name": "h1"})
+    with queue_mod.db_instance.SessionLocal() as s:
+        s.execute(update(IaCJob).where(IaCJob.id == c).values(status="SUCCESS"))
+        s.commit()
+    assert JobDatabase().clear_all_jobs(keep_running=True) == 1
+    assert _row(a).status == "SCHEDULED" and _row(b).status == "RUNNING" and _row(c) is None
+
+
+def test_latest_job_prefers_scheduled_regardless_of_time_window(q):
+    a = q.enqueue(WEBHOOK)
+    q.claim_next("r1")
+    q.park(a, not_before=datetime.now() + timedelta(days=1), window_ci_ids=None, reason="later")
+    with queue_mod.db_instance.SessionLocal() as s:  # parked long ago
+        s.execute(update(IaCJob).where(IaCJob.id == a).values(start_time=datetime.now() - timedelta(days=10)))
+        s.commit()
+    job = JobDatabase().get_latest_job_for_pipeline_type("single_service:svc-a", since_epoch=int(datetime.now().timestamp()))
+    assert job and job["id"] == a and job["status"] == "SCHEDULED" and job["not_before"] is not None
+
+
+def test_override_bookkeeping_and_terminal_hook(q):
+    a = q.enqueue(WEBHOOK)
+    q.claim_next("r1")
+    q.set_override(a, "iac-job-%d" % a, ["u-s", "u-h"])
+    assert _row(a).override_id == f"iac-job-{a}"
+    live = q.running_overrides()
+    assert len(live) == 1 and live[0]["override_id"] == f"iac-job-{a}" and live[0]["window_ci_ids"] == ["u-s", "u-h"]
+    assert live[0]["claimed_at"].tzinfo is not None
+    assert q.clear_override(a) == f"iac-job-{a}"
+    assert q.clear_override(a) is None          # exactly once
+    assert _row(a).override_id is None
+
+    ended = []
+    q.on_terminal = ended.append
+    q.set_override(a, "iac-job-x", [])
+    assert q.mark_failed(a, "Runner 'r1' lost") is True
+    assert ended == [a]
+    assert q.mark_failed(a, "again") is False and ended == [a]  # hook only on the real transition

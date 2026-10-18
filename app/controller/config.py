@@ -119,6 +119,47 @@ class IaCConfig:
             if host and host.strip()
         }
 
+    # --- MAINTENANCE WINDOWS (plugin 1.6) — env > Vault (settings UI) > default ---
+    def _get_bool(self, env_var: str, vault_key: str, default: bool) -> bool:
+        raw = str(self._get(env_var, vault_key, "true" if default else "false")).strip().lower()
+        return raw in ("1", "true", "yes", "on")
+
+    def _get_int(self, env_var: str, vault_key: str, default: int, *, minimum: int = 0) -> int:
+        try:
+            return max(minimum, int(str(self._get(env_var, vault_key, str(default))).strip()))
+        except ValueError:
+            return default
+
+    @property
+    def maintenance_deploy_marks_maintenance(self) -> bool:
+        """Every executed deploy announces a maintenance override (decision B)."""
+        return self._get_bool("PLUGIN_IAC_ORCHESTRATOR_MAINTENANCE_DEPLOY_MARKS_MAINTENANCE",
+                              "iac_maintenance_deploy_marks_maintenance", True)
+
+    @property
+    def maintenance_max_override_minutes(self) -> int:
+        """Upper bound of a deploy override (its end is unknown when it starts)."""
+        return self._get_int("PLUGIN_IAC_ORCHESTRATOR_MAINTENANCE_MAX_OVERRIDE_MINUTES",
+                             "iac_maintenance_max_override_minutes", 240, minimum=1)
+
+    @property
+    def maintenance_linger_minutes(self) -> int:
+        """How long consumers keep the override after ``override_ended``."""
+        return self._get_int("PLUGIN_IAC_ORCHESTRATOR_MAINTENANCE_LINGER_MINUTES",
+                             "iac_maintenance_linger_minutes", 15, minimum=0)
+
+    @property
+    def maintenance_schedule_horizon_days(self) -> int:
+        """How far ahead a ``deploy_policy: window`` deploy may be parked."""
+        return self._get_int("PLUGIN_IAC_ORCHESTRATOR_MAINTENANCE_SCHEDULE_HORIZON_DAYS",
+                             "iac_maintenance_schedule_horizon_days", 30, minimum=1)
+
+    @property
+    def maintenance_report_missing_window(self) -> bool:
+        """Emit ``maintenance:window_missing`` when a window deploy runs without a window (decision H)."""
+        return self._get_bool("PLUGIN_IAC_ORCHESTRATOR_MAINTENANCE_REPORT_MISSING_WINDOW",
+                              "iac_maintenance_report_missing_window", True)
+
     def get_log_path(self, job_id: int) -> Path:
         return self.logs_dir / f"job_{job_id}.log"
 

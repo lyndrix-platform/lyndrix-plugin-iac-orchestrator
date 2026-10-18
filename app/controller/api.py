@@ -32,6 +32,7 @@ from pydantic import BaseModel, Field
 
 from .settings_schema import OrchestratorSettings
 from .queue import DuplicateJob as _DuplicateJob
+from . import maintenance_resolver as _mres
 
 # Internal references to be set by init_api
 _ctx = None
@@ -272,6 +273,10 @@ def _should_trigger_orchestrator(payload: dict) -> tuple[bool, str]:
         ).lower()
         if "ci: automated state update" in commit_message:
             return False, "ignored orchestrator auto-commit pipeline"
+        # Loop guard for the (future) SSoT-Manager maintenance-default switch: its
+        # controller commit syncs the tree but must never trigger a deploy.
+        if _mres.is_maintenance_commit(commit_message):
+            return False, "ignored maintenance default commit"
 
         return True, "pipeline success"
 
@@ -534,6 +539,7 @@ async def do_health():
         "vault_ready": _ctx.get_secret("iac_auto_apply") is not None,
         "active_workers": len(live.get("active_tasks") or {}),
         "queued_jobs": live.get("queued", 0),
+        "scheduled_jobs": live.get("scheduled", 0),
         "runner_online": bool(_service.runner_online()) if _service else True,
         "is_runner": bool(_service.is_runner) if _service else True,
         "instance_id": getattr(_ctx, "instance_id", None),
@@ -623,8 +629,14 @@ async def do_get_catalog():
     return _snapshot_items("catalog") or []
 
 
-async def do_trigger_service_deployment(service_name: str, payload: DeployRequest):
-    """Triggers a targeted single-service deployment."""
+async def do_trigger_service_deployment(service_name: str, payload: DeployRequest, *, trigger: str = "ui"):
+    """Triggers a targeted single-service deployment.
+
+    ``trigger`` tells the maintenance policy stage where the deploy comes from:
+    ``gitlab-ci`` (service CI, public route) follows the service's ``deploy_policy``
+    and may be parked as SCHEDULED; ``ui`` (catalog button) always runs at once and
+    promotes a parked job for the same service ("run now").
+    """
     if not _ctx:
         raise HTTPException(status_code=500, detail="Context offline")
     normalized_service = str(service_name or "").strip().lower()
@@ -650,14 +662,50 @@ async def do_trigger_service_deployment(service_name: str, payload: DeployReques
         "service_name": normalized_service,
         "service_branch": branch,
         "manual": True,
+        "trigger": str(trigger or "ui"),
     }
     _ctx.emit("iac:webhook_verified", event_payload)
     _emit_webhook_verified(event_payload)
     return {"status": "accepted", "message": f"Deployment queued for {normalized_service}"}
 
 
-async def do_get_service_status(service_name: str, since_epoch: int = 0):
-    """Returns the latest deployment status for a service, optionally after an epoch timestamp."""
+def map_service_status(job: dict | None, *, accept: str | None = None) -> dict:
+    """CI-facing status of the newest job of a service (pure; ``job`` from
+    ``get_latest_job_for_pipeline_type``).
+
+    Maintenance windows (1.6): a parked job is ``SCHEDULED``. Only a caller that
+    sends ``accept=scheduled`` gets ``status: "scheduled"`` (+ ``not_before``); the
+    old CI template polls for success/failed and would turn red on anything else, so
+    without it the compatibility mode answers ``status: "success"`` with
+    ``job_status: "SCHEDULED"`` (decision D / finding 7). ``QUEUED`` is ``running``.
+    """
+    accepted = {a.strip().lower() for a in str(accept or "").split(",") if a.strip()}
+    job_status = str((job or {}).get("status") or "").upper()
+    if job_status == "SUCCESS":
+        status = "success"
+    elif job_status in {"FAILED", "ERROR", "ABORTED"}:
+        status = "failed"
+    elif job_status in {"RUNNING", "PENDING", "QUEUED"}:
+        status = "running"
+    elif job_status == "SCHEDULED":
+        status = "scheduled" if "scheduled" in accepted else "success"
+    else:
+        status = "unknown"
+    out: dict = {"status": status, "job_status": job_status}
+    not_before = (job or {}).get("not_before")
+    if job_status == "SCHEDULED" and not_before is not None:
+        from .queue import from_queue_clock
+        from core.api import maintenance as _mw
+
+        aware = from_queue_clock(not_before)
+        out["not_before"] = _mw.iso(aware) if aware else None
+    return out
+
+
+async def do_get_service_status(service_name: str, since_epoch: int = 0, accept: str | None = None):
+    """Returns the latest deployment status for a service, optionally after an epoch
+    timestamp. ``accept`` is a comma list of extra statuses the caller understands
+    (today: ``scheduled``) — see :func:`map_service_status`."""
     if not _engine:
         raise HTTPException(status_code=500, detail="Engine offline")
     normalized_service = str(service_name or "").strip().lower()
@@ -672,25 +720,152 @@ async def do_get_service_status(service_name: str, since_epoch: int = 0):
             "since_epoch": since_epoch,
         }
 
-    job_status = str(job.get("status") or "").upper()
-    if job_status == "SUCCESS":
-        status = "success"
-    elif job_status in {"FAILED", "ERROR", "ABORTED"}:
-        status = "failed"
-    elif job_status in {"RUNNING", "PENDING"}:
-        status = "running"
-    else:
-        status = "unknown"
-
+    mapped = map_service_status(job, accept=accept)
     return {
-        "status": status,
+        **mapped,
         "found": True,
         "service_name": normalized_service,
         "pipeline_type": pipeline_type,
         "job_id": job.get("id"),
-        "job_status": job_status,
         "progress": job.get("progress") or 0,
         "current_step": job.get("current_step") or "",
+    }
+
+
+# ── Maintenance windows (plugin 1.6): scheduled deploys + effective windows ──
+
+def _iso(value) -> str | None:
+    if value is None:
+        return None
+    from core.api import maintenance as _mw
+
+    try:
+        return _mw.iso(value)
+    except Exception:
+        return str(value)
+
+
+async def do_list_schedules():
+    """Parked (SCHEDULED) deploys waiting for their maintenance window."""
+    if not _service:
+        raise HTTPException(status_code=503, detail="Orchestrator not initialized")
+    rows = await asyncio.to_thread(_service.queue.scheduled_jobs)
+    for r in rows:
+        r["not_before"] = _iso(r.get("not_before"))
+        r["start_time"] = _iso(r.get("start_time"))
+    return {"schedules": rows, "count": len(rows)}
+
+
+async def do_run_schedule_now(job_id: int):
+    """"Run now": promote a SCHEDULED job to QUEUED (``force``), wake the runners.
+    The maintenance override is announced when the job actually runs."""
+    if not _service:
+        raise HTTPException(status_code=503, detail="Orchestrator not initialized")
+    ok = await asyncio.to_thread(_service.promote_scheduled, int(job_id))
+    if not ok:
+        raise HTTPException(status_code=404, detail=f"Job #{job_id} is not a scheduled deployment")
+    return {"status": "ok", "job_id": int(job_id), "message": f"Scheduled job #{job_id} queued to run now"}
+
+
+async def do_cancel_schedule(job_id: int):
+    """Cancel a parked deploy (SCHEDULED → ABORTED)."""
+    if not _service:
+        raise HTTPException(status_code=503, detail="Orchestrator not initialized")
+    ok = await asyncio.to_thread(_service.queue.abort_scheduled, int(job_id))
+    if not ok:
+        raise HTTPException(status_code=404, detail=f"Job #{job_id} is not a scheduled deployment")
+    return {"status": "ok", "job_id": int(job_id), "message": f"Scheduled job #{job_id} cancelled"}
+
+
+def _maintenance_snapshot() -> dict:
+    """The runner-published read model (``snapshot:maintenance_effective``), empty when none."""
+    if not _engine:
+        return {}
+    try:
+        rec = _engine.db.get_state(_engine.MAINTENANCE_SNAPSHOT)
+    except Exception:
+        rec = None
+    data = (rec or {}).get("data")
+    return data if isinstance(data, dict) else {}
+
+
+def _running_overrides():
+    """Our own running deploy overrides as ``core.api.maintenance.Override`` objects
+    (what this plugin knows; other plugins' overrides live in their read models)."""
+    from datetime import timedelta
+    from core.api import maintenance as _mw
+
+    queue = getattr(_service, "queue", None)
+    if queue is None or not _engine:
+        return []
+    try:
+        rows = queue.running_overrides()
+    except Exception:
+        return []
+    max_minutes = int(_engine.config.maintenance_max_override_minutes)
+    linger = int(_engine.config.maintenance_linger_minutes)
+    out = []
+    for r in rows:
+        started = r.get("claimed_at") or _mw.utcnow()
+        out.append(_mw.Override(
+            override_id=str(r["override_id"]), ci_ids=tuple(r.get("window_ci_ids") or []),
+            until=started + timedelta(minutes=max_minutes), started_at=started,
+            linger_minutes=linger, reason=f"IaC deploy job #{r['id']}", source=_mres.SOURCE,
+        ))
+    return out
+
+
+async def do_maintenance_windows(site: str | None = None, stage: str | None = None,
+                                 kind: str | None = None, q: str | None = None):
+    """Effective maintenance windows (snapshot) with the evaluated state per item."""
+    if not _engine:
+        raise HTTPException(status_code=500, detail="Engine offline")
+    from core.api import maintenance as _mw
+
+    snap = await asyncio.to_thread(_maintenance_snapshot)
+    items = [it for it in (snap.get("items") or []) if isinstance(it, dict)]
+    term = str(q or "").strip().lower()
+    if site:
+        items = [it for it in items if it.get("site") == site]
+    if stage:
+        items = [it for it in items if it.get("stage") == stage]
+    if kind:
+        items = [it for it in items if it.get("kind") == kind]
+    if term:
+        items = [it for it in items if term in str(it.get("name") or "").lower()
+                 or term in str(it.get("host") or "").lower()]
+    overrides = await asyncio.to_thread(_running_overrides)
+    now = _mw.utcnow()
+    horizon = int(_engine.config.maintenance_schedule_horizon_days)
+    out = []
+    for it in items:
+        row = dict(it)
+        row["state"] = _mres.effective_state_of(it, overrides, now, horizon_days=horizon)
+        out.append(row)
+    all_items = [it for it in (snap.get("items") or []) if isinstance(it, dict)]
+    return {
+        "items": out,
+        "count": len(out),
+        "published_at": snap.get("published_at"),
+        "now": _mw.iso(now),
+        "sites": sorted({str(it.get("site")) for it in all_items if it.get("site")}),
+        "stages": sorted({str(it.get("stage")) for it in all_items if it.get("stage")}),
+        "kinds": sorted({str(it.get("kind")) for it in all_items if it.get("kind")}),
+    }
+
+
+async def do_maintenance_default():
+    """Read-only: ``maintenance_default`` per site/stage from the controller snapshot
+    (decision C — changed in the iac-controller repo, never from here)."""
+    if not _engine:
+        raise HTTPException(status_code=500, detail="Engine offline")
+    snap = await asyncio.to_thread(_maintenance_snapshot)
+    return {
+        "defaults": [d for d in (snap.get("defaults") or []) if isinstance(d, dict)],
+        "published_at": snap.get("published_at"),
+        "read_only": True,
+        "hint": "Edit maintenance_default (block under stage_vars: / site_vars:) in the iac-controller "
+                "repository; the next sync republishes it.",
     }
 
 
@@ -1180,6 +1355,7 @@ async def do_abort():
             if local or not owner or (alive is not None and owner not in alive):
                 _engine.db.update_job(job_id, "ABORTED")
                 _engine.db.update_progress(job_id, progress=None, current_step="Aborted by User")
+                _engine.end_override_for(job_id)  # maintenance override of a dead runner's job
         aborted.extend(running_ids)
 
     if aborted:
@@ -1746,6 +1922,7 @@ def _job_stream_snapshot() -> dict:
         "active_tasks": live.get("active_tasks") or {},
         "is_running": bool(live.get("is_running", False)),
         "queued": live.get("queued", 0),
+        "scheduled": live.get("scheduled", 0),
         "runner_online": bool(_service.runner_online()) if _service else True,
         "ts": time.time(),
     }

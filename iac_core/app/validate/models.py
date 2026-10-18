@@ -11,6 +11,11 @@ class ServiceDefinition(BaseModel):
     git_version: Optional[str] = None
     config: Optional[Dict[str, Any]] = None
 
+    # Keep unknown per-service keys (maintenance windows: ``maintenance``,
+    # ``incidents`` on a controller service entry) instead of silently dropping
+    # them — they must survive into the generated inventory like host extras do.
+    model_config = {"extra": "allow"}
+
 class TerraformConfig(BaseModel):
     is_managed: Optional[bool] = False
     is_used: Optional[bool] = False

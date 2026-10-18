@@ -103,6 +103,8 @@ Docker-Socket), Job-Logs und Working-Trees weg vom lokalen Host des Runners.
 | Methode | Pfad | Beschreibung |
 |---|---|---|
 | `POST` | `/api/iac/webhook/gitlab` | GitLab-Webhook empfangen (validiert `X-Gitlab-Token`) |
+| `POST` | `/api/iac/deploy/service/{svc}/gitlab` | Service-Deploy aus der Service-CI (`trigger: gitlab-ci` → Deploy-Policy gilt, siehe „Wartungsfenster“) |
+| `GET` | `/api/iac/deploy/service/{svc}/gitlab/status?since_epoch=&accept=` | Status des neuesten Jobs: `success` / `failed` / `running` (auch `QUEUED`). Ein geparkter Job (`SCHEDULED`) liefert nur mit `accept=scheduled` den Wert `scheduled` + `not_before`; ohne `accept` den Kompatibilitätswert `success` mit `job_status: "SCHEDULED"` (alte CI-Templates werden nie rot) |
 
 Dieser Router wird direkt auf der FastAPI-Applikation eingehängt (nicht über `ctx.register_routes`), damit externe GitLab/CI-Aufrufer ohne Lyndrix-User-Token durchkommen. Jeder Handler validiert den `X-Gitlab-Token` selbst.
 
@@ -134,8 +136,13 @@ Alle Routen unter `/api/plugins/lyndrix.plugin.iac_orchestrator/` erfordern eine
 | `PUT` | `/settings` | `api:write` | Einstellungen aktualisieren |
 | `GET` | `/git/status` | `api:read` | SSoT-Repository-Sync-Status |
 | `POST` | `/git/sync` | `api:write` | SSoT-Sync erzwingen |
+| `GET` | `/schedules` | `api:read` | Geparkte Deployments (`SCHEDULED`): `id`, `service`, `branch`, `trigger`, `not_before` (ISO UTC), `window_ci_ids`, `schedule_reason`, `start_time` |
+| `POST` | `/schedules/{job_id}/run-now` | `api:write` | „Jetzt ausführen“: `SCHEDULED → QUEUED` mit `force`; das Override entsteht beim Lauf |
+| `DELETE` | `/schedules/{job_id}` | `api:write` | Geparktes Deployment abbrechen (`ABORTED`) |
+| `GET` | `/maintenance-windows?site=&stage=&kind=&q=` | `api:read` | Effektive Fenster je Hypervisor/Host/Service aus dem Snapshot `maintenance_effective`, je Item `state` (`active`, `until`, `source`, `next_start`) über `core.api.maintenance.effective_state` |
+| `GET` | `/maintenance-default` | `api:read` | Nur lesend: `maintenance_default` je Site/Stage (`enabled`, `windows`, `source_file`, `level`) aus dem Controller-Snapshot |
 
-**Hinweis:** Der Einstellungs-Endpunkt heißt `/settings` (nicht `/prefs`), da `/settings` auf Core-Ebene reserviert ist und zu einem Routing-Konflikt führen würde.
+**Hinweis:** Der Einstellungs-Endpunkt heißt `/settings` (nicht `/prefs`), da `/settings` auf Core-Ebene reserviert ist und zu einem Routing-Konflikt führen würde. Die Pfade `/maintenance/*` sind Plugin-Pflege (Statistik löschen, Repo-Sync) — die Wartungsfenster liegen daher unter `/schedules`, `/maintenance-windows` und `/maintenance-default`.
 
 ---
 
@@ -156,9 +163,13 @@ Alle Routen unter `/api/plugins/lyndrix.plugin.iac_orchestrator/` erfordern eine
 | emit | `system:notify` | Plattform-Benachrichtigung |
 | emit | `user:notify` | Benutzer-Benachrichtigung |
 | emit | `monitoring:inventory_sync` | Inventar-Sync an Monitoring-Plugin |
-| emit | `iac:inventory_updated` | Generische Host-Liste `{hosts: [...]}` für alle interessierten Plugins — je Host `name`, `hostname`, `ip`, `groups`, `baseline_roles`, `terraform` (**ohne** Zugangsdaten), `entity_type`, `site`, `stage`, `ci_id` |
-| emit | `entity_registry:identify` | Batch-Anfrage an die Entity Registry: UUID je Host über `iac.host`, `pve.vm` (`node/vmid`), `fqdn` |
+| emit | `iac:inventory_updated` | Generische Host-Liste `{hosts: [...], services: [...]}` für alle interessierten Plugins — je Host `name`, `hostname`, `ip`, `groups`, `baseline_roles`, `terraform` (**ohne** Zugangsdaten), `entity_type`, `site`, `stage`, `maintenance`, `incidents`, `ci_id`; je Service-Instanz `host`, `name`, `site`, `stage`, `ci_id`, `host_ci_id` |
+| emit | `entity_registry:identify` | Batch-Anfrage an die Entity Registry (Chunks à 500): UUID je Host über `iac.host`, `pve.vm` (`node/vmid`), `fqdn`; je Service-Instanz über `iac.service = "<host>/<service>"` (Registry ≥ 0.3.0) |
+| emit | `entity_registry:relate` | `runs_on` Service → Host für jede Service-Instanz mit beiden UUIDs (idempotent) |
 | emit | `server_manager:register_server` | Je Host ein Upsert im Server-Manager (`source=iac-orchestrator`, `external_id=<Host-Key>`, `writeback=false` → dort schreibgeschützt, mit `ci_id`) |
+| emit | `maintenance:windows_published` | Effektive Wartungsfenster aller Hypervisoren, Hosts und Service-Instanzen (`source: iac-orchestrator`, `replaces: true`) — nach jeder Inventar-Generierung und beim Runner-Start, **lokal** emittiert |
+| emit | `maintenance:override_started` / `maintenance:override_ended` | Jeder ausgeführte Service-Deploy markiert die betroffenen Service- und Host-CIs als „in Wartung“ (`override_id = iac-job-<id>`, `until = now + max_override_minutes`); `ended` genau einmal auf jedem Endpfad |
+| emit | `maintenance:window_missing` | Ein `deploy_policy: window`-Deploy lief sofort, weil im Horizont kein Fenster liegt (`event_id = window_missing:<ci_id>:<job_id>`) — das ITSM legt daraus einen Task an |
 | emit | `socket:request` | Socket-Anfrage senden |
 | emit | `messaging:outbound` | Ausgehende Nachricht über Messaging Gateway |
 
@@ -183,6 +194,95 @@ aus `inventory_state/global/ansible/inventory.yml`:
 Voraussetzung: Core-API ≥ 1.4 (`ctx.request`); ohne Registry- bzw. Server-Manager-Plugin laufen
 die Schritte ins Leere, der Orchestrator selbst bleibt unbeeinträchtigt.
 
+Seit 1.6 identifiziert der Orchestrator zusätzlich **Service-Instanzen** (`entity_type: service`,
+Scheme `iac.service = "<host>/<service>"`, Anzeigename `"<service> @ <host>"`) und setzt die
+Relation `runs_on` Service → Host. Die Reihenfolge in `NativeGenerateStage` und beim Runner-Start
+ist fest: Registry-IDs (Hosts + Services) → Monitoring-Inventory-Sync (mit `ci_id`/`host_ci_id`)
+→ `iac:inventory_updated` → `maintenance:windows_published`.
+
+---
+
+## Wartungsfenster und geplante Deployments (ab 1.6, Core-API ≥ 1.13)
+
+Der Orchestrator ist die **Quelle** der Wartungsfenster für Hypervisoren, Hosts und Services
+und der einzige, der Deployments danach plant. Vokabular, Zeitauswertung und Bus-Vertrag kommen
+aus `core.api.maintenance`; der Orchestrator speichert keine Fenster anderer Plugins.
+
+### Auflösung (`app/controller/maintenance_resolver.py`)
+
+Läuft nur auf Runnern (Git-Working-Trees). Quellen: der iac-controller
+(`environments/sites/<site>/{site_vars,hardware}.yml`,
+`stages/<stage>/{stage_vars,stage,hosts}.yml`, Werte literal) und die auf dem Runner geklonten
+`service.yml`-Dateien (`services_dir/<service>/service.yml`: `maintenance`, `incidents`,
+`stage_overrides[<stage>]`). Spezifisch gewinnt, Listen werden **ersetzt**:
+
+- **Service:** `service.yml` (+ `stage_overrides`) → Controller `hosts[].services[].maintenance`
+  → Host `maintenance` (außer `inherit: false`) → Stage `maintenance_default` (wenn `enabled`)
+  → Site `maintenance_default` → keins.
+- **Host:** eigenes `maintenance` → Stage-Default → Site-Default → keins.
+- **Hypervisor** (`hardware.yml`, auch Cluster-Nodes): eigenes `maintenance` → Site-Default → keins.
+- **Incident-Regel:** eigener Block → `incident_defaults[<kind>]` der Stage → der Site → keine
+  (`core.api.maintenance.resolve_incident_rule`).
+- **`deploy_policy`:** Service → Stage-Default (`prod` → `window`, sonst `immediate`).
+- Fehlt `tz`, gilt `site_vars.timezone`, sonst UTC. Ein ungültiger Block wird geloggt und
+  **übersprungen** (die Kette läuft weiter) — die Auflösung bricht nie ein Deployment ab.
+
+Nach jeder Inventar-Generierung emittiert der Runner `maintenance:windows_published`
+(`replaces: true`, nur Items mit `ci_id`) und legt das Lesemodell als Snapshot
+`maintenance_effective` in `iac_orchestrator_state` ab (alle Items, auch ohne `ci_id`, plus die
+Default-Schalter je Site/Stage) — davon antworten `GET /maintenance-windows` und
+`GET /maintenance-default` auf jeder Instanz.
+
+### Entscheidung im Job: `MaintenancePolicyStage`
+
+Die Entscheidung „sofort oder geplant“ fällt **im Job auf dem Runner**, direkt nach
+`CloneServiceRepoStage` (frische `service.yml`), nicht beim Einreihen:
+
+1. Zielhosts = Controller-Hosts, deren `services[]` den Service enthält (Branch `dev`/`*-dev`/`test`
+   schränkt die Stage ein). Der **erste Host (sortiert) entscheidet**; abweichende Hosts stehen im
+   Joblog.
+2. Die Policy gilt nur für Trigger `gitlab-ci` / `webhook` (`trigger` im Payload). UI-Deploys
+   (Katalog-Button), `force` („Jetzt ausführen“) und ein fälliger `SCHEDULED`-Job (`not_before`
+   erreicht) laufen ohne Prüfung.
+3. `deploy_policy: window` und kein laufendes Fenster → der Job wird **geparkt**: Status
+   `SCHEDULED`, `not_before` = nächster Fensterbeginn (innerhalb `maintenance_schedule_horizon_days`),
+   `window_ci_ids`, `schedule_reason`; Claim freigegeben, kein Endstatus, Bell-Eintrag „⏳ scheduled“.
+   `claim_next` nimmt fällige `SCHEDULED`-Jobs (`not_before <= now`) vor der normalen Queue und klont
+   erneut. **Kein Fenster im Horizont** (oder gar keines definiert) → Warnung im Joblog, Deploy
+   **sofort** und `maintenance:window_missing` (Entscheidung H; nur mit Service-CI und Setting
+   `maintenance_report_missing_window`). Ohne ITSM bleibt die Joblog-Warnung.
+4. **Jeder ausgeführte Deploy ist ein Override** (`maintenance_deploy_marks_maintenance`):
+   `maintenance:override_started` für Service- und Host-CIs der Zielhosts
+   (`override_id = iac-job-<id>`, `until = now + maintenance_max_override_minutes`,
+   `linger_minutes`), `override_ended` genau einmal am Ende — Pipeline-Ende, Abort, Orphan-Sweep,
+   Container-Recovery, Startup-Reconciliation (`DeploymentEngine.end_override_for`, die
+   `override_id` wird atomar aus der Jobzeile genommen).
+
+Queue-Regeln: ein zweiter Trigger für einen `SCHEDULED`-Job wird **zusammengefasst** (Payload
+ersetzt, `start_time = now`, damit die zweite CI den Job über `since_epoch` findet); ein UI-Deploy
+**promotet** ihn (`QUEUED`, `force`). `QUEUED`/`RUNNING` bleiben „erster gewinnt“ (`DuplicateJob`).
+`POST /abort` lässt `SCHEDULED` stehen, `DELETE /schedules/{id}` bricht ab; „Statistik löschen“
+behält `SCHEDULED` und `RUNNING`. Zeiten in der Jobtabelle sind wie bisher naiv in der Prozessuhr
+(`to_queue_clock`/`from_queue_clock`).
+
+### Default-Schalter nur lesend (Entscheidung C)
+
+Der Orchestrator bleibt Ausführung: er zeigt `maintenance_default` je Site/Stage (`enabled`,
+Fenster, Quelldatei) aus dem Snapshot, schreibt aber **nie** ins Controller-Repo. Ein/Aus wird in
+`environments/sites/<site>/stages/<stage>/stage_vars.yml` (Block `maintenance_default` unter
+`stage_vars:`, bzw. `site_vars.yml`) editiert; der nächste Sync veröffentlicht neu. Der
+Webhook-Pfad ignoriert Deploy-Trigger für Commits mit dem reservierten Präfix `ci: maintenance`
+(der künftige SSoT-Manager-Schalter), der Sync läuft weiter.
+
+### Bekannte Grenzen
+
+- Ein Service auf mehreren Hosts: das Fenster des ersten Zielhosts (sortiert) entscheidet.
+- Services, die der Runner noch nie geklont hat, erben Host/Stage-Default (kein `service.yml`).
+- `window_missing` wird je Deploy-Job emittiert; die Deduplizierung (ein offener Task je CI) liegt
+  im ITSM.
+- Service-CIs brauchen die Entity Registry ≥ 0.3.0 (Scheme `iac.service`); davor bleiben Service-Items
+  ohne `ci_id` (nur Host-Overrides, kein `window_missing`).
+
 ---
 
 ## Benachrichtigungsendpunkte
@@ -203,13 +303,25 @@ die Schritte ins Leere, der Orchestrator selbst bleibt unbeeinträchtigt.
 
 Die Einstellungen sind über die React-UI unter `/iac/settings` oder über die REST-API (`GET/PUT /settings`) zugänglich.
 
+Kategorie **Maintenance** (ab 1.6; Env `PLUGIN_IAC_ORCHESTRATOR_MAINTENANCE_*` hat Vorrang vor Vault):
+
+| Key | Typ | Default | Bedeutung |
+|---|---|---|---|
+| `maintenance_deploy_marks_maintenance` | bool | `true` | Jeder ausgeführte Deploy meldet ein Wartungs-Override für Service- und Host-CIs |
+| `maintenance_max_override_minutes` | int | `240` | Obergrenze eines Deploy-Overrides (`until`); endet früher mit dem Job |
+| `maintenance_linger_minutes` | int | `15` | Nachlauf des Overrides nach `override_ended` beim Konsumenten |
+| `maintenance_schedule_horizon_days` | int | `30` | Maximaler Vorlauf eines geparkten `window`-Deploys |
+| `maintenance_report_missing_window` | bool | `true` | `maintenance:window_missing` emittieren, wenn ein `window`-Deploy ohne Fenster sofort läuft |
+
+Der Default-Schalter `maintenance_default.enabled` ist **kein** Setting — er liegt im iac-controller (siehe „Wartungsfenster“).
+
 ---
 
 ## React-Routen
 
 | Pfad | Sichtbar in Sidebar | Beschreibung |
 |---|---|---|
-| `/iac` | Ja | Hauptansicht: Dashboard, Pipeline-Historie, Job-Übersicht |
+| `/iac` | Ja | Hauptansicht: Dashboard, Pipeline-Historie, Job-Übersicht, Tab „Wartung“ (geplante Deployments mit „Jetzt ausführen“/„Abbrechen“, effektive Fenster mit Filtern, Default-Fenster nur lesend) |
 | `/iac/settings` | Nein | Orchestrator-Einstellungen |
 
 ---

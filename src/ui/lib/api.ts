@@ -104,6 +104,8 @@ export interface JobStreamSnapshot {
   jobs: IaCJob[]
   active_tasks: Record<string, RunnerTask>
   is_running: boolean
+  queued?: number
+  scheduled?: number             // parked deploys (plugin ≥ 1.6)
   ts: number
 }
 
@@ -241,6 +243,92 @@ export interface PendingPlanResponse {
   envs?: Record<string, PendingPlanEnv>
 }
 
+// ─── Maintenance windows (plugin 1.6, core API 1.13) ────────────────────────
+
+/** A deploy parked by the runner until its maintenance window (status SCHEDULED). */
+export interface ScheduledJob {
+  id: number
+  pipeline_type: string
+  service: string | null
+  branch: string | null
+  trigger: string
+  not_before: string | null      // ISO UTC
+  window_ci_ids: string[]
+  schedule_reason: string | null
+  start_time: string | null
+}
+
+export interface SchedulesResponse {
+  schedules: ScheduledJob[]
+  count: number
+}
+
+/** Normal form of one window (core.api.maintenance.to_dict). */
+export interface MaintenanceWindow {
+  type: 'weekly' | 'once' | 'cron'
+  days?: string[]
+  start?: string
+  end?: string
+  tz?: string
+  expr?: string
+  duration_minutes?: number
+  note?: string
+}
+
+export interface MaintenanceState {
+  active: boolean
+  until: string | null
+  source: 'window' | 'override' | null
+  next_start: string | null
+  note: string | null
+}
+
+export interface MaintenanceItem {
+  ci_id: string | null
+  kind: string                   // Entity-Registry kind (hypervisor | host | service | …, open)
+  name: string
+  host_ci_id?: string | null
+  windows: MaintenanceWindow[]
+  inherited_from: null | 'host' | 'stage_default' | 'site_default'
+  deploy_policy?: 'window' | 'immediate'
+  incidents?: { enabled: boolean; offline_minutes: number; severity: string; auto_resolve: boolean } | null
+  site?: string | null
+  stage?: string | null
+  host?: string
+  service?: string
+  tz?: string
+  state: MaintenanceState
+}
+
+export interface MaintenanceWindowsResponse {
+  items: MaintenanceItem[]
+  count: number
+  published_at: string | null
+  now: string
+  sites: string[]
+  stages: string[]
+  kinds: string[]
+}
+
+/** Read-only view of maintenance_default per site/stage (edited in the iac-controller repo). */
+export interface MaintenanceDefault {
+  site: string
+  stage: string
+  level: 'stage' | 'site' | null
+  enabled: boolean
+  windows: MaintenanceWindow[]
+  source_file: string
+  tz: string
+  errors: string[]
+}
+
+export interface MaintenanceDefaultResponse {
+  defaults: MaintenanceDefault[]
+  published_at: string | null
+  read_only: boolean
+  hint: string
+}
+
 // ─── Typed endpoint helpers ─────────────────────────────────────────────────
 
 export const iacApi = {
@@ -307,4 +395,18 @@ export const iacApi = {
     pluginApi.post<{ status: string; deleted: number }>('maintenance/clear-failed-jobs'),
   syncRepos: () =>
     pluginApi.post<AcceptedResponse>('maintenance/sync-repos'),
+
+  // Maintenance windows (plugin 1.6): scheduled deploys, effective windows, read-only default.
+  listSchedules: () => pluginApi.get<SchedulesResponse>('schedules'),
+  runNow: (jobId: number) =>
+    pluginApi.post<{ status: string; job_id: number; message: string }>(`schedules/${jobId}/run-now`),
+  cancelSchedule: (jobId: number) =>
+    pluginApi.del<{ status: string; job_id: number; message: string }>(`schedules/${jobId}`),
+  maintenanceWindows: (filter: { site?: string; stage?: string; kind?: string; q?: string } = {}) => {
+    const params = new URLSearchParams()
+    for (const [k, v] of Object.entries(filter)) if (v) params.set(k, v)
+    const qs = params.toString()
+    return pluginApi.get<MaintenanceWindowsResponse>(`maintenance-windows${qs ? `?${qs}` : ''}`)
+  },
+  maintenanceDefault: () => pluginApi.get<MaintenanceDefaultResponse>('maintenance-default'),
 }

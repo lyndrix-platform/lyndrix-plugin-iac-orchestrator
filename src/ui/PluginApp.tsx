@@ -17,6 +17,10 @@ import {
   type PipelinePayload,
   type SettingField,
   type PendingPlanResponse,
+  type ScheduledJob,
+  type MaintenanceItem,
+  type MaintenanceWindow,
+  type MaintenanceDefault,
 } from './lib/api'
 import { useJobsSSE } from './lib/hooks'
 
@@ -25,6 +29,10 @@ import { useJobsSSE } from './lib/hooks'
 // QUEUED (plugin ≥ 1.4): accepted by the control plane, waiting for a runner instance to claim it.
 const RUNNING_STATES = new Set(['RUNNING', 'PENDING', 'QUEUED'])
 const FAIL_STATES = new Set(['FAILED', 'ERROR', 'ABORTED'])
+// SCHEDULED (plugin ≥ 1.6): parked by the runner until the service's maintenance window.
+const SCHEDULED_STATE = 'SCHEDULED'
+// Maintenance colour token (core ≥ 1.11 / ui ≥ 1.8); older shells fall back to the paused colour.
+const MAINT_COLOR = 'var(--lx-state-maintenance, var(--lx-state-paused))'
 
 // In-SPA navigation the shell's BrowserRouter picks up — NOT a full page reload.
 // A full reload cold-loads the SPA before dynamic plugin routes register and
@@ -58,6 +66,7 @@ function statusColor(status: string): string {
   if (s === 'SUCCESS') return 'var(--lx-state-up)'
   if (FAIL_STATES.has(s)) return 'var(--lx-state-down)'
   if (RUNNING_STATES.has(s)) return 'var(--lx-accent)'
+  if (s === SCHEDULED_STATE) return MAINT_COLOR
   return 'var(--lx-state-unknown)'
 }
 
@@ -66,6 +75,7 @@ function badgeVariant(status: string): string {
   if (s === 'SUCCESS') return 'lx-badge--up'
   if (FAIL_STATES.has(s)) return 'lx-badge--down'
   if (RUNNING_STATES.has(s)) return 'lx-badge--accent'
+  if (s === SCHEDULED_STATE) return 'lx-badge--maintenance'
   return 'lx-badge--muted'
 }
 
@@ -77,8 +87,11 @@ function describeType(t: string): string {
 
 function StatusBadge({ status }: { status: string }) {
   const { t } = useTranslation('iac')
+  // SCHEDULED: explicit colour so the badge reads right even on a shell without lx-badge--maintenance.
+  const maint = (status || '').toUpperCase() === SCHEDULED_STATE
   return (
-    <span className={`lx-badge ${badgeVariant(status)}`}>
+    <span className={`lx-badge ${badgeVariant(status)}`}
+      style={maint ? { color: MAINT_COLOR, borderColor: `color-mix(in srgb, ${MAINT_COLOR} 40%, transparent)` } : undefined}>
       <span className="lx-dot" />
       {status || t('common.unknown', { defaultValue: 'UNKNOWN' })}
     </span>
@@ -309,23 +322,47 @@ function LogViewer({ jobId, onClose }: { jobId: number; onClose: () => void }) {
 
 // ─── Active pipelines (live) ─────────────────────────────────────────────────
 
-function ActivePipelines({ jobs, runnersByJob, onLogs }: {
+function ActivePipelines({ jobs, runnersByJob, onLogs, scheduled = 0, onMaintenance }: {
   jobs: IaCJob[]
   runnersByJob: Record<number, [string, RunnerTask][]>
   onLogs: (id: number) => void
+  scheduled?: number
+  onMaintenance?: () => void
 }) {
   const { t } = useTranslation('iac')
   const running = jobs.filter((j) => RUNNING_STATES.has((j.status || '').toUpperCase()))
+  // Parked deploys are shown separately ("scheduled: n") — they are not executing.
+  const scheduledNote = scheduled > 0 ? (
+    <div className="lx-card" style={{
+      display: 'flex', alignItems: 'center', gap: 8, padding: '0.6rem 1rem', marginBottom: '1rem',
+      borderLeft: `3px solid ${MAINT_COLOR}`,
+    }}>
+      <span className="material-icons" style={{ fontSize: 16, color: MAINT_COLOR }}>schedule</span>
+      <span style={{ fontSize: '0.78rem', color: 'var(--lx-text)' }}>
+        {t('active.scheduled', { defaultValue: '{{count}} deployment(s) scheduled for a maintenance window', count: scheduled })}
+      </span>
+      {onMaintenance && (
+        <div style={{ marginLeft: 'auto' }}>
+          <Button label={t('active.openMaintenance', { defaultValue: 'Maintenance' })} icon="event_available" onClick={onMaintenance} />
+        </div>
+      )}
+    </div>
+  ) : null
   if (!running.length) {
     return (
-      <div className="lx-card lx-empty">
-        <span className="material-icons">task_alt</span>
-        <div style={{ fontWeight: 600, color: 'var(--lx-text)' }}>{t('active.stableTitle', { defaultValue: 'Infrastructure is stable' })}</div>
-        <div style={{ fontSize: '0.8rem' }}>{t('active.stableBody', { defaultValue: 'No active jobs running right now.' })}</div>
+      <div>
+        {scheduledNote}
+        <div className="lx-card lx-empty">
+          <span className="material-icons">task_alt</span>
+          <div style={{ fontWeight: 600, color: 'var(--lx-text)' }}>{t('active.stableTitle', { defaultValue: 'Infrastructure is stable' })}</div>
+          <div style={{ fontSize: '0.8rem' }}>{t('active.stableBody', { defaultValue: 'No active jobs running right now.' })}</div>
+        </div>
       </div>
     )
   }
   return (
+    <div>
+    {scheduledNote}
     <div className="iac-card-grid" style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))', gap: '1rem' }}>
       {running.map((job) => {
         const runners = runnersByJob[job.id] || []
@@ -364,6 +401,7 @@ function ActivePipelines({ jobs, runnersByJob, onLogs }: {
           </Card>
         )
       })}
+    </div>
     </div>
   )
 }
@@ -527,10 +565,229 @@ function ServiceCatalog({ confirm, toast, onLogs }: { confirm: ConfirmFn; toast:
   )
 }
 
+// ─── Maintenance windows (plugin 1.6) ────────────────────────────────────────
+
+function fmtTs(iso: string | null | undefined): string {
+  if (!iso) return '—'
+  const d = new Date(iso)
+  return isNaN(d.getTime()) ? String(iso) : d.toLocaleString()
+}
+
+function describeWindow(w: MaintenanceWindow): string {
+  if (w.type === 'weekly') return `${(w.days || []).join(',')} ${w.start}–${w.end}${w.tz ? ` ${w.tz}` : ''}`
+  if (w.type === 'once') return `${fmtTs(w.start)} → ${fmtTs(w.end)}${w.note ? ` · ${w.note}` : ''}`
+  return `cron ${w.expr} +${w.duration_minutes} min${w.tz ? ` ${w.tz}` : ''}`
+}
+
+function MaintStateBadge({ item }: { item: MaintenanceItem }) {
+  const { t } = useTranslation('iac')
+  const st = item.state
+  if (st?.active) {
+    const label = st.source === 'override'
+      ? t('maintenance.overrideUntil', { defaultValue: 'override until {{until}}', until: fmtTs(st.until) })
+      : t('maintenance.activeUntil', { defaultValue: 'active until {{until}}', until: fmtTs(st.until) })
+    return (
+      <span className="lx-badge lx-badge--maintenance" style={{ color: MAINT_COLOR, borderColor: `color-mix(in srgb, ${MAINT_COLOR} 40%, transparent)` }}>
+        <span className="lx-dot" />{label}
+      </span>
+    )
+  }
+  if (st?.next_start) {
+    return <span className="lx-badge lx-badge--muted">{t('maintenance.nextStart', { defaultValue: 'next {{at}}', at: fmtTs(st.next_start) })}</span>
+  }
+  return <span className="lx-badge lx-badge--muted">{t('maintenance.noWindow', { defaultValue: 'no window' })}</span>
+}
+
+function Maintenance({ confirm, toast, statsTick, onLogs }: {
+  confirm: ConfirmFn; toast: ToastFn; statsTick: number; onLogs: (id: number) => void
+}) {
+  const { t } = useTranslation('iac')
+  const [schedules, setSchedules] = useState<ScheduledJob[] | null>(null)
+  const [items, setItems] = useState<MaintenanceItem[] | null>(null)
+  const [meta, setMeta] = useState<{ sites: string[]; stages: string[]; kinds: string[]; published_at: string | null }>({ sites: [], stages: [], kinds: [], published_at: null })
+  const [defaults, setDefaults] = useState<MaintenanceDefault[] | null>(null)
+  const [hint, setHint] = useState('')
+  const [error, setError] = useState<string | null>(null)
+  const [site, setSite] = useState('')
+  const [stage, setStage] = useState('')
+  const [kind, setKind] = useState('')
+  const [q, setQ] = useState('')
+  const [tick, setTick] = useState(0)
+
+  useEffect(() => {
+    let cancelled = false
+    iacApi.listSchedules()
+      .then((r) => { if (!cancelled) setSchedules(r.schedules) })
+      .catch((e) => { if (!cancelled) setError(e instanceof Error ? e.message : t('maintenance.loadError', { defaultValue: 'Could not load maintenance data.' })) })
+    iacApi.maintenanceDefault()
+      .then((r) => { if (!cancelled) { setDefaults(r.defaults); setHint(r.hint) } })
+      .catch(() => { /* card shows the empty state */ })
+    return () => { cancelled = true }
+  }, [statsTick, tick])
+
+  useEffect(() => {
+    let cancelled = false
+    iacApi.maintenanceWindows({ site, stage, kind, q })
+      .then((r) => { if (!cancelled) { setItems(r.items); setMeta({ sites: r.sites, stages: r.stages, kinds: r.kinds, published_at: r.published_at }); setError(null) } })
+      .catch((e) => { if (!cancelled) setError(e instanceof Error ? e.message : t('maintenance.loadError', { defaultValue: 'Could not load maintenance data.' })) })
+    return () => { cancelled = true }
+  }, [statsTick, tick, site, stage, kind, q])
+
+  function runNow(job: ScheduledJob) {
+    confirm({
+      title: t('maintenance.runNowConfirmTitle', { defaultValue: 'Run deployment #{{id}} now?', id: job.id }),
+      body: t('maintenance.runNowConfirmBody', { defaultValue: 'Deploys "{{service}}" ({{branch}}) outside its maintenance window. The deploy announces a maintenance override for the affected service and host, so monitoring shows "maintenance" instead of "down".', service: job.service || '?', branch: job.branch || 'main' }),
+      confirmLabel: t('maintenance.runNowLabel', { defaultValue: 'Run now' }),
+      onConfirm: () => {
+        iacApi.runNow(job.id)
+          .then(() => { toast(t('maintenance.runNowQueued', { defaultValue: 'Deployment #{{id}} queued to run now.', id: job.id })); setTick((n) => n + 1) })
+          .catch((e) => toast(e instanceof Error ? e.message : t('maintenance.runNowError', { defaultValue: 'Run now failed.' }), 'err'))
+      },
+    })
+  }
+
+  function cancel(job: ScheduledJob) {
+    confirm({
+      title: t('maintenance.cancelConfirmTitle', { defaultValue: 'Cancel scheduled deployment #{{id}}?', id: job.id }),
+      body: t('maintenance.cancelConfirmBody', { defaultValue: 'The parked deployment of "{{service}}" is aborted. The next CI trigger schedules it again.', service: job.service || '?' }),
+      confirmLabel: t('maintenance.cancelLabel', { defaultValue: 'Cancel deployment' }),
+      onConfirm: () => {
+        iacApi.cancelSchedule(job.id)
+          .then(() => { toast(t('maintenance.cancelled', { defaultValue: 'Scheduled deployment #{{id}} cancelled.', id: job.id })); setTick((n) => n + 1) })
+          .catch((e) => toast(e instanceof Error ? e.message : t('maintenance.cancelError', { defaultValue: 'Cancel failed.' }), 'err'))
+      },
+    })
+  }
+
+  const kindLabel = (k: string) => t(`maintenance.kind.${k}`, { defaultValue: k })
+  const inheritedLabel = (v: MaintenanceItem['inherited_from']) =>
+    v === 'host' ? t('maintenance.inheritedHost', { defaultValue: 'from host' })
+      : v === 'stage_default' ? t('maintenance.inheritedStage', { defaultValue: 'stage default' })
+        : v === 'site_default' ? t('maintenance.inheritedSite', { defaultValue: 'site default' })
+          : t('maintenance.own', { defaultValue: 'own' })
+  const headerCell: React.CSSProperties = { fontSize: '0.6rem', textTransform: 'uppercase', letterSpacing: '0.08em', color: 'var(--lx-text-muted)', fontWeight: 700 }
+
+  return (
+    <div>
+      {error && <ErrorBox msg={error} />}
+
+      {/* 1 — Scheduled deployments */}
+      <SectionCard title={t('maintenance.scheduledTitle', { defaultValue: 'Scheduled deployments' })}>
+        {schedules === null && <div style={{ color: 'var(--lx-text-muted)' }}>{t('serviceHistory.loading', { defaultValue: 'Loading…' })}</div>}
+        {schedules && schedules.length === 0 && (
+          <div style={{ color: 'var(--lx-text-muted)', fontStyle: 'italic', fontSize: '0.8rem' }}>{t('maintenance.scheduledEmpty', { defaultValue: 'No deployment is waiting for a maintenance window.' })}</div>
+        )}
+        {schedules && schedules.map((job, i) => (
+          <div key={job.id} className="iac-hist-row" style={{
+            display: 'flex', alignItems: 'center', gap: '0.75rem', padding: '0.6rem 0',
+            borderTop: i === 0 ? 'none' : '1px solid var(--lx-border-soft)',
+          }}>
+            <span style={{ width: 4, height: 34, borderRadius: 'var(--lx-radius-sm)', background: MAINT_COLOR, flexShrink: 0 }} />
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ fontSize: '0.8rem', fontWeight: 600, color: 'var(--lx-text)' }}>
+                #{job.id} · {job.service || describeType(job.pipeline_type)} <span style={{ color: 'var(--lx-text-muted)', fontWeight: 400 }}>({job.branch || 'main'} · {job.trigger})</span>
+              </div>
+              <div style={{ fontSize: '0.66rem', color: 'var(--lx-text-muted)', fontFamily: 'var(--lx-font-mono)' }}>
+                {t('maintenance.notBefore', { defaultValue: 'not before' })} {fmtTs(job.not_before)}
+                {job.schedule_reason ? ` · ${job.schedule_reason}` : ''}
+              </div>
+            </div>
+            <StatusBadge status="SCHEDULED" />
+            <Button label={t('history.logs', { defaultValue: 'Logs' })} onClick={() => onLogs(job.id)} />
+            <Button label={t('maintenance.runNow', { defaultValue: 'Run now' })} icon="play_arrow" variant="warn" onClick={() => runNow(job)} />
+            <Button label={t('maintenance.cancel', { defaultValue: 'Cancel' })} icon="close" variant="danger" onClick={() => cancel(job)} />
+          </div>
+        ))}
+      </SectionCard>
+
+      {/* 2 — Effective windows */}
+      <SectionCard title={t('maintenance.windowsTitle', { defaultValue: 'Effective maintenance windows' })}>
+        <div className="iac-view-header" style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: '0.75rem' }}>
+          <select className="lx-input" value={site} onChange={(e) => setSite(e.target.value)} style={{ width: 150 }}>
+            <option value="">{t('maintenance.allSites', { defaultValue: 'All sites' })}</option>
+            {meta.sites.map((s) => <option key={s} value={s}>{s}</option>)}
+          </select>
+          <select className="lx-input" value={stage} onChange={(e) => setStage(e.target.value)} style={{ width: 150 }}>
+            <option value="">{t('maintenance.allStages', { defaultValue: 'All stages' })}</option>
+            {meta.stages.map((s) => <option key={s} value={s}>{s}</option>)}
+          </select>
+          <select className="lx-input" value={kind} onChange={(e) => setKind(e.target.value)} style={{ width: 150 }}>
+            <option value="">{t('maintenance.allKinds', { defaultValue: 'All kinds' })}</option>
+            {meta.kinds.map((k) => <option key={k} value={k}>{kindLabel(k)}</option>)}
+          </select>
+          <input className="lx-input iac-search" value={q} onChange={(e) => setQ(e.target.value)} placeholder={t('maintenance.searchPlaceholder', { defaultValue: 'Name / host…' })} style={{ flex: 1, minWidth: 160 }} />
+        </div>
+        {items === null && <div style={{ color: 'var(--lx-text-muted)' }}>{t('serviceHistory.loading', { defaultValue: 'Loading…' })}</div>}
+        {items && items.length === 0 && (
+          <div style={{ color: 'var(--lx-text-muted)', fontStyle: 'italic', fontSize: '0.8rem' }}>
+            {t('maintenance.windowsEmpty', { defaultValue: 'No windows published yet — the runner publishes them after the next inventory generation.' })}
+          </div>
+        )}
+        {items && items.map((it, i) => (
+          <div key={`${it.kind}:${it.site}:${it.stage}:${it.name}`} className="iac-hist-row" style={{
+            display: 'flex', alignItems: 'center', gap: '0.75rem', padding: '0.5rem 0',
+            borderTop: i === 0 ? 'none' : '1px solid var(--lx-border-soft)',
+          }}>
+            <span className="lx-badge lx-badge--muted" style={{ minWidth: 86, justifyContent: 'center' }}>{kindLabel(it.kind)}</span>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ fontSize: '0.8rem', fontWeight: 600, color: 'var(--lx-text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                {it.name}
+                <span style={{ color: 'var(--lx-text-muted)', fontWeight: 400, fontSize: '0.68rem', marginLeft: 6 }}>{[it.site, it.stage].filter(Boolean).join('/')}</span>
+                {!it.ci_id && <span title={t('maintenance.noCi', { defaultValue: 'no CI id (Entity Registry) — not published on the bus' })} style={{ color: 'var(--lx-warning)', marginLeft: 6, fontSize: '0.66rem' }}>⚠</span>}
+              </div>
+              <div style={{ fontSize: '0.66rem', color: 'var(--lx-text-muted)', fontFamily: 'var(--lx-font-mono)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                {it.windows.length ? it.windows.map(describeWindow).join(' · ') : t('maintenance.noWindow', { defaultValue: 'no window' })}
+                {' '}<span style={{ fontFamily: 'inherit' }}>({inheritedLabel(it.inherited_from)})</span>
+                {it.deploy_policy && <span> · {t(`maintenance.policy.${it.deploy_policy}`, { defaultValue: it.deploy_policy })}</span>}
+              </div>
+            </div>
+            <MaintStateBadge item={it} />
+          </div>
+        ))}
+        {meta.published_at && (
+          <div style={{ marginTop: 8, fontSize: '0.62rem', color: 'var(--lx-text-muted)' }}>
+            {t('maintenance.publishedAt', { defaultValue: 'published {{at}}', at: fmtTs(meta.published_at) })}
+          </div>
+        )}
+      </SectionCard>
+
+      {/* 3 — Default windows: read-only (decision C: edited in the iac-controller repo) */}
+      <SectionCard title={t('maintenance.defaultTitle', { defaultValue: 'Default windows (maintenance_default)' })}>
+        <div style={{ display: 'flex', alignItems: 'flex-start', gap: 8, fontSize: '0.74rem', color: 'var(--lx-text-muted)', marginBottom: '0.75rem' }}>
+          <span className="material-icons" style={{ fontSize: 16, color: 'var(--lx-accent)' }}>lock</span>
+          <span>{t('maintenance.readOnlyHint', { defaultValue: 'Read-only. The switch is changed in the iac-controller repository (file stage_vars.yml / site_vars.yml, block maintenance_default → enabled). The next sync republishes it.' })}{hint ? '' : ''}</span>
+        </div>
+        {defaults === null && <div style={{ color: 'var(--lx-text-muted)' }}>{t('serviceHistory.loading', { defaultValue: 'Loading…' })}</div>}
+        {defaults && defaults.length === 0 && (
+          <div style={{ color: 'var(--lx-text-muted)', fontStyle: 'italic', fontSize: '0.8rem' }}>{t('maintenance.defaultEmpty', { defaultValue: 'No snapshot yet.' })}</div>
+        )}
+        <div style={{ display: 'grid', gap: 4 }}>
+          {defaults && defaults.map((d) => (
+            <div key={`${d.site}/${d.stage}`} style={{ display: 'flex', alignItems: 'center', gap: 10, fontSize: '0.74rem', flexWrap: 'wrap', padding: '0.3rem 0', borderTop: '1px solid var(--lx-border-soft)' }}>
+              <span style={{ fontFamily: 'var(--lx-font-mono)', fontWeight: 700, color: 'var(--lx-text)', minWidth: 140 }}>{d.site}/{d.stage}</span>
+              <span className={`lx-badge ${d.enabled ? 'lx-badge--up' : 'lx-badge--muted'}`}>
+                <span className="lx-dot" />{d.enabled ? t('maintenance.enabled', { defaultValue: 'on' }) : t('maintenance.disabled', { defaultValue: 'off' })}
+              </span>
+              <span style={{ color: 'var(--lx-text-muted)', fontFamily: 'var(--lx-font-mono)', fontSize: '0.66rem', flex: 1, minWidth: 160 }}>
+                {d.level === null
+                  ? t('maintenance.noDefault', { defaultValue: 'no maintenance_default defined' })
+                  : (d.windows.length ? d.windows.map(describeWindow).join(' · ') : t('maintenance.noWindow', { defaultValue: 'no window' }))}
+                {d.level === 'site' && <span> · {t('maintenance.levelSite', { defaultValue: 'site level' })}</span>}
+                {d.errors.length > 0 && <span style={{ color: 'var(--lx-state-down)' }}> · {d.errors.join('; ')}</span>}
+              </span>
+              <span title={d.source_file} style={{ fontSize: '0.62rem', color: 'var(--lx-text-muted)', fontFamily: 'var(--lx-font-mono)', overflow: 'hidden', textOverflow: 'ellipsis', maxWidth: 320 }}>{d.source_file}</span>
+            </div>
+          ))}
+        </div>
+      </SectionCard>
+    </div>
+  )
+}
+
 // ─── Overview (stats) ────────────────────────────────────────────────────────
 
-function Overview({ statsTick, isRunning, jobs, runningCount, onNavigate }: {
-  statsTick: number; isRunning: boolean; jobs: IaCJob[]; runningCount: number
+function Overview({ statsTick, isRunning, jobs, runningCount, scheduled = 0, onNavigate }: {
+  statsTick: number; isRunning: boolean; jobs: IaCJob[]; runningCount: number; scheduled?: number
   onNavigate: (tab: TabId) => void
 }) {
   const { t } = useTranslation('iac')
@@ -600,6 +857,13 @@ function Overview({ statsTick, isRunning, jobs, runningCount, onNavigate }: {
           sub={t('overview.successRate', { defaultValue: '{{percent}}% success rate', percent: Math.round(stats.success_rate) })}
           accent={tileRateColor}
           onClick={() => onNavigate('history')}
+        />
+        <NavTile
+          icon="event_available" label={t('overview.navMaintenance', { defaultValue: 'Maintenance' })}
+          value={scheduled > 0 ? t('overview.scheduled', { defaultValue: '{{count}} scheduled', count: scheduled }) : t('overview.noScheduled', { defaultValue: 'No scheduled deploys' })}
+          sub={t('overview.maintenanceSub', { defaultValue: 'Windows · scheduled deploys' })}
+          accent={scheduled > 0 ? MAINT_COLOR : undefined}
+          onClick={() => onNavigate('maintenance')}
         />
       </div>
 
@@ -1298,11 +1562,11 @@ function SettingsPage({ confirm, toast }: { confirm: ConfirmFn; toast: ToastFn }
 
 // ─── Root ────────────────────────────────────────────────────────────────────
 
-type TabId = 'overview' | 'active' | 'provision' | 'catalog' | 'assignments' | 'history'
+type TabId = 'overview' | 'active' | 'provision' | 'catalog' | 'assignments' | 'history' | 'maintenance'
 
 const VIEW_LABELS: Record<TabId, string> = {
   overview: 'Overview', active: 'Active Pipelines', provision: 'Provision',
-  catalog: 'Service Catalog', assignments: 'Topology', history: 'History',
+  catalog: 'Service Catalog', assignments: 'Topology', history: 'History', maintenance: 'Maintenance',
 }
 
 // ─── Nav tile (Overview → sub-view entry point) ───────────────────────────────
@@ -1454,6 +1718,7 @@ function Dashboard() {
 
   const jobs = snapshot?.jobs ?? []
   const isRunning = snapshot?.is_running ?? false
+  const scheduled = snapshot?.scheduled ?? 0
 
   const [statsTick, setStatsTick] = useState(0)
   useEffect(() => {
@@ -1519,12 +1784,13 @@ function Dashboard() {
 
       {tab !== 'overview' && <ViewHeader tab={tab} onBack={() => setTab('overview')} />}
 
-      {tab === 'overview'    && <Overview statsTick={statsTick} isRunning={isRunning} jobs={jobs} runningCount={runningCount} onNavigate={setTab} />}
-      {tab === 'active'      && <ActivePipelines jobs={jobs} runnersByJob={runnersByJob} onLogs={setLogJob} />}
+      {tab === 'overview'    && <Overview statsTick={statsTick} isRunning={isRunning} jobs={jobs} runningCount={runningCount} scheduled={scheduled} onNavigate={setTab} />}
+      {tab === 'active'      && <ActivePipelines jobs={jobs} runnersByJob={runnersByJob} onLogs={setLogJob} scheduled={scheduled} onMaintenance={() => setTab('maintenance')} />}
       {tab === 'provision'   && <Provision confirm={confirm} toast={toast} isRunning={isRunning} statsTick={statsTick} />}
       {tab === 'catalog'     && <ServiceCatalog confirm={confirm} toast={toast} onLogs={setLogJob} />}
       {tab === 'assignments' && <Assignments confirm={confirm} toast={toast} isRunning={isRunning} />}
       {tab === 'history'     && <History jobs={jobs} onLogs={setLogJob} />}
+      {tab === 'maintenance' && <Maintenance confirm={confirm} toast={toast} statsTick={statsTick} onLogs={setLogJob} />}
 
       {logJob !== null && <LogViewer jobId={logJob} onClose={() => setLogJob(null)} />}
       {confirmOpts && <ConfirmDialog opts={confirmOpts} onClose={() => setConfirmOpts(null)} />}

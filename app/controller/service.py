@@ -43,6 +43,9 @@ class IaCService:
         self.queue = JobQueue()
         self.engine = DeploymentEngine(ctx, self.state, self.db, self.config, self.socket_client)
         self.engine.queue = self.queue
+        # Maintenance windows (1.6): a job the queue closes itself (orphan sweep →
+        # mark_failed) still ends its maintenance override exactly once.
+        self.queue.on_terminal = self.engine.end_override_for
         self.worker: JobWorker | None = None
 
         # Restore the Auto-Apply setting from Vault/Config on boot
@@ -76,8 +79,19 @@ class IaCService:
 
     def enqueue_pipeline(self, payload: dict, *, requested_by: str | None = None) -> int:
         """Queue a pipeline for a runner. Raises :class:`DuplicateJob` when the same
-        target is already queued or running. Wakes the runners via the cluster bus."""
-        job_id = self.queue.enqueue(payload, requested_by=requested_by)
+        target is already queued or running. Wakes the runners via the cluster bus.
+
+        Maintenance windows (1.6): a SCHEDULED job for the same target absorbs a
+        newer webhook trigger (coalesced — nothing to wake) or is promoted to QUEUED
+        when the trigger must run now (UI deploy / ``force``)."""
+        result = self.queue.enqueue_ex(payload, requested_by=requested_by)
+        job_id = result.job_id
+        if result.coalesced:
+            log.info(f"ENQUEUE: trigger for '{payload.get('service_name') or payload.get('pipeline_type')}' "
+                     f"coalesced into scheduled job #{job_id}.")
+            return job_id
+        if result.promoted:
+            log.info(f"ENQUEUE: scheduled job #{job_id} promoted to run now ({requested_by}).")
         if job_id > 0:
             try:
                 self.ctx.emit("iac:job_queued", {"job_id": job_id}, cluster=True)
@@ -151,6 +165,32 @@ class IaCService:
                 log.info(f"IaC Orchestrator: repo snapshots published {counts}.")
         except Exception as exc:
             log.debug(f"IaC Orchestrator: snapshot publish on boot skipped: {exc}")
+
+    async def publish_inventory_chain(self):
+        """Runner boot: the same ordered publish as ``NativeGenerateStage`` — Entity
+        Registry ids (hosts + services) first, then the monitoring sync carrying them,
+        then the effective maintenance windows (``maintenance:windows_published``)."""
+        try:
+            await self.engine.emit_iac_inventory_updated()
+            await self.engine.emit_monitoring_inventory_sync()
+            await self.engine.publish_maintenance()
+        except Exception as exc:
+            log.error(f"IaC Orchestrator: inventory publish on boot failed: {exc}")
+
+    def promote_scheduled(self, job_id: int) -> bool:
+        """"Run now" for a parked deploy: SCHEDULED → QUEUED with ``force`` and wake the
+        runners (the override is announced when the job actually runs)."""
+        if not self.queue.promote(job_id, override=True):
+            return False
+        try:
+            self.ctx.emit("iac:job_queued", {"job_id": job_id}, cluster=True)
+        except TypeError:
+            self.ctx.emit("iac:job_queued", {"job_id": job_id})
+        except Exception as exc:
+            log.debug(f"iac:job_queued not emitted: {exc}")
+        if self.worker is not None:
+            self.worker.wake()
+        return True
 
     # -- webhook auto-sync: one instance (lease) -----------------------------
     def start_webhook_sync(self) -> None:
@@ -319,6 +359,7 @@ class IaCService:
                 )
                 self.db.update_job(job.id, "FAILED")
                 self.db.update_progress(job.id, progress=None, current_step="System Restart (Aborted)")
+                self.engine.end_override_for(job.id)
                 self.state["last_deployment"] = "FAILED"
 
     async def emit_monitoring_inventory_sync(self):

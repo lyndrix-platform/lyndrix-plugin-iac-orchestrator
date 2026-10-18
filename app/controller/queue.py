@@ -17,7 +17,9 @@ import asyncio
 import json
 import logging
 import time
-from datetime import datetime, timedelta
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from typing import Callable
 
 from sqlalchemy import inspect as sa_inspect, select, text, update
 
@@ -31,6 +33,44 @@ STATUS_QUEUED = "QUEUED"
 STATUS_RUNNING = "RUNNING"
 STATUS_ABORTED = "ABORTED"
 STATUS_FAILED = "FAILED"
+# Maintenance windows (plugin 1.6): a deploy the runner parked until its window opens.
+# No owner, no heartbeat — the claim picks it up again once ``not_before`` is reached.
+STATUS_SCHEDULED = "SCHEDULED"
+
+#: Statuses that block a second job with the same dedupe key (``DuplicateJob``).
+_ACTIVE_STATUSES = (STATUS_QUEUED, STATUS_RUNNING)
+
+
+def to_queue_clock(aware: datetime) -> datetime:
+    """Aware datetime → the naive process-local clock every job column uses
+    (``datetime.now()``), so ``not_before <= now`` compares like-for-like in SQL."""
+    if aware.tzinfo is None:
+        return aware
+    return aware.astimezone().replace(tzinfo=None)
+
+
+def from_queue_clock(naive: datetime | None) -> datetime | None:
+    """Naive process-local column value → aware UTC (for ISO output on the bus/API)."""
+    if naive is None:
+        return None
+    if naive.tzinfo is not None:
+        return naive.astimezone(timezone.utc)
+    local_tz = datetime.now().astimezone().tzinfo
+    return naive.replace(tzinfo=local_tz).astimezone(timezone.utc)
+
+
+@dataclass(frozen=True)
+class EnqueueResult:
+    """Outcome of :meth:`JobQueue.enqueue_ex`.
+
+    ``coalesced``: an existing SCHEDULED job for the same target absorbed this trigger
+    (payload replaced, ``start_time`` reset). ``promoted``: the existing SCHEDULED job
+    was moved to QUEUED because this trigger must run now (UI deploy / ``force``).
+    """
+
+    job_id: int
+    coalesced: bool = False
+    promoted: bool = False
 
 # Pipeline types that must not run twice for the same target at the same time.
 _HOST_SCOPED = ("host_provision", "bootstrap_compliance", "init_host", "compliance", "state_check", "adopt_host")
@@ -120,6 +160,11 @@ class JobQueue:
     """Database-backed queue + log/runner store. Every method is synchronous and
     cheap; callers off-load them with ``asyncio.to_thread`` where it matters."""
 
+    #: Called with the job id after this queue closed a job on a terminal path it
+    #: owns itself (``mark_failed`` → orphan sweep), so the engine can end the job's
+    #: maintenance override. Set by the service; may run in a worker thread.
+    on_terminal: Callable[[int], None] | None = None
+
     def _session(self):
         # READ COMMITTED: several writers (progress, heartbeat, runner snapshot, claim)
         # touch one job row concurrently — see database.read_committed_session.
@@ -152,9 +197,15 @@ class JobQueue:
                 "claimed_at": "DATETIME NULL",
                 "heartbeat_at": "DATETIME NULL",
                 "runners": "LONGTEXT NULL",
+                # maintenance windows (plugin 1.6)
+                "not_before": "DATETIME NULL",
+                "window_ci_ids": "LONGTEXT NULL",
+                "override_id": "VARCHAR(64) NULL",
+                "schedule_reason": "VARCHAR(255) NULL",
             }
             if engine.dialect.name == "sqlite":
-                wanted = {k: v.replace("LONGTEXT", "TEXT").replace("VARCHAR(255)", "TEXT").replace("VARCHAR(100)", "TEXT")
+                wanted = {k: v.replace("LONGTEXT", "TEXT").replace("VARCHAR(255)", "TEXT")
+                          .replace("VARCHAR(100)", "TEXT").replace("VARCHAR(64)", "TEXT")
                           for k, v in wanted.items()}
             with engine.begin() as conn:
                 for col, ddl in wanted.items():
@@ -174,7 +225,7 @@ class JobQueue:
             return set()
         try:
             rows = session.execute(
-                select(IaCJob.dedupe_key).where(IaCJob.status.in_((STATUS_QUEUED, STATUS_RUNNING)))
+                select(IaCJob.dedupe_key).where(IaCJob.status.in_(_ACTIVE_STATUSES))
             ).all()
             return {r[0] for r in rows if r[0]}
         finally:
@@ -183,20 +234,63 @@ class JobQueue:
 
     def enqueue(self, payload: dict, *, requested_by: str | None = None) -> int:
         """Insert a QUEUED job for ``payload``; raises :class:`DuplicateJob` on a
-        concurrency collision. Returns the job id (-1 without a database)."""
+        concurrency collision. Returns the job id (-1 without a database).
+
+        A SCHEDULED job for the same target absorbs the trigger instead (see
+        :meth:`enqueue_ex`); callers that need to know use ``enqueue_ex``.
+        """
+        return self.enqueue_ex(payload, requested_by=requested_by).job_id
+
+    def enqueue_ex(self, payload: dict, *, requested_by: str | None = None) -> EnqueueResult:
+        """:meth:`enqueue` with the coalesce/promote outcome.
+
+        * QUEUED/RUNNING job with the same key → :class:`DuplicateJob` (first wins, as before).
+        * SCHEDULED job with the same key → the newer trigger is **coalesced** into it
+          (payload replaced, ``start_time = now`` so the CI finds it via ``since_epoch``);
+          a trigger that must run now (UI deploy, ``force``) **promotes** it to QUEUED instead.
+        """
         payload = normalize_payload(payload)
         key = dedupe_key_for(payload)
         session = self._session()
         if not session:
-            return -1
+            return EnqueueResult(-1)
         try:
             if key and _conflicts(key, self.active_keys(session)):
                 existing = session.execute(
                     select(IaCJob.id).where(IaCJob.dedupe_key == key,
-                                            IaCJob.status.in_((STATUS_QUEUED, STATUS_RUNNING)))
+                                            IaCJob.status.in_(_ACTIVE_STATUSES))
                     .order_by(IaCJob.id.desc())
                 ).first()
                 raise DuplicateJob(key, existing[0] if existing else None)
+            if key:
+                scheduled = session.execute(
+                    select(IaCJob.id).where(IaCJob.dedupe_key == key, IaCJob.status == STATUS_SCHEDULED)
+                    .order_by(IaCJob.id.desc())
+                ).first()
+                if scheduled:
+                    from .maintenance_resolver import policy_applies
+
+                    sched_id = int(scheduled[0])
+                    now = datetime.now()
+                    if policy_applies(payload):
+                        session.execute(
+                            update(IaCJob).where(IaCJob.id == sched_id, IaCJob.status == STATUS_SCHEDULED)
+                            .values(payload=json.dumps(payload, default=str), start_time=now,
+                                    current_step="Scheduled (updated by a newer trigger)")
+                        )
+                        session.commit()
+                        log.info("QUEUE: coalesced trigger for '%s' into scheduled job #%s", key, sched_id)
+                        return EnqueueResult(sched_id, coalesced=True)
+                    payload["force"] = True
+                    session.execute(
+                        update(IaCJob).where(IaCJob.id == sched_id, IaCJob.status == STATUS_SCHEDULED)
+                        .values(status=STATUS_QUEUED, not_before=None, start_time=now,
+                                payload=json.dumps(payload, default=str),
+                                current_step="Queued" + (f" by {requested_by}" if requested_by else "") + " (run now)")
+                    )
+                    session.commit()
+                    log.info("QUEUE: promoted scheduled job #%s for '%s' (run now)", sched_id, key)
+                    return EnqueueResult(sched_id, promoted=True)
             job = IaCJob(
                 pipeline_type=db_tag_for(payload),
                 status=STATUS_QUEUED,
@@ -210,7 +304,7 @@ class JobQueue:
             session.add(job)
             session.commit()
             session.refresh(job)
-            return int(job.id)
+            return EnqueueResult(int(job.id))
         except DuplicateJob:
             session.rollback()
             raise
@@ -222,26 +316,38 @@ class JobQueue:
 
     # ------------------------------------------------------------------- claim
     def claim_next(self, instance_id: str) -> tuple[int, dict] | None:
-        """Atomically move the oldest QUEUED job to RUNNING owned by ``instance_id``.
+        """Atomically move the oldest QUEUED job — or a SCHEDULED job whose
+        ``not_before`` is reached — to RUNNING owned by ``instance_id``.
 
         Two runners may race for the same row: the conditional UPDATE lets only
         one win (``rowcount == 1``); the loser retries with the next candidate.
+        Due SCHEDULED jobs come first (``not_before`` ascending), then QUEUED by id.
+        ``not_before`` stays on the claimed row so the policy stage knows the job
+        is due and does not park it again.
         """
         for _ in range(5):
             session = self._session()
             if not session:
                 return None
             try:
+                now = datetime.now()
                 cand = session.execute(
-                    select(IaCJob.id).where(IaCJob.status == STATUS_QUEUED).order_by(IaCJob.id).limit(1)
+                    select(IaCJob.id)
+                    .where(
+                        (IaCJob.status == STATUS_QUEUED)
+                        | ((IaCJob.status == STATUS_SCHEDULED) & (IaCJob.not_before <= now))
+                    )
+                    # NULLS FIRST portable across SQLite/MariaDB: due scheduled jobs
+                    # (oldest window first) ahead of the plain FIFO queue.
+                    .order_by(IaCJob.not_before.is_(None), IaCJob.not_before, IaCJob.id)
+                    .limit(1)
                 ).first()
                 if not cand:
                     return None
                 job_id = int(cand[0])
-                now = datetime.now()
                 res = session.execute(
                     update(IaCJob)
-                    .where(IaCJob.id == job_id, IaCJob.status == STATUS_QUEUED)
+                    .where(IaCJob.id == job_id, IaCJob.status.in_((STATUS_QUEUED, STATUS_SCHEDULED)))
                     .values(status=STATUS_RUNNING, owner_instance=instance_id, claimed_at=now,
                             heartbeat_at=now, current_step=f"Claimed by {instance_id}")
                 )
@@ -271,6 +377,246 @@ class JobQueue:
             return 0
         try:
             return len(session.execute(select(IaCJob.id).where(IaCJob.status == STATUS_QUEUED)).all())
+        finally:
+            session.close()
+
+    # ------------------------------------------------- scheduled deploys (1.6)
+    def park(self, job_id: int, *, not_before: datetime, window_ci_ids: list[str] | None,
+             reason: str, instance_id: str | None = None) -> bool:
+        """RUNNING → SCHEDULED until ``not_before`` (aware or process-clock naive).
+
+        Conditional on the row still being RUNNING and owned by this instance (or
+        ownerless — a legacy direct ``run_pipeline`` call). Releases the claim so the
+        orphan sweep never sees the parked job; the claim takes it again once due.
+        """
+        if job_id in (None, -1, 0):
+            return False
+        due = to_queue_clock(not_before)
+
+        def _tx():
+            session = self._session()
+            if not session:
+                return False
+            try:
+                cond = [IaCJob.id == job_id, IaCJob.status == STATUS_RUNNING]
+                if instance_id:
+                    cond.append((IaCJob.owner_instance == instance_id) | (IaCJob.owner_instance.is_(None)))
+                res = session.execute(
+                    update(IaCJob).where(*cond).values(
+                        status=STATUS_SCHEDULED, not_before=due,
+                        window_ci_ids=json.dumps(list(window_ci_ids or [])),
+                        schedule_reason=str(reason or "")[:250],
+                        owner_instance=None, claimed_at=None, heartbeat_at=None,
+                        progress=0, current_step="Scheduled",
+                    )
+                )
+                session.commit()
+                return res.rowcount == 1
+            except Exception:
+                session.rollback()
+                raise
+            finally:
+                session.close()
+
+        try:
+            return bool(self._retry(_tx))
+        except Exception as exc:
+            log.error("QUEUE: park of job #%s failed: %s", job_id, exc)
+            return False
+
+    def promote(self, job_id: int, *, override: bool = True) -> bool:
+        """SCHEDULED → QUEUED now ("run now"). ``override=True`` sets ``force`` in the
+        payload so the policy stage lets the deploy through; the caller emits
+        ``iac:job_queued`` to wake the runners."""
+        session = self._session()
+        if not session:
+            return False
+        try:
+            row = session.execute(
+                select(IaCJob.id, IaCJob.payload).where(IaCJob.id == job_id, IaCJob.status == STATUS_SCHEDULED)
+            ).first()
+            if not row:
+                return False
+            try:
+                payload = json.loads(row[1]) if row[1] else {}
+            except Exception:
+                payload = {}
+            if override:
+                payload["force"] = True
+            res = session.execute(
+                update(IaCJob).where(IaCJob.id == job_id, IaCJob.status == STATUS_SCHEDULED)
+                .values(status=STATUS_QUEUED, not_before=None, start_time=datetime.now(),
+                        payload=json.dumps(payload, default=str), current_step="Queued (run now)")
+            )
+            session.commit()
+            return res.rowcount == 1
+        except Exception as exc:
+            session.rollback()
+            log.error("QUEUE: promote of job #%s failed: %s", job_id, exc)
+            return False
+        finally:
+            session.close()
+
+    def abort_scheduled(self, job_id: int) -> bool:
+        """SCHEDULED → ABORTED (cancel a parked deploy)."""
+        session = self._session()
+        if not session:
+            return False
+        try:
+            res = session.execute(
+                update(IaCJob).where(IaCJob.id == job_id, IaCJob.status == STATUS_SCHEDULED)
+                .values(status=STATUS_ABORTED, not_before=None, end_time=datetime.now(),
+                        current_step="Scheduled deployment cancelled")
+            )
+            session.commit()
+            return res.rowcount == 1
+        except Exception as exc:
+            session.rollback()
+            log.error("QUEUE: abort of scheduled job #%s failed: %s", job_id, exc)
+            return False
+        finally:
+            session.close()
+
+    def scheduled_jobs(self) -> list[dict]:
+        """Every SCHEDULED job (oldest window first) for the API/UI."""
+        session = self._session()
+        if not session:
+            return []
+        try:
+            rows = session.execute(
+                select(IaCJob.id, IaCJob.pipeline_type, IaCJob.payload, IaCJob.not_before,
+                       IaCJob.window_ci_ids, IaCJob.schedule_reason, IaCJob.start_time)
+                .where(IaCJob.status == STATUS_SCHEDULED)
+                .order_by(IaCJob.not_before, IaCJob.id)
+            ).all()
+            out = []
+            for job_id, ptype, raw, not_before, ci_raw, reason, start_time in rows:
+                try:
+                    payload = json.loads(raw) if raw else {}
+                except Exception:
+                    payload = {}
+                try:
+                    ci_ids = json.loads(ci_raw) if ci_raw else []
+                except Exception:
+                    ci_ids = []
+                out.append({
+                    "id": int(job_id),
+                    "pipeline_type": ptype,
+                    "service": payload.get("service_name"),
+                    "branch": payload.get("service_branch"),
+                    "trigger": payload.get("trigger") or ("ui" if payload.get("manual") else "webhook"),
+                    "not_before": from_queue_clock(not_before),
+                    "window_ci_ids": ci_ids,
+                    "schedule_reason": reason,
+                    "start_time": from_queue_clock(start_time),
+                })
+            return out
+        finally:
+            session.close()
+
+    def scheduled_count(self) -> int:
+        session = self._session()
+        if not session:
+            return 0
+        try:
+            return len(session.execute(select(IaCJob.id).where(IaCJob.status == STATUS_SCHEDULED)).all())
+        finally:
+            session.close()
+
+    def job_schedule(self, job_id: int) -> dict | None:
+        """``{status, not_before, window_ci_ids, override_id, claimed_at}`` of one job."""
+        if job_id in (None, -1, 0):
+            return None
+        session = self._session()
+        if not session:
+            return None
+        try:
+            row = session.execute(
+                select(IaCJob.status, IaCJob.not_before, IaCJob.window_ci_ids, IaCJob.override_id, IaCJob.claimed_at)
+                .where(IaCJob.id == job_id)
+            ).first()
+            if not row:
+                return None
+            status, not_before, ci_raw, override_id, claimed_at = row
+            try:
+                ci_ids = json.loads(ci_raw) if ci_raw else []
+            except Exception:
+                ci_ids = []
+            return {"status": status, "not_before": from_queue_clock(not_before), "window_ci_ids": ci_ids,
+                    "override_id": override_id, "claimed_at": from_queue_clock(claimed_at)}
+        finally:
+            session.close()
+
+    def set_override(self, job_id: int, override_id: str, window_ci_ids: list[str]) -> None:
+        """Remember the maintenance override a running deploy announced."""
+        if job_id in (None, -1, 0):
+            return
+
+        def _tx():
+            session = self._session()
+            if not session:
+                return
+            try:
+                session.execute(
+                    update(IaCJob).where(IaCJob.id == job_id)
+                    .values(override_id=override_id, window_ci_ids=json.dumps(list(window_ci_ids or [])))
+                )
+                session.commit()
+            except Exception:
+                session.rollback()
+                raise
+            finally:
+                session.close()
+
+        try:
+            self._retry(_tx)
+        except Exception as exc:
+            log.debug("QUEUE: set_override failed: %s", exc)
+
+    def clear_override(self, job_id: int) -> str | None:
+        """Atomically take the job's ``override_id`` (``None`` when there is none or a
+        peer already took it) — the caller emits ``override_ended`` exactly once."""
+        if job_id in (None, -1, 0):
+            return None
+        session = self._session()
+        if not session:
+            return None
+        try:
+            current = session.execute(select(IaCJob.override_id).where(IaCJob.id == job_id)).scalar()
+            if not current:
+                return None
+            res = session.execute(
+                update(IaCJob).where(IaCJob.id == job_id, IaCJob.override_id == current).values(override_id=None)
+            )
+            session.commit()
+            return str(current) if res.rowcount == 1 else None
+        except Exception as exc:
+            session.rollback()
+            log.debug("QUEUE: clear_override failed: %s", exc)
+            return None
+        finally:
+            session.close()
+
+    def running_overrides(self) -> list[dict]:
+        """RUNNING jobs that announced a maintenance override: ``[{id, override_id,
+        window_ci_ids, claimed_at}]`` — for the read model on every instance."""
+        session = self._session()
+        if not session:
+            return []
+        try:
+            rows = session.execute(
+                select(IaCJob.id, IaCJob.override_id, IaCJob.window_ci_ids, IaCJob.claimed_at)
+                .where(IaCJob.status == STATUS_RUNNING, IaCJob.override_id.isnot(None))
+            ).all()
+            out = []
+            for job_id, override_id, ci_raw, claimed_at in rows:
+                try:
+                    ci_ids = json.loads(ci_raw) if ci_raw else []
+                except Exception:
+                    ci_ids = []
+                out.append({"id": int(job_id), "override_id": override_id, "window_ci_ids": ci_ids,
+                            "claimed_at": from_queue_clock(claimed_at)})
+            return out
         finally:
             session.close()
 
@@ -344,13 +690,19 @@ class JobQueue:
                 .values(status=STATUS_FAILED, end_time=datetime.now(), current_step=reason[:250])
             )
             session.commit()
-            return res.rowcount == 1
+            done = res.rowcount == 1
         except Exception as exc:
             session.rollback()
             log.debug("QUEUE: mark_failed failed: %s", exc)
             return False
         finally:
             session.close()
+        if done and self.on_terminal is not None:
+            try:
+                self.on_terminal(job_id)
+            except Exception as exc:
+                log.debug("QUEUE: on_terminal hook failed for #%s: %s", job_id, exc)
+        return done
 
     def fail_orphans(self, alive_instances: set[str] | None, stale_seconds: int = 180,
                      self_instance: str | None = None) -> list[int]:
@@ -384,17 +736,21 @@ class JobQueue:
             session.close()
 
     # ------------------------------------------------------------------- abort
-    def abort_queued(self) -> list[int]:
-        """QUEUED → ABORTED (nothing is executing yet)."""
+    def abort_queued(self, *, include_scheduled: bool = False) -> list[int]:
+        """QUEUED → ABORTED (nothing is executing yet). Parked SCHEDULED deploys are
+        kept unless ``include_scheduled`` — the global abort button stops executions,
+        it does not cancel planned maintenance deploys."""
         session = self._session()
         if not session:
             return []
+        statuses = (STATUS_QUEUED, STATUS_SCHEDULED) if include_scheduled else (STATUS_QUEUED,)
         try:
-            ids = [int(r[0]) for r in session.execute(select(IaCJob.id).where(IaCJob.status == STATUS_QUEUED)).all()]
+            ids = [int(r[0]) for r in session.execute(select(IaCJob.id).where(IaCJob.status.in_(statuses))).all()]
             if ids:
                 session.execute(
-                    update(IaCJob).where(IaCJob.id.in_(ids), IaCJob.status == STATUS_QUEUED)
-                    .values(status=STATUS_ABORTED, end_time=datetime.now(), current_step="Aborted by User")
+                    update(IaCJob).where(IaCJob.id.in_(ids), IaCJob.status.in_(statuses))
+                    .values(status=STATUS_ABORTED, not_before=None, end_time=datetime.now(),
+                            current_step="Aborted by User")
                 )
                 session.commit()
             return ids
@@ -455,12 +811,12 @@ class JobQueue:
             session.close()
 
     def live_summary(self, recent_minutes: int = 10) -> dict:
-        """``{"active_tasks": {...}, "is_running": bool, "queued": n}`` for the SSE
-        snapshot — the same shape the in-memory state had, now from the database
-        so every instance shows the same picture."""
+        """``{"active_tasks": {...}, "is_running": bool, "queued": n, "scheduled": n}``
+        for the SSE snapshot — the same shape the in-memory state had, now from the
+        database so every instance shows the same picture."""
         session = self._session()
         if not session:
-            return {"active_tasks": {}, "is_running": False, "queued": 0}
+            return {"active_tasks": {}, "is_running": False, "queued": 0, "scheduled": 0}
         try:
             since = datetime.now() - timedelta(minutes=recent_minutes)
             rows = session.execute(
@@ -482,7 +838,9 @@ class JobQueue:
                         active.setdefault(task, info)
             n_running = len(session.execute(select(IaCJob.id).where(IaCJob.status == STATUS_RUNNING)).all())
             n_queued = len(session.execute(select(IaCJob.id).where(IaCJob.status == STATUS_QUEUED)).all())
-            return {"active_tasks": active, "is_running": n_running > 0, "queued": n_queued}
+            n_scheduled = len(session.execute(select(IaCJob.id).where(IaCJob.status == STATUS_SCHEDULED)).all())
+            return {"active_tasks": active, "is_running": n_running > 0, "queued": n_queued,
+                    "scheduled": n_scheduled}
         finally:
             session.close()
 

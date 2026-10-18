@@ -35,6 +35,16 @@ class IaCJob(Base):
     heartbeat_at = Column(DateTime(timezone=True), nullable=True)
     runners = Column(LONGTEXT, nullable=True)            # live runner/task snapshot (JSON) for every instance's UI
 
+    # --- MAINTENANCE WINDOWS (plugin 1.6): a deploy parked for its window ---
+    # Status SCHEDULED: the runner evaluated the service's deploy_policy and parked the job
+    # until ``not_before`` (naive, process clock like every other time here). The claim
+    # takes it again once due. ``override_id`` marks the maintenance override a running
+    # deploy announced on the bus (ended exactly once, on every terminal path).
+    not_before = Column(DateTime(timezone=True), nullable=True)
+    window_ci_ids = Column(LONGTEXT, nullable=True)      # JSON list of Entity-Registry UUIDs the deploy touches
+    override_id = Column(String(64), nullable=True)      # maintenance:override_started id while the deploy runs
+    schedule_reason = Column(String(255), nullable=True) # why the job was parked (operator-facing)
+
 
 class IaCJobLog(Base):
     """One log line per row — written by the executing runner, read by every instance.

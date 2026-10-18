@@ -194,6 +194,47 @@ def _build_fields() -> list[SettingField]:
             vault_key="iac_tf_backend_secret_key",
             description="Shared backend secret across all sites/stages.",
         ),
+        # ── Maintenance windows (plugin 1.6, core API 1.13) ───────────────────
+        # Read by IaCConfig.maintenance_* (env > Vault > default). The default
+        # switch itself (maintenance_default.enabled) is NOT a setting here: it lives
+        # in the iac-controller repo and is only displayed (decision C).
+        SettingField(
+            "maintenance_deploy_marks_maintenance", "Deploys mark maintenance", kind="bool",
+            category="Maintenance", default=True, bool_format="lower",
+            vault_key="iac_maintenance_deploy_marks_maintenance",
+            env_var="PLUGIN_IAC_ORCHESTRATOR_MAINTENANCE_DEPLOY_MARKS_MAINTENANCE",
+            description="Every executed service deploy announces a maintenance override for the service and "
+                        "host CIs it touches (monitoring shows 'maintenance' instead of 'down').",
+        ),
+        SettingField(
+            "maintenance_max_override_minutes", "Max override duration (min)", kind="int",
+            category="Maintenance", default=240,
+            vault_key="iac_maintenance_max_override_minutes",
+            env_var="PLUGIN_IAC_ORCHESTRATOR_MAINTENANCE_MAX_OVERRIDE_MINUTES",
+            description="Upper bound of a deploy override; it ends earlier when the job finishes.",
+        ),
+        SettingField(
+            "maintenance_linger_minutes", "Override linger (min)", kind="int",
+            category="Maintenance", default=15,
+            vault_key="iac_maintenance_linger_minutes",
+            env_var="PLUGIN_IAC_ORCHESTRATOR_MAINTENANCE_LINGER_MINUTES",
+            description="Consumers keep the override this long after the deploy ended (containers restart, probes settle).",
+        ),
+        SettingField(
+            "maintenance_schedule_horizon_days", "Schedule horizon (days)", kind="int",
+            category="Maintenance", default=30,
+            vault_key="iac_maintenance_schedule_horizon_days",
+            env_var="PLUGIN_IAC_ORCHESTRATOR_MAINTENANCE_SCHEDULE_HORIZON_DAYS",
+            description="A 'window' deploy is parked at most this far ahead; without a window in the horizon it "
+                        "runs at once with a warning.",
+        ),
+        SettingField(
+            "maintenance_report_missing_window", "Report missing window", kind="bool",
+            category="Maintenance", default=True, bool_format="lower",
+            vault_key="iac_maintenance_report_missing_window",
+            env_var="PLUGIN_IAC_ORCHESTRATOR_MAINTENANCE_REPORT_MISSING_WINDOW",
+            description="Emit maintenance:window_missing when a window deploy runs without a window (ITSM opens a task).",
+        ),
     ]
 
     # ── Repository Roles (each persisted into repo_<slug>_config JSON) ─────────

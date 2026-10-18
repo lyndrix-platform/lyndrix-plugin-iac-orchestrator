@@ -7,16 +7,19 @@ import shutil
 import time
 import uuid
 import yaml
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 from pathlib import Path
 
 from deepdiff import DeepDiff
 import re
 
+from core.api import maintenance as mw
+
 from ...stages.base import BaseStage
 from .utils import StageResult, JobFileLogBridge, current_job_id as _job_id_ctxvar
 from .queue import JobLogWriter
+from . import maintenance_resolver as mres
 from ...stages.git import (
     SyncRepoStage,
     CommitPushStage,
@@ -139,6 +142,16 @@ class PipelineTask:
             return int((self.end_time - self.start_time) * 1000)
         return 0
 
+class JobParked(Exception):
+    """Raised by :class:`MaintenancePolicyStage` after it parked the job as SCHEDULED:
+    ``run_pipeline`` stops without a terminal status (the row is already SCHEDULED)."""
+
+    def __init__(self, not_before: datetime, reason: str):
+        super().__init__(reason)
+        self.not_before = not_before
+        self.reason = reason
+
+
 # --- LOCAL STAGE DEFINITIONS ---
 class NativeGenerateStage:
     def __init__(self):
@@ -146,11 +159,147 @@ class NativeGenerateStage:
     async def run(self, engine, context: dict) -> StageResult:
         try:
             await engine._generate_inventory_and_snapshot(context.get("job_id", 0))
-            await engine.emit_monitoring_inventory_sync()
+            # Order matters (maintenance windows, 1.6): the Entity-Registry ci_ids are
+            # fetched first (hosts + services, inside emit_iac_inventory_updated), the
+            # monitoring sync then carries them, and the effective maintenance windows
+            # are published last — they reference the same ci_ids.
             await engine.emit_iac_inventory_updated()
+            await engine.emit_monitoring_inventory_sync()
+            await engine.publish_maintenance()
             return StageResult(True, "Native artifacts generated.")
         except Exception as e:
             return StageResult(False, f"Native generation failed: {e}")
+
+
+class MaintenancePolicyStage(BaseStage):
+    """Decide **in the job, on the runner** whether a service deploy runs now, is
+    parked until its maintenance window, or runs now with a warning (plugin 1.6,
+    ``plan-iac-orchestrator.md`` §4; decisions B, C, H).
+
+    Runs right after ``CloneServiceRepoStage`` so the fresh ``service.yml`` is on disk.
+
+    1. Target hosts = controller hosts whose ``services[]`` list the service (branch
+       ``dev``/``*-dev``/``test`` narrows the stage); the first sorted host decides.
+    2. Policy applies only to webhook/CI triggers (``policy_applies``). ``force``
+       (run now, promoted job), UI deploys and a due SCHEDULED job (``not_before``
+       reached) skip the evaluation.
+    3. ``deploy_policy: window`` and not inside a window → park as SCHEDULED until the
+       next window start within ``maintenance_schedule_horizon_days`` and raise
+       :class:`JobParked`. No window within the horizon (or none defined at all) →
+       warning, deploy now **and** emit ``maintenance:window_missing`` (decision H; only
+       when the service has a CI and the setting is on — ITSM opens a task from it).
+    4. Every deploy that proceeds announces a maintenance override for the service
+       and host CIs it touches (``maintenance_deploy_marks_maintenance``, decision B);
+       ``run_pipeline`` ends it on every terminal path.
+    """
+
+    def __init__(self, service_name: str, branch: str, payload: dict, *, clock=None):
+        super().__init__(f"Maintenance Policy: {service_name}")
+        self.service_name = str(service_name or "").strip().lower()
+        self.branch = str(branch or "main")
+        self.payload = payload or {}
+        self.clock = clock or mw.utcnow
+
+    def _stage_hint(self) -> str | None:
+        """The stage a branch implies (mirrors SingleServiceStrategy's target group)."""
+        if self.branch == "dev" or self.branch.endswith("-dev"):
+            return "dev"
+        if self.branch == "test":
+            return "test"
+        return None
+
+    async def run(self, engine, context: dict) -> StageResult:
+        job_id = int(context.get("job_id") or 0)
+        now = self.clock()
+        cfg = engine.config
+        controller_root = engine.base_git_dir / "iac_controller"
+        svc = self.service_name
+
+        # 1. Target hosts (controller is the SSoT; the branch only narrows the stage).
+        hint = self._stage_hint()
+        targets = await asyncio.to_thread(mres.find_service_hosts, controller_root, svc, stage=hint)
+        if not targets and hint:
+            targets = await asyncio.to_thread(mres.find_service_hosts, controller_root, svc)
+        if not targets:
+            log.info(f"[MAINTENANCE] No controller host lists service '{svc}' — no deploy policy, no override.")
+            return StageResult(True, "No target host in the controller — maintenance policy skipped")
+
+        services = await asyncio.to_thread(mres.scan_service_ymls, [engine.config.services_dir])
+        items: list[dict] = []
+        for site, stage in sorted({(s, st) for s, st, _ in targets}):
+            tree = await asyncio.to_thread(mres.load_tree, controller_root, site, stage)
+            items.extend(mres.resolve(site, stage, tree, services, getattr(engine, "_ci_map", None) or {},
+                                      include_hypervisors=False))
+        decision = mres.service_policy(items, svc, [h for _, _, h in targets])
+        context["maintenance_decision"] = decision
+        for note in decision.notes:
+            log.warning(f"[MAINTENANCE] {note}")
+
+        # 2./3. Policy.
+        sched = None
+        if engine.queue is not None and job_id:
+            sched = await asyncio.to_thread(engine.queue.job_schedule, job_id)
+        due = bool(sched and sched.get("not_before") and sched["not_before"] <= now)
+        message = "deploying now"
+        if not mres.policy_applies(self.payload):
+            why = "force / run now" if self.payload.get("force") else f"trigger '{self.payload.get('trigger') or 'ui'}'"
+            log.info(f"[MAINTENANCE] {why} — deploy policy not applied, deploying now.")
+        elif due:
+            log.info(f"[MAINTENANCE] Scheduled deployment is due (not_before {mw.iso(sched['not_before'])}) — running.")
+            message = "scheduled window reached, deploying"
+        elif decision.deploy_policy == "window":
+            current = mw.current_interval(decision.schedules, now) if decision.schedules else None
+            if current is not None:
+                log.info(f"[MAINTENANCE] Inside maintenance window of {svc} @ {decision.host} "
+                         f"until {mw.iso(current.end)} — deploying now.")
+                message = f"inside maintenance window until {mw.iso(current.end)}"
+            else:
+                horizon_days = int(cfg.maintenance_schedule_horizon_days)
+                nxt = (mw.next_start(decision.schedules, now, horizon=timedelta(days=horizon_days))
+                       if decision.schedules else None)
+                if nxt is not None:
+                    reason = (f"deploy_policy window — next window of {svc} @ {decision.host} "
+                              f"opens {mw.iso(nxt)}")
+                    parked = False
+                    if engine.queue is not None and job_id:
+                        parked = await asyncio.to_thread(
+                            engine.queue.park, job_id, not_before=nxt, window_ci_ids=decision.ci_ids,
+                            reason=reason, instance_id=getattr(engine.ctx, "instance_id", None),
+                        )
+                    if parked:
+                        raise JobParked(nxt, reason)
+                    log.warning(f"[MAINTENANCE] Could not park job #{job_id} ({reason}) — deploying now.")
+                else:
+                    log.warning(
+                        f"[MAINTENANCE] deploy_policy is 'window' for {svc} @ {decision.host} but no "
+                        f"maintenance window lies within {horizon_days} days — deploying NOW. Define a "
+                        f"window in service.yml or the iac-controller (maintenance / maintenance_default)."
+                    )
+                    message = f"no maintenance window within {horizon_days} days — deployed at once (warning)"
+                    if not cfg.maintenance_report_missing_window:
+                        log.info("[MAINTENANCE] window_missing report disabled by setting.")
+                    elif not decision.service_ci_id:
+                        log.info("[MAINTENANCE] Service has no CI id (Entity Registry absent) — no window_missing event.")
+                    else:
+                        engine.ctx.emit(mw.TOPIC_WINDOW_MISSING, mres.window_missing_payload(
+                            decision, job_id=job_id, horizon_days=horizon_days, now=now))
+        else:
+            log.info(f"[MAINTENANCE] deploy_policy '{decision.deploy_policy}' for {svc} @ {decision.host} — deploying now.")
+
+        # 4. Override: every executed deploy restarts containers → mark maintenance.
+        if cfg.maintenance_deploy_marks_maintenance and decision.ci_ids and job_id and engine.queue is not None:
+            override_id = f"iac-job-{job_id}"
+            engine.ctx.emit(mw.TOPIC_OVERRIDE_STARTED, mres.override_started_payload(
+                override_id, decision.ci_ids, reason=f"IaC deploy of {svc} (job #{job_id})", now=now,
+                max_override_minutes=int(cfg.maintenance_max_override_minutes),
+                linger_minutes=int(cfg.maintenance_linger_minutes),
+            ))
+            await asyncio.to_thread(engine.queue.set_override, job_id, override_id, decision.ci_ids)
+            context["override_id"] = override_id
+            log.info(f"[MAINTENANCE] Override {override_id} started for {len(decision.ci_ids)} CI(s).")
+        elif cfg.maintenance_deploy_marks_maintenance and not decision.ci_ids:
+            log.info("[MAINTENANCE] No CI ids for the target hosts (Entity Registry absent) — no override event.")
+        return StageResult(True, f"Maintenance policy '{decision.deploy_policy}': {message}")
 
 
 class TerraformProvisionStage(BaseStage):
@@ -678,6 +827,9 @@ class SingleServiceStrategy(PipelineStrategy):
         playbook_path, extra_roles = service_rollout_selector(engine, svc_name)
         return [
             CloneServiceRepoStage(svc_name, svc_branch, payload),
+            # Maintenance windows (1.6): decide on the fresh service.yml whether to
+            # run now, park until the window, or run with a warning; marks the override.
+            MaintenancePolicyStage(svc_name, svc_branch, payload),
             AnsiblePlaybookStage(
                 name_override=f"Single Service: {svc_name} ({svc_branch})",
                 playbook_path=playbook_path,
@@ -932,6 +1084,10 @@ class DeploymentEngine:
         self.queue = None
         self._log_writers: dict[int, "JobLogWriter"] = {}
         self._runners_last_push: dict[int, float] = {}
+        # Entity-Registry CI ids of the last publish: ("host", name) and
+        # ("service", host, service) → UUID. Feeds the monitoring sync, the
+        # maintenance publisher and the policy stage (runner instances only).
+        self._ci_map: dict[tuple, str] = {}
 
     def get_default_ansible_stages(self, pipeline_type: str = "connectivity"):
         if pipeline_type == "rollout":
@@ -1030,12 +1186,17 @@ class DeploymentEngine:
             normalized = "".join(ch for ch in str(slug or "").lower() if ch.isalnum())
             return docker_name_map.get(normalized) or slug
 
+        # Entity-Registry ids from the last identify (maintenance windows, 1.6): the
+        # monitoring stores ci_id per monitor so windows/overrides can be matched.
+        ci_map = getattr(self, "_ci_map", None) or {}
+
         hosts = []
         services = []
         for host_name, host_data in all_hosts.items():
             groups = sorted(host_groups.get(host_name, []))
             stage = next((group[len("stage_"):] for group in groups if group.startswith("stage_")), None)
             site = next((group[len("site_"):] for group in groups if group.startswith("site_")), None)
+            host_ci = ci_map.get(("host", host_name))
             hosts.append(
                 {
                     "host_name": host_name,
@@ -1049,6 +1210,7 @@ class DeploymentEngine:
                     "terraform": host_data.get("terraform") or {},
                     "site": site,
                     "stage": stage,
+                    "ci_id": host_ci,
                 }
             )
 
@@ -1075,6 +1237,8 @@ class DeploymentEngine:
                         "ansible_groups": groups,
                         "site": site,
                         "stage": stage,
+                        "ci_id": ci_map.get(("service", host_name, slug)),
+                        "host_ci_id": host_ci,
                     }
                 )
 
@@ -1158,9 +1322,9 @@ class DeploymentEngine:
             out[key] = value
         return out
 
-    def _build_inventory_hosts(self) -> list[dict]:
+    def _build_inventory_hosts(self, inventory: dict | None = None) -> list[dict]:
         """Generic host list from the generated inventory (sync — YAML read)."""
-        inventory = self._load_generated_inventory()
+        inventory = inventory if inventory is not None else self._load_generated_inventory()
         if not inventory:
             return []
         all_hosts = (inventory.get("all") or {}).get("hosts") or {}
@@ -1189,17 +1353,54 @@ class DeploymentEngine:
                 "entity_type": "hypervisor" if is_hypervisor else "host",
                 "site": next((g[len("site_"):] for g in groups if g.startswith("site_")), None),
                 "stage": next((g[len("stage_"):] for g in groups if g.startswith("stage_")), None),
+                # Maintenance windows (1.6): the host's own blocks travel with the event
+                # (consumers evaluate them with core.api.maintenance).
+                "maintenance": host_data.get("maintenance") if isinstance(host_data.get("maintenance"), dict) else None,
+                "incidents": host_data.get("incidents") if isinstance(host_data.get("incidents"), dict) else None,
                 "ci_id": None,  # filled in by the Entity Registry when it is present
             })
         return hosts
 
-    async def _attach_ci_ids(self, hosts: list[dict]) -> None:
-        """Ask the Entity Registry for every host's CI UUID (best effort).
+    def _build_inventory_services(self, inventory: dict | None = None) -> list[dict]:
+        """``[{host, name, site, stage, ci_id, host_ci_id}]`` — one entry per service
+        instance (``hosts[].services[]`` of the generated inventory)."""
+        inventory = inventory if inventory is not None else self._load_generated_inventory()
+        if not inventory:
+            return []
+        all_hosts = (inventory.get("all") or {}).get("hosts") or {}
+        children = (inventory.get("all") or {}).get("children") or {}
+        host_groups: dict[str, set[str]] = {}
+        for group_name, group_data in children.items():
+            for host_name in (group_data.get("hosts") or {}).keys():
+                host_groups.setdefault(host_name, set()).add(group_name)
+        out: list[dict] = []
+        for host_name, host_data in all_hosts.items():
+            groups = host_groups.get(host_name, set()) | set(host_data.get("ansible_groups") or [])
+            site = next((g[len("site_"):] for g in sorted(groups) if g.startswith("site_")), None)
+            stage = next((g[len("stage_"):] for g in sorted(groups) if g.startswith("stage_")), None)
+            for entry in host_data.get("services") or []:
+                name = entry.get("name") if isinstance(entry, dict) else entry
+                if not name:
+                    continue
+                out.append({"host": host_name, "name": str(name), "site": site, "stage": stage,
+                            "ci_id": None, "host_ci_id": None})
+        return out
 
-        Identifiers: ``iac.host`` (inventory key), ``pve.vm`` (node/vmid for
-        managed guests — survives a rename) and ``fqdn``. No registry → no
-        ci_id; the next publish fills it in.
+    #: Max items per ``entity_registry:identify`` request (one 10 s round trip each).
+    _IDENTIFY_CHUNK = 500
+
+    async def _attach_ci_ids(self, hosts: list[dict], services: list[dict] | None = None) -> None:
+        """Ask the Entity Registry for every host's — and service instance's — CI
+        UUID (best effort) and remember them in ``self._ci_map``.
+
+        Hosts: ``iac.host`` (inventory key), ``pve.vm`` (node/vmid for managed
+        guests — survives a rename) and ``fqdn``. Services: ``iac.service =
+        "<host>/<service>"`` (registry ≥ 0.3.0; an older registry rejects the scheme →
+        ``ci_id`` stays None, no error). Afterwards every service with both ids is
+        related ``runs_on`` its host (fire-and-forget). No registry → no ci_id; the
+        next publish fills it in.
         """
+        services = services if services is not None else []
         request = getattr(self.ctx, "request", None)
         if request is None:  # core API < 1.4
             return
@@ -1222,25 +1423,73 @@ class DeploymentEngine:
                 "display_name": host["name"], "attributes": attributes,
                 "source": "iac-orchestrator",
             })
-        reply = await request(
-            "entity_registry:identify", {"items": items},
-            reply_topic="entity_registry:identified", timeout=10,
-        )
-        if not reply or not reply.get("ok"):
-            log.info("IAC: Entity Registry not available — inventory published without ci_id.")
-            return
+        for svc in services:
+            items.append({
+                "entity_type": "service",
+                "identifiers": {"iac.service": f"{svc['host']}/{svc['name']}"},
+                "display_name": f"{svc['name']} @ {svc['host']}",
+                "attributes": {k: v for k, v in {
+                    "host": svc["host"], "site": svc.get("site"), "stage": svc.get("stage"),
+                }.items() if v},
+                "source": "iac-orchestrator",
+            })
+
+        results: list[dict] = []
+        for start in range(0, len(items), self._IDENTIFY_CHUNK):
+            chunk = items[start:start + self._IDENTIFY_CHUNK]
+            reply = await request(
+                "entity_registry:identify", {"items": chunk},
+                reply_topic="entity_registry:identified", timeout=10,
+            )
+            if not reply or not reply.get("ok"):
+                log.info("IAC: Entity Registry not available — inventory published without ci_id.")
+                return
+            results.extend(reply.get("results") or [])
+
         conflicts = 0
-        for host, result in zip(hosts, reply.get("results") or []):
+        rejected_services = 0
+        ci_map: dict[tuple, str] = {}
+        host_results, svc_results = results[:len(hosts)], results[len(hosts):]
+        for host, result in zip(hosts, host_results):
             if result.get("ok"):
                 host["ci_id"] = result.get("uuid")
+                if host["ci_id"]:
+                    ci_map[("host", host["name"])] = host["ci_id"]
                 conflicts += 1 if result.get("conflict") else 0
             else:
                 log.warning(f"IAC: Entity Registry rejected host '{host['name']}': {result.get('error')}")
+        for svc, result in zip(services, svc_results):
+            if result.get("ok") and result.get("uuid"):
+                svc["ci_id"] = result["uuid"]
+                ci_map[("service", svc["host"], svc["name"])] = svc["ci_id"]
+                conflicts += 1 if result.get("conflict") else 0
+            else:
+                rejected_services += 1
+            svc["host_ci_id"] = ci_map.get(("host", svc["host"]))
+        if rejected_services:
+            # Registry < 0.3.0 does not know the ``iac.service`` scheme — not an error.
+            log.info(f"IAC: Entity Registry did not identify {rejected_services} service instance(s) "
+                     "(scheme iac.service needs registry >= 0.3.0).")
         if conflicts:
             log.warning(
                 f"IAC: Entity Registry reported {conflicts} identity conflict(s) — "
                 "review them in the Registry UI."
             )
+        self._ci_map = ci_map
+        self._relate_services(services)
+
+    def _relate_services(self, services: list[dict]) -> None:
+        """``entity_registry:relate`` service → host (``runs_on``) for every service
+        instance that has both ids (idempotent on the registry side)."""
+        for svc in services:
+            if svc.get("ci_id") and svc.get("host_ci_id"):
+                try:
+                    self.ctx.emit("entity_registry:relate", {
+                        "from_uuid": svc["ci_id"], "to_uuid": svc["host_ci_id"],
+                        "relation": "runs_on", "source": "iac-orchestrator",
+                    })
+                except Exception as exc:
+                    log.debug(f"IAC: relate emit failed for {svc.get('name')}: {exc}")
 
     def _register_servers(self, hosts: list[dict]) -> None:
         """Push every host into the Server Manager (read-only there, we are the SSoT)."""
@@ -1279,16 +1528,82 @@ class DeploymentEngine:
         Both degrade gracefully when the target plugin is absent.
         """
         try:
-            hosts = await asyncio.to_thread(self._build_inventory_hosts)
+            inventory = await asyncio.to_thread(self._load_generated_inventory)
+            hosts = self._build_inventory_hosts(inventory) if inventory else []
             if not hosts:
                 return
-            await self._attach_ci_ids(hosts)
-            self.ctx.emit("iac:inventory_updated", {"hosts": hosts})
+            services = self._build_inventory_services(inventory)
+            await self._attach_ci_ids(hosts, services)
+            self.ctx.emit("iac:inventory_updated", {"hosts": hosts, "services": services})
             self._register_servers(hosts)
             with_ci = sum(1 for h in hosts if h.get("ci_id"))
-            log.debug(f"IAC: Published inventory — {len(hosts)} host(s), {with_ci} with ci_id.")
+            log.debug(f"IAC: Published inventory — {len(hosts)} host(s), {with_ci} with ci_id, "
+                      f"{len(services)} service instance(s).")
         except Exception as exc:
             log.error(f"IAC: Failed to publish inventory: {exc}")
+
+    # ------------------------------------------------------------------
+    # Maintenance windows (plugin 1.6, core API 1.13)
+    # ------------------------------------------------------------------
+
+    #: Snapshot key (``iac_orchestrator_state``) of the effective windows read model.
+    MAINTENANCE_SNAPSHOT = "snapshot:maintenance_effective"
+
+    async def publish_maintenance(self) -> None:
+        """Resolve the effective maintenance windows of every hypervisor, host and
+        service (controller tree + cloned ``service.yml`` files) and
+
+        1. emit ``maintenance:windows_published`` **locally** (``replaces: true``) —
+           the transport rule: consumers persist in the shared DB, no ``cluster=True``;
+        2. store the read model (items incl. those without ci_id, the default switches)
+           as snapshot ``maintenance_effective`` so every instance can serve the UI.
+
+        Runner instances only (needs the working trees). Never raises.
+        """
+        try:
+            controller_root = self.base_git_dir / "iac_controller"
+            if not controller_root.is_dir():
+                log.debug("MAINTENANCE: no iac_controller checkout — nothing to publish.")
+                return
+            items = await asyncio.to_thread(
+                mres.resolve_all, controller_root, [self.config.services_dir],
+                dict(getattr(self, "_ci_map", None) or {}),
+            )
+            defaults = await asyncio.to_thread(mres.default_switches, controller_root)
+            now = mw.utcnow()
+            payload = mres.windows_published_payload(items, now=now)
+            self.ctx.emit(mw.TOPIC_WINDOWS_PUBLISHED, payload)
+            snapshot = {"items": items, "defaults": defaults, "published_at": mw.iso(now)}
+            await asyncio.to_thread(self.db.update_state, self.MAINTENANCE_SNAPSHOT, snapshot, "")
+            log.info(
+                f"MAINTENANCE: published {len(payload['items'])} item(s) with ci_id "
+                f"({len(items)} resolved, {len(defaults)} site/stage default(s))."
+            )
+        except Exception as exc:
+            log.error(f"MAINTENANCE: publish failed: {exc}")
+
+    def end_override_for(self, job_id: int | None) -> bool:
+        """Emit ``maintenance:override_ended`` for the job's override — exactly once
+        (the id is taken atomically from the row). Called on every terminal path:
+        pipeline end, abort, orphan sweep, container recovery. Sync and thread-safe
+        (``ctx.emit`` hops onto the loop since core 1.7)."""
+        if self.queue is None or job_id in (None, -1, 0):
+            return False
+        try:
+            override_id = self.queue.clear_override(int(job_id))
+        except Exception as exc:
+            log.debug(f"MAINTENANCE: clear_override failed for #{job_id}: {exc}")
+            return False
+        if not override_id:
+            return False
+        try:
+            self.ctx.emit(mw.TOPIC_OVERRIDE_ENDED, mres.override_ended_payload(
+                override_id, now=mw.utcnow(), linger_minutes=int(self.config.maintenance_linger_minutes)))
+            log.info(f"[MAINTENANCE] Override {override_id} ended.")
+            return True
+        except Exception as exc:
+            log.warning(f"MAINTENANCE: override_ended emit failed for {override_id}: {exc}")
+            return False
 
     # ------------------------------------------------------------------
     # Notification helpers — use messaging:outbound instead of system:notify
@@ -1475,6 +1790,7 @@ class DeploymentEngine:
                                   sink=_writer.append if _writer else None)
         logging.getLogger("IaC:Engine").addHandler(bridge)
         final_status = "FAILED"
+        parked = False  # set by the JobParked handler (maintenance windows, 1.6)
 
         log.info("[SYSTEM] Pipeline Started")
         log.info(f"[SYSTEM] Job #{current_job_id} registered in database.")
@@ -1601,6 +1917,31 @@ class DeploymentEngine:
             self.state["last_deployment"] = final_status
             log.warning("[SYSTEM] Pipeline aborted.")
             raise
+        except JobParked as parked_exc:
+            # Maintenance windows (1.6): the policy stage parked the job as SCHEDULED
+            # (row already updated, claim released). No terminal status, no override.
+            parked = True
+            log.info(f"[SYSTEM] Deployment scheduled for {mw.iso(parked_exc.not_before)} ({parked_exc.reason})")
+            self.db.update_progress(current_job_id, progress=0,
+                                    current_step=f"Scheduled for {mw.iso(parked_exc.not_before)}")
+            self.ctx.notify(
+                "deployment_started",
+                payload={
+                    "message":        f"Pipeline #{current_job_id} scheduled for {mw.iso(parked_exc.not_before)}.",
+                    "job_id":         current_job_id,
+                    "pipeline_type":  pipeline_type,
+                    "pipeline_label": pipeline_label,
+                    "service_name":   payload.get("service_name"),
+                    "service_branch": payload.get("service_branch"),
+                    "not_before":     mw.iso(parked_exc.not_before),
+                    "reason":         parked_exc.reason,
+                    "started_at":     _run_start_ts,
+                },
+                notification_id=f"job_{current_job_id}",
+                title=f"⏳ Pipeline #{current_job_id} — {pipeline_label}",
+                body=f"Scheduled for the next maintenance window ({mw.iso(parked_exc.not_before)}).",
+                severity="info",
+            )
         except Exception as e:
             import traceback
             error_detail = str(e) if str(e) else f"{type(e).__name__}: (no message)"
@@ -1648,9 +1989,12 @@ class DeploymentEngine:
             _job_id_ctxvar.reset(_job_ctx_token)
             self.state["running_jobs"] = max(0, self.state.get("running_jobs", 0) - 1)
             self.state["is_running"] = self.state["running_jobs"] > 0
-            # Per-job result (never the shared last_deployment: concurrent pipelines
-            # used to overwrite each other's final status through it).
-            self.db.update_job(job_id=current_job_id, status=final_status)
+            if not parked:
+                # Per-job result (never the shared last_deployment: concurrent pipelines
+                # used to overwrite each other's final status through it). A parked job
+                # is already SCHEDULED — writing a terminal status would un-park it.
+                self.db.update_job(job_id=current_job_id, status=final_status)
+                self.end_override_for(current_job_id)
             self._sync_runners(current_job_id, force=True)
             await self._close_log_writer(current_job_id)
             self._cleanup_inventory_snapshot(current_job_id)
@@ -1923,6 +2267,7 @@ class DeploymentEngine:
         self.db.update_progress(job_id, progress=100 if success else None,
                                 current_step="Recovered after runner restart" + ("" if success else " (failed)"))
         self.db.update_job(job_id, final)
+        self.end_override_for(job_id)
         await self._close_log_writer(job_id)
         self._notify(f"Pipeline #{job_id}", f"Recovered after runner restart: {final}.",
                      "positive" if success else "negative", notification_id=f"job_{job_id}")
@@ -1956,6 +2301,7 @@ class DeploymentEngine:
         self._sync_runners(job_id, force=True)
         self.db.update_progress(job_id, progress=None, current_step=reason)
         self.db.update_job(job_id, "ABORTED")
+        self.end_override_for(job_id)
         return killed
 
     async def _on_git_status(self, payload: dict):

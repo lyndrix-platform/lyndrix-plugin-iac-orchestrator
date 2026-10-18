@@ -23,7 +23,10 @@
     "pipeline": "Pipeline #{{id}}",
     "activeRunners": "Active Runners",
     "waitingPool": "Waiting for pool…",
-    "liveLogs": "Live Logs"
+    "liveLogs": "Live Logs",
+    "scheduled_one": "{{count}} deployment is scheduled for a maintenance window",
+    "scheduled_other": "{{count}} deployments are scheduled for a maintenance window",
+    "openMaintenance": "Maintenance"
   },
   "history": {
     "title": "Deployment History",
@@ -90,7 +93,12 @@
     "statusBreakdown": "Status Breakdown",
     "noDeploymentsRecorded": "No deployments recorded yet.",
     "recentDeployments": "Recent Deployments",
-    "nothingHere": "Nothing here yet."
+    "nothingHere": "Nothing here yet.",
+    "navMaintenance": "Maintenance",
+    "scheduled_one": "{{count}} scheduled",
+    "scheduled_other": "{{count}} scheduled",
+    "noScheduled": "No scheduled deploys",
+    "maintenanceSub": "Windows · scheduled deploys"
   },
   "provision": {
     "title": "Provisioning (Terraform)",
@@ -224,7 +232,8 @@
     "provision": "Provision",
     "catalog": "Service Catalog",
     "assignments": "Topology",
-    "history": "History"
+    "history": "History",
+    "maintenance": "Maintenance"
   },
   "dashboard": {
     "title": "IaC Orchestrator",
@@ -238,5 +247,57 @@
     "aborted_other": "Execution aborted ({{count}} jobs).",
     "abortError": "Abort failed.",
     "settings": "Settings"
+  },
+  "maintenance": {
+    "scheduledTitle": "Scheduled deployments",
+    "scheduledEmpty": "No deployment is waiting for a maintenance window.",
+    "notBefore": "not before",
+    "runNow": "Run now",
+    "runNowConfirmTitle": "Run deployment #{{id}} now?",
+    "runNowConfirmBody": "Deploys “{{service}}” ({{branch}}) outside its maintenance window. The deploy announces a maintenance override for the affected service and host, so monitoring shows “maintenance” instead of “down”.",
+    "runNowLabel": "Run now",
+    "runNowQueued": "Deployment #{{id}} queued to run now.",
+    "runNowError": "Run now failed.",
+    "cancel": "Cancel",
+    "cancelConfirmTitle": "Cancel scheduled deployment #{{id}}?",
+    "cancelConfirmBody": "The parked deployment of “{{service}}” is aborted. The next CI trigger schedules it again.",
+    "cancelLabel": "Cancel deployment",
+    "cancelled": "Scheduled deployment #{{id}} cancelled.",
+    "cancelError": "Cancel failed.",
+    "windowsTitle": "Effective maintenance windows",
+    "windowsEmpty": "No windows published yet — the runner publishes them after the next inventory generation.",
+    "allSites": "All sites",
+    "allStages": "All stages",
+    "allKinds": "All kinds",
+    "searchPlaceholder": "Name / host…",
+    "activeUntil": "active until {{until}}",
+    "overrideUntil": "override until {{until}}",
+    "nextStart": "next {{at}}",
+    "noWindow": "no window",
+    "inheritedHost": "from host",
+    "inheritedStage": "stage default",
+    "inheritedSite": "site default",
+    "own": "own",
+    "noCi": "no CI id (Entity Registry) — not published on the bus",
+    "publishedAt": "published {{at}}",
+    "defaultTitle": "Default windows (maintenance_default)",
+    "defaultEmpty": "No snapshot yet.",
+    "readOnlyHint": "Read-only. The switch is changed in the iac-controller repository (file stage_vars.yml / site_vars.yml, block maintenance_default → enabled). The next sync republishes it.",
+    "enabled": "on",
+    "disabled": "off",
+    "noDefault": "no maintenance_default defined",
+    "levelSite": "site level",
+    "loadError": "Could not load maintenance data.",
+    "kind": {
+      "hypervisor": "Hypervisor",
+      "host": "Host",
+      "service": "Service",
+      "container": "Container",
+      "network": "Network"
+    },
+    "policy": {
+      "window": "deploy: window",
+      "immediate": "deploy: immediate"
+    }
   }
 }

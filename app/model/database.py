@@ -146,13 +146,17 @@ class JobDatabase:
                 session.close()
 
     def get_latest_job_for_pipeline_type(self, pipeline_type: str, since_epoch: int = 0) -> dict | None:
-        """Returns the newest job for an exact pipeline type, optionally after epoch seconds."""
+        """Returns the newest job for an exact pipeline type, optionally after epoch seconds.
+
+        A SCHEDULED (parked) job is the current state of that service regardless of the
+        time window — a deploy planned days ahead must still be found by the CI poll.
+        """
         session = self._get_session()
         if not session:
             return None
 
         try:
-            query = session.query(
+            columns = (
                 IaCJob.id,
                 IaCJob.pipeline_type,
                 IaCJob.status,
@@ -160,20 +164,29 @@ class JobDatabase:
                 IaCJob.current_step,
                 IaCJob.start_time,
                 IaCJob.end_time,
-            ).filter(IaCJob.pipeline_type == pipeline_type)
+                IaCJob.not_before,
+            )
+            job = (
+                session.query(*columns)
+                .filter(IaCJob.pipeline_type == pipeline_type, IaCJob.status == "SCHEDULED")
+                .order_by(IaCJob.id.desc())
+                .first()
+            )
+            if not job:
+                query = session.query(*columns).filter(IaCJob.pipeline_type == pipeline_type)
 
-            if since_epoch and since_epoch > 0:
-                # Allow a small skew window so CI/Orchestrator clock drift does not
-                # hide the freshly created deployment job from the status endpoint.
-                since_dt = datetime.fromtimestamp(max(0, since_epoch - 60))
-                query = query.filter(
-                    or_(
-                        IaCJob.start_time >= since_dt,
-                        IaCJob.end_time >= since_dt,
+                if since_epoch and since_epoch > 0:
+                    # Allow a small skew window so CI/Orchestrator clock drift does not
+                    # hide the freshly created deployment job from the status endpoint.
+                    since_dt = datetime.fromtimestamp(max(0, since_epoch - 60))
+                    query = query.filter(
+                        or_(
+                            IaCJob.start_time >= since_dt,
+                            IaCJob.end_time >= since_dt,
+                        )
                     )
-                )
 
-            job = query.order_by(IaCJob.id.desc()).first()
+                job = query.order_by(IaCJob.id.desc()).first()
             if not job:
                 return None
 
@@ -185,6 +198,7 @@ class JobDatabase:
                 "current_step": job.current_step or "",
                 "start_time": job.start_time,
                 "end_time": job.end_time,
+                "not_before": job.not_before,
             }
         finally:
             if session:
@@ -288,7 +302,9 @@ class JobDatabase:
         """Deletes job history (the data behind the Overview statistics).
 
         By default keeps any currently RUNNING jobs so an active pipeline is not
-        disrupted. Returns the number of deleted rows (-1 on failure).
+        disrupted, and SCHEDULED jobs — a parked deploy waiting for its maintenance
+        window is pending work, not history. Returns the number of deleted rows
+        (-1 on failure).
         """
         session = self._get_session()
         if not session:
@@ -296,7 +312,7 @@ class JobDatabase:
         try:
             job_query = session.query(IaCJob)
             if keep_running:
-                job_query = job_query.filter(IaCJob.status != "RUNNING")
+                job_query = job_query.filter(IaCJob.status.notin_(("RUNNING", "SCHEDULED")))
             job_ids = [j.id for j in job_query.all()]
             if not job_ids:
                 return 0

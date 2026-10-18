@@ -20,12 +20,13 @@ from .app.ui.widget import render_dashboard_widget as modular_widget
 manifest = ModuleManifest(
     id="lyndrix.plugin.iac_orchestrator",
     name="IaC Orchestrator",
-    version="1.5.0",
+    version="1.6.0",
     description="Standalone GitOps controller for executing Terraform and Ansible pipelines.",
     author="Lyndrix",
     icon="rocket_launch",
     type="PLUGIN",
-    min_core_version="1.4.0",
+    # core.api.maintenance (API 1.13) is imported unconditionally (maintenance windows).
+    min_core_version="1.11.0",
     # Cluster placement (core API ≥ 1.7): the CONTROL PLANE — API, UI data, webhook
     # ingest, job queue, logs — runs on every instance from the shared database.
     # EXECUTION (git working trees, Docker runner containers, ansible/terraform)
@@ -102,10 +103,13 @@ manifest = ModuleManifest(
         "subscribe": ["vault:ready_for_data", "iac:webhook_verified", "git:status_update", "db:connected", "socket:response",
                       "entity_registry:identified", "iac:job_queued", "iac:job_abort_requested"],
         "emit": ["iac:pipeline_started", "iac:webhook_verified", "iac:inventory_updated",
-                 "entity_registry:identify", "server_manager:register_server",
+                 "entity_registry:identify", "entity_registry:relate", "server_manager:register_server",
                  "git:sync", "git:commit_push",
                  "system:notify", "user:notify", "socket:request", "messaging:outbound",
-                 "iac:job_queued", "iac:job_abort_requested"],
+                 "iac:job_queued", "iac:job_abort_requested",
+                 # Maintenance windows (core API 1.13) — emitted LOCALLY, never cluster=True.
+                 "maintenance:windows_published", "maintenance:override_started",
+                 "maintenance:override_ended", "maintenance:window_missing"],
     },
     notification_endpoints=[
         NotificationEndpoint(
@@ -302,8 +306,9 @@ def setup(ctx):
     if _service.is_runner:
         _service.start_runner()
         ctx.create_task(_service.run_startup_reconciliation(), name="iac:startup_reconciliation")
-        ctx.create_task(_service.emit_monitoring_inventory_sync(), name="iac:monitoring_inventory_seed")
-        ctx.create_task(_service.emit_iac_inventory_updated(), name="iac:inventory_publish")
+        # One ordered chain (maintenance windows, 1.6): registry ci_ids → monitoring
+        # sync with ci_ids → maintenance:windows_published. Same order as NativeGenerateStage.
+        ctx.create_task(_service.publish_inventory_chain(), name="iac:inventory_publish")
         ctx.create_task(_service.publish_snapshots_on_boot(), name="iac:snapshots_publish")
     else:
         ctx.log.info("IaC Orchestrator: control plane only on this instance (no 'runner' role).")

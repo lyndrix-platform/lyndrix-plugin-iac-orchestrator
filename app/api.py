@@ -32,7 +32,7 @@ PLUGIN_ID = "lyndrix.plugin.iac_orchestrator"
 # versa — so gating on the bare ids would lock out groups holding only this
 # plugin's qualified viewer/operator role permissions. Gate on the scoped ids:
 # scoped grants unlock exactly this plugin, global grants keep working.
-PLUGIN_VERSION = "1.5.0"   # mirrors entrypoint.manifest.version
+PLUGIN_VERSION = "1.6.0"   # mirrors entrypoint.manifest.version
 PERM_READ = f"plugin:{PLUGIN_ID}:api:read"
 PERM_WRITE = f"plugin:{PLUGIN_ID}:api:write"
 
@@ -85,9 +85,35 @@ def build_plugin_router(service) -> APIRouter:
     async def service_status(
         service_name: str,
         since_epoch: int = 0,
+        accept: str | None = None,
         identity: ApiIdentity = Depends(require_permission(PERM_READ)),
     ):
-        return await _api.do_get_service_status(service_name, since_epoch=since_epoch)
+        return await _api.do_get_service_status(service_name, since_epoch=since_epoch, accept=accept)
+
+    # ── Maintenance windows (plugin 1.6, core API 1.13) ──────────────────────
+    # NB: ``/maintenance/*`` is the plugin-upkeep namespace (clear-stats, sync-repos);
+    # the maintenance-window surface therefore lives under /schedules and
+    # /maintenance-windows, /maintenance-default.
+    @router.get("/schedules")
+    async def list_schedules(identity: ApiIdentity = Depends(require_permission(PERM_READ))):
+        """Parked deploys (SCHEDULED) waiting for their maintenance window."""
+        return await _api.do_list_schedules()
+
+    @router.get("/maintenance-windows")
+    async def maintenance_windows(
+        site: str | None = None,
+        stage: str | None = None,
+        kind: str | None = None,
+        q: str | None = None,
+        identity: ApiIdentity = Depends(require_permission(PERM_READ)),
+    ):
+        """Effective windows per hypervisor/host/service with the evaluated state (snapshot)."""
+        return await _api.do_maintenance_windows(site=site, stage=stage, kind=kind, q=q)
+
+    @router.get("/maintenance-default")
+    async def maintenance_default(identity: ApiIdentity = Depends(require_permission(PERM_READ))):
+        """Read-only ``maintenance_default`` per site/stage (edited in the iac-controller repo)."""
+        return await _api.do_maintenance_default()
 
     @router.get("/stats")
     async def stats(identity: ApiIdentity = Depends(require_permission(PERM_READ))):
@@ -209,6 +235,23 @@ def build_plugin_router(service) -> APIRouter:
     @router.post("/maintenance/sync-repos")
     async def sync_repos(identity: ApiIdentity = Depends(require_permission(PERM_WRITE))):
         return await _api.do_sync_repos()
+
+    @router.post("/schedules/{job_id}/run-now")
+    async def run_schedule_now(
+        job_id: int,
+        identity: ApiIdentity = Depends(require_permission(PERM_WRITE)),
+    ):
+        """Promote a parked deploy to run now (the run announces a maintenance override)."""
+        return await _api.do_run_schedule_now(job_id)
+
+    @router.delete("/schedules/{job_id}")
+    async def cancel_schedule(
+        job_id: int,
+        identity: ApiIdentity = Depends(require_permission(PERM_WRITE)),
+    ):
+        """Cancel a parked deploy (SCHEDULED → ABORTED)."""
+        return await _api.do_cancel_schedule(job_id)
+
     @router.post("/deploy/service/{service_name}")
     async def deploy_service(
         service_name: str,

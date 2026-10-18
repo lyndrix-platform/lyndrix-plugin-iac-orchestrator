@@ -23,7 +23,10 @@
     "pipeline": "Pipeline #{{id}}",
     "activeRunners": "Aktive Runner",
     "waitingPool": "Warte auf Pool…",
-    "liveLogs": "Live-Logs"
+    "liveLogs": "Live-Logs",
+    "scheduled_one": "{{count}} Deployment wartet auf ein Wartungsfenster",
+    "scheduled_other": "{{count}} Deployments warten auf ein Wartungsfenster",
+    "openMaintenance": "Wartung"
   },
   "history": {
     "title": "Deployment-Verlauf",
@@ -90,7 +93,12 @@
     "statusBreakdown": "Status-Aufschlüsselung",
     "noDeploymentsRecorded": "Noch keine Deployments erfasst.",
     "recentDeployments": "Letzte Deployments",
-    "nothingHere": "Noch nichts vorhanden."
+    "nothingHere": "Noch nichts vorhanden.",
+    "navMaintenance": "Wartung",
+    "scheduled_one": "{{count}} geplant",
+    "scheduled_other": "{{count}} geplant",
+    "noScheduled": "Keine geplanten Deployments",
+    "maintenanceSub": "Fenster · geplante Deployments"
   },
   "provision": {
     "title": "Provisionierung (Terraform)",
@@ -224,7 +232,8 @@
     "provision": "Provisionierung",
     "catalog": "Service-Katalog",
     "assignments": "Topologie",
-    "history": "Verlauf"
+    "history": "Verlauf",
+    "maintenance": "Wartung"
   },
   "dashboard": {
     "title": "IaC Orchestrator",
@@ -238,5 +247,57 @@
     "aborted_other": "Ausführung abgebrochen ({{count}} Jobs).",
     "abortError": "Abbruch fehlgeschlagen.",
     "settings": "Einstellungen"
+  },
+  "maintenance": {
+    "scheduledTitle": "Geplante Deployments",
+    "scheduledEmpty": "Kein Deployment wartet auf ein Wartungsfenster.",
+    "notBefore": "frühestens",
+    "runNow": "Jetzt ausführen",
+    "runNowConfirmTitle": "Deployment #{{id}} jetzt ausführen?",
+    "runNowConfirmBody": "Deployt „{{service}}“ ({{branch}}) außerhalb seines Wartungsfensters. Der Deploy meldet ein Wartungs-Override für Service und Host, das Monitoring zeigt „maintenance“ statt „down“.",
+    "runNowLabel": "Jetzt ausführen",
+    "runNowQueued": "Deployment #{{id}} wird jetzt ausgeführt.",
+    "runNowError": "Ausführen fehlgeschlagen.",
+    "cancel": "Abbrechen",
+    "cancelConfirmTitle": "Geplantes Deployment #{{id}} abbrechen?",
+    "cancelConfirmBody": "Das geparkte Deployment von „{{service}}“ wird abgebrochen. Der nächste CI-Trigger plant es erneut.",
+    "cancelLabel": "Deployment abbrechen",
+    "cancelled": "Geplantes Deployment #{{id}} abgebrochen.",
+    "cancelError": "Abbrechen fehlgeschlagen.",
+    "windowsTitle": "Effektive Wartungsfenster",
+    "windowsEmpty": "Noch keine Fenster veröffentlicht — der Runner veröffentlicht sie nach der nächsten Inventar-Generierung.",
+    "allSites": "Alle Sites",
+    "allStages": "Alle Stages",
+    "allKinds": "Alle Typen",
+    "searchPlaceholder": "Name / Host…",
+    "activeUntil": "aktiv bis {{until}}",
+    "overrideUntil": "Override bis {{until}}",
+    "nextStart": "nächstes {{at}}",
+    "noWindow": "kein Fenster",
+    "inheritedHost": "vom Host",
+    "inheritedStage": "Stage-Default",
+    "inheritedSite": "Site-Default",
+    "own": "eigenes",
+    "noCi": "keine CI-ID (Entity Registry) — nicht auf dem Bus veröffentlicht",
+    "publishedAt": "veröffentlicht {{at}}",
+    "defaultTitle": "Default-Fenster (maintenance_default)",
+    "defaultEmpty": "Noch kein Snapshot.",
+    "readOnlyHint": "Nur Anzeige. Der Schalter wird im iac-controller-Repository geändert (Datei stage_vars.yml / site_vars.yml, Block maintenance_default → enabled). Der nächste Sync veröffentlicht ihn neu.",
+    "enabled": "an",
+    "disabled": "aus",
+    "noDefault": "kein maintenance_default definiert",
+    "levelSite": "Site-Ebene",
+    "loadError": "Wartungsdaten konnten nicht geladen werden.",
+    "kind": {
+      "hypervisor": "Hypervisor",
+      "host": "Host",
+      "service": "Service",
+      "container": "Container",
+      "network": "Netzwerk"
+    },
+    "policy": {
+      "window": "Deploy: Fenster",
+      "immediate": "Deploy: sofort"
+    }
   }
 }

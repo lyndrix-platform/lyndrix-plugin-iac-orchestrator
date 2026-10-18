@@ -49,16 +49,20 @@ def build_webhook_router(service) -> APIRouter:
         x_gitlab_token: str = Header(None),
     ):
         _api._require_gitlab_token(x_gitlab_token)
-        return await _api.do_trigger_service_deployment(service_name, payload)
+        # CI-originated: the service's deploy_policy applies (may be parked as SCHEDULED).
+        return await _api.do_trigger_service_deployment(service_name, payload, trigger="gitlab-ci")
 
     @router.get("/deploy/service/{service_name}/gitlab/status")
     async def get_service_deployment_status_gitlab(
         service_name: str,
         since_epoch: int = 0,
+        accept: str | None = None,
         x_gitlab_token: str = Header(None),
     ):
         _api._require_gitlab_token(x_gitlab_token)
-        return await _api.do_get_service_status(service_name, since_epoch=since_epoch)
+        # ``accept=scheduled``: the caller understands a parked deploy and gets
+        # ``status: "scheduled"``; older CI templates get the compatibility mapping.
+        return await _api.do_get_service_status(service_name, since_epoch=since_epoch, accept=accept)
 
     @router.post("/webhook/gitlab/test-host/{host_name}")
     async def gitlab_test_host_webhook(
