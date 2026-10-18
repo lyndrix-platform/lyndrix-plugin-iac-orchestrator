@@ -1442,9 +1442,14 @@ class DeploymentEngine:
                 reply_topic="entity_registry:identified", timeout=10,
             )
             if not reply or not reply.get("ok"):
+                # Typical at boot: the registry answers ``ok: False, "database not
+                # ready"`` for a few seconds. Remember it so the boot chain retries
+                # and ``publish_maintenance`` does not wipe the consumers' windows.
+                self._registry_ok = False
                 log.info("IAC: Entity Registry not available — inventory published without ci_id.")
                 return
             results.extend(reply.get("results") or [])
+        self._registry_ok = True
 
         conflicts = 0
         rejected_services = 0
@@ -1549,7 +1554,7 @@ class DeploymentEngine:
     #: Snapshot key (``iac_orchestrator_state``) of the effective windows read model.
     MAINTENANCE_SNAPSHOT = "snapshot:maintenance_effective"
 
-    async def publish_maintenance(self) -> None:
+    async def publish_maintenance(self) -> bool:
         """Resolve the effective maintenance windows of every hypervisor, host and
         service (controller tree + cloned ``service.yml`` files) and
 
@@ -1558,29 +1563,42 @@ class DeploymentEngine:
         2. store the read model (items incl. those without ci_id, the default switches)
            as snapshot ``maintenance_effective`` so every instance can serve the UI.
 
+        When the last ``entity_registry:identify`` failed (registry booting), the
+        bus event is **held back**: with ``replaces: true`` an empty set would wipe
+        every consumer's windows until the next publish. The snapshot is still
+        refreshed. Returns True when the event was emitted.
+
         Runner instances only (needs the working trees). Never raises.
         """
         try:
             controller_root = self.base_git_dir / "iac_controller"
             if not controller_root.is_dir():
                 log.debug("MAINTENANCE: no iac_controller checkout — nothing to publish.")
-                return
+                return False
             items = await asyncio.to_thread(
                 mres.resolve_all, controller_root, [self.config.services_dir],
                 dict(getattr(self, "_ci_map", None) or {}),
             )
             defaults = await asyncio.to_thread(mres.default_switches, controller_root)
             now = mw.utcnow()
-            payload = mres.windows_published_payload(items, now=now)
-            self.ctx.emit(mw.TOPIC_WINDOWS_PUBLISHED, payload)
             snapshot = {"items": items, "defaults": defaults, "published_at": mw.iso(now)}
             await asyncio.to_thread(self.db.update_state, self.MAINTENANCE_SNAPSHOT, snapshot, "")
+            if items and getattr(self, "_registry_ok", None) is False:
+                log.info(
+                    f"MAINTENANCE: Entity Registry unavailable — {len(items)} item(s) resolved "
+                    "but windows_published held back (an empty set would wipe the consumers)."
+                )
+                return False
+            payload = mres.windows_published_payload(items, now=now)
+            self.ctx.emit(mw.TOPIC_WINDOWS_PUBLISHED, payload)
             log.info(
                 f"MAINTENANCE: published {len(payload['items'])} item(s) with ci_id "
                 f"({len(items)} resolved, {len(defaults)} site/stage default(s))."
             )
+            return True
         except Exception as exc:
             log.error(f"MAINTENANCE: publish failed: {exc}")
+            return False
 
     def end_override_for(self, job_id: int | None) -> bool:
         """Emit ``maintenance:override_ended`` for the job's override — exactly once

@@ -252,5 +252,37 @@ def test_publish_maintenance_without_checkout_is_silent(tmp_path):
     eng = _engine({}, ctx)
     eng.base_git_dir = tmp_path / "nowhere"
     eng.config = SimpleNamespace(services_dir=tmp_path / "services")
-    asyncio.run(eng.publish_maintenance())
+    assert asyncio.run(eng.publish_maintenance()) is False
     ctx.emit.assert_not_called()
+
+
+def test_attach_ci_ids_records_registry_availability():
+    ctx = MagicMock()
+    ctx.request = AsyncMock(return_value={"ok": False, "error": "database not ready"})  # registry booting
+    eng = _engine(INV, ctx)
+    asyncio.run(eng._attach_ci_ids(eng._build_inventory_hosts(INV), []))
+    assert eng._registry_ok is False
+
+    ctx.request = AsyncMock(return_value=_registry_reply("u-atlas", "u-hydra"))
+    asyncio.run(eng._attach_ci_ids(eng._build_inventory_hosts(INV), []))
+    assert eng._registry_ok is True
+
+
+def test_publish_maintenance_holds_back_the_event_while_registry_is_unavailable(tmp_path):
+    """replaces:true + an empty set would wipe every consumer — keep the snapshot, skip the bus."""
+    ctx = MagicMock()
+    eng = _engine({}, ctx)
+    eng.base_git_dir = tmp_path / "git"
+    _controller_tree(eng.base_git_dir / "iac_controller")
+    eng.config = SimpleNamespace(services_dir=tmp_path / "services")
+    eng.db = MagicMock()
+    eng._ci_map = {}
+    eng._registry_ok = False
+    assert asyncio.run(eng.publish_maintenance()) is False
+    assert not [c for c in ctx.emit.call_args_list if c.args[0] == mw.TOPIC_WINDOWS_PUBLISHED]
+    key, snapshot, _hash = eng.db.update_state.call_args.args
+    assert key == "snapshot:maintenance_effective" and len(snapshot["items"]) == 3  # UI still sees them
+
+    eng._registry_ok = True  # registry answered (even without ci_ids) → publish as before
+    assert asyncio.run(eng.publish_maintenance()) is True
+    assert len([c for c in ctx.emit.call_args_list if c.args[0] == mw.TOPIC_WINDOWS_PUBLISHED]) == 1

@@ -166,16 +166,40 @@ class IaCService:
         except Exception as exc:
             log.debug(f"IaC Orchestrator: snapshot publish on boot skipped: {exc}")
 
-    async def publish_inventory_chain(self):
+    #: Back-off between boot publish attempts while the Entity Registry is still booting.
+    PUBLISH_RETRY_DELAYS = (15, 30, 60, 120, 300)
+
+    async def publish_inventory_chain(self, *, retry_delays=None, sleep=asyncio.sleep):
         """Runner boot: the same ordered publish as ``NativeGenerateStage`` — Entity
         Registry ids (hosts + services) first, then the monitoring sync carrying them,
-        then the effective maintenance windows (``maintenance:windows_published``)."""
-        try:
-            await self.engine.emit_iac_inventory_updated()
-            await self.engine.emit_monitoring_inventory_sync()
-            await self.engine.publish_maintenance()
-        except Exception as exc:
-            log.error(f"IaC Orchestrator: inventory publish on boot failed: {exc}")
+        then the effective maintenance windows (``maintenance:windows_published``).
+
+        The registry is usually a few seconds behind this plugin at boot (``ok: False,
+        "database not ready"``); without ci_ids nothing useful can be published, so
+        the chain is repeated with back-off until the registry answered or the
+        delays are exhausted (then the next deploy/sync publishes)."""
+        delays = list(self.PUBLISH_RETRY_DELAYS if retry_delays is None else retry_delays)
+        attempt = 0
+        while True:
+            try:
+                await self.engine.emit_iac_inventory_updated()
+                await self.engine.emit_monitoring_inventory_sync()
+                await self.engine.publish_maintenance()
+            except Exception as exc:
+                log.error(f"IaC Orchestrator: inventory publish on boot failed: {exc}")
+                return
+            if getattr(self.engine, "_registry_ok", None) is not False:
+                return
+            if not delays:
+                log.warning(
+                    f"IaC Orchestrator: Entity Registry still unavailable after {attempt} retries — "
+                    "ci_ids and maintenance windows are published with the next deploy or sync."
+                )
+                return
+            delay = delays.pop(0)
+            attempt += 1
+            log.info(f"IaC Orchestrator: Entity Registry not ready — retrying the inventory publish in {delay}s.")
+            await sleep(delay)
 
     def promote_scheduled(self, job_id: int) -> bool:
         """"Run now" for a parked deploy: SCHEDULED → QUEUED with ``force`` and wake the

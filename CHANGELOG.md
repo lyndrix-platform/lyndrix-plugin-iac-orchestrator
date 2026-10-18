@@ -19,6 +19,7 @@ Maintenance windows (core API 1.13, `core.api.maintenance`; plan `lyndrix-core/f
 - React tab **Wartung / Maintenance**: scheduled deployments (run now / cancel), effective windows with filters and state badges, read-only default-window card per site/stage pointing to the controller file. `SCHEDULED` badge uses `--lx-state-maintenance` (falls back to paused). Overview tile + "scheduled: n" note on Active Pipelines.
 - `ServiceDefinition` (`iac_core`) keeps unknown keys (`extra="allow"`) so `services[].maintenance` survives validation.
 - Loop guard: a controller commit starting with `ci: maintenance` (reserved for the future SSoT-Manager default switch) syncs but never triggers a deploy.
+- **Boot publish waits for the Entity Registry.** The runner's boot chain (registry ids → monitoring sync → `windows_published`) is retried with back-off (15/30/60/120/300 s) while the registry still answers `ok: false` ("database not ready"); meanwhile `windows_published` is **held back** instead of sending an empty `replaces: true` set that would wipe every consumer's windows (the UI snapshot is still refreshed). Seen on the dev bench: 108 items resolved, 0 published after a core restart.
 
 ### Changed
 - `JobQueue.enqueue` is now `enqueue_ex(...).job_id`; `abort_queued()` keeps SCHEDULED jobs (`include_scheduled=True` to cancel them); `clear_all_jobs(keep_running=True)` keeps SCHEDULED; `live_summary`/SSE snapshot/health carry `scheduled`; `get_latest_job_for_pipeline_type` prefers a SCHEDULED job regardless of the time window.
