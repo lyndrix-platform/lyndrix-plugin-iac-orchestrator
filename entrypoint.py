@@ -26,7 +26,7 @@ manifest = ModuleManifest(
     icon="rocket_launch",
     type="PLUGIN",
     # core.api.maintenance (API 1.13) is imported unconditionally (maintenance windows).
-    min_core_version="1.11.0",
+    min_core_version="1.13.0",   # core.api.maintenance (core API 1.13 = core 1.11.0)
     # Cluster placement (core API ≥ 1.7): the CONTROL PLANE — API, UI data, webhook
     # ingest, job queue, logs — runs on every instance from the shared database.
     # EXECUTION (git working trees, Docker runner containers, ansible/terraform)
