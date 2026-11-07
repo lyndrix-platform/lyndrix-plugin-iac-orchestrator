@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.2] - 2026-11-07
+### Fixed
+- Adopt/import step ("step <import> failed with exit code 1" with nothing else in the job log, e.g. job #1335 docker-cerberus, adopt job #1321 onp-netp-iot): the guard piped `tofu state list` into `grep -q` under `set -euo pipefail`. grep quitting early SIGPIPEs tofu (measured ~1 in 13 runs on the runner) and a `$(… | grep)` without a match aborted the script — so every adopt of an untracked CT and a share of apply-eligible runs died silently since 1.4.3. The state list is now snapshotted to a file once, no pipeline can abort the step, and every decision is echoed into the job log (`[adopt] …`) together with tofu's own output.
+- Node migration: a CT tracked under another node's module, or at the right address but with a stale `node_name` in state, is now `state rm` + re-imported from the live node instead of `state mv`'d. `state mv` kept the old `node_name`, so the refresh looked for the CT on the old node, dropped it and planned a create (onp-netp-prv). A failed re-import is fatal so an apply never tries to create an existing CT.
+
 ## [1.5.1] - 2026-11-07
 ### Fixed
 - Terraform runner: tofu errors and exit codes are no longer swallowed. The TF container is spawned without auto-remove (the watcher removes it), stderr is folded into the job log, an EXIT trap names the failing step (init/import/plan/apply/show) with its exit code, and an unreadable `docker wait` result or a watcher exception is logged instead of failing silently. Hotfix on the 1.5 line for cores < 1.11 (the 1.6 line requires core API 1.13).
