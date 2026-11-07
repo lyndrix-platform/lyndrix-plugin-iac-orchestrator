@@ -5,6 +5,10 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.1] - 2026-11-07
+### Fixed
+- Terraform runner: tofu errors and exit codes are no longer swallowed. The TF container is spawned without auto-remove (the watcher removes it), stderr is folded into the job log, an EXIT trap names the failing step (init/import/plan/apply/show) with its exit code, and an unreadable `docker wait` result or a watcher exception is logged instead of failing silently. Hotfix on the 1.5 line for cores < 1.11 (the 1.6 line requires core API 1.13).
+
 ## [1.5.0] - 2026-10-16
 ### Added
 - AI assistant (core API 1.12): manifest `ai_instructions` (purpose) + `ai_instructions_route`; the full operating guide is served live at `GET /ai/instructions` from `ai/INSTRUCTIONS.md` (concepts, trigger model, adopt/plan/apply operations, guardrails).

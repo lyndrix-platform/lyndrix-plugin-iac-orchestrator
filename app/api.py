@@ -32,7 +32,7 @@ PLUGIN_ID = "lyndrix.plugin.iac_orchestrator"
 # versa — so gating on the bare ids would lock out groups holding only this
 # plugin's qualified viewer/operator role permissions. Gate on the scoped ids:
 # scoped grants unlock exactly this plugin, global grants keep working.
-PLUGIN_VERSION = "1.5.0"   # mirrors entrypoint.manifest.version
+PLUGIN_VERSION = "1.5.1"   # mirrors entrypoint.manifest.version
 PERM_READ = f"plugin:{PLUGIN_ID}:api:read"
 PERM_WRITE = f"plugin:{PLUGIN_ID}:api:write"
 
