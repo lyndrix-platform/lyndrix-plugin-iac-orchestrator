@@ -7,13 +7,17 @@ the remote goes stale and the rule engine diffs an old commit.
 
 Why this does not go through the core ``git:commit_push`` bus handler:
 
-* the core stages ``git add -A`` over the whole tree — that includes the
-  terraform run directories (``.terraform_runs/<env>__<mode>``) with rendered
-  ``secrets.auto.tfvars``; those are run artifacts and must never be versioned
-  (the Terraform state itself lives in the S3/MinIO backend);
 * the core reports ``pushed`` even when the remote rejected the push
   (GitPython does not raise on a non-fast-forward reject);
 * the commit message cannot carry the iac-controller SHA it was generated from.
+
+What is versioned: the whole generated tree *including* the terraform run
+directories (``.terraform_runs/<env>__<mode>`` with rendered
+``secrets.auto.tfvars``). inventory_state lives on the on-prem GitLab only
+(not reachable from outside) and is meant to keep them; SOPS encryption of
+those files follows later. Only the terraform provider cache (``.terraform/``:
+large binaries and symlinks into the shared provider mirror) is kept out via
+``.git/info/exclude``. Never mirror this repo to GitHub or any public remote.
 
 The credential handling mirrors the core (token as a per-process HTTP header,
 never in ``.git/config`` or argv). SOPS-encrypted files are ordinary generated
@@ -31,10 +35,13 @@ from pathlib import Path
 
 log = logging.getLogger("IaC:Engine")
 
-#: Paths inside inventory_state that are run artifacts, never generated state.
-RUN_ARTIFACT_PATHS = (".terraform_runs",)
-#: Local ignore rules (``.git/info/exclude``) that keep run artifacts unstaged.
-LOCAL_EXCLUDES = (".terraform_runs/", ".terraform/")
+#: Local ignore rules (``.git/info/exclude``): terraform provider cache only.
+LOCAL_EXCLUDES = (".terraform/",)
+#: Rules 1.5.3 wrote into ``.git/info/exclude`` that must go again: run
+#: directories (incl. rendered secrets) are versioned in the on-prem GitLab.
+OBSOLETE_EXCLUDES = (".terraform_runs/",)
+_EXCLUDE_HEADER = "# lyndrix iac-orchestrator: terraform provider cache is never state"
+_OBSOLETE_HEADERS = ("# lyndrix iac-orchestrator: run artifacts are never state",)
 
 AUTHOR_NAME = "Lyndrix IaC"
 AUTHOR_EMAIL = "iac@lyndrix.local"
@@ -53,7 +60,6 @@ class PublishResult:
     status: str
     commit_sha: str = ""
     controller_sha: str = ""
-    untracked_artifacts: bool = False
     detail: str = ""
     files: list[str] = field(default_factory=list)
 
@@ -119,21 +125,20 @@ def build_message(controller_sha: str, job_id: int | None, pipeline: str, trigge
 
 
 def _ensure_local_excludes(repo: Path) -> str:
-    """Keep run artifacts out of ``git add`` without touching the repo's tracked
-    .gitignore (local, idempotent). Returns an error text, '' on success — the
-    caller refuses to stage anything when this fails (rendered secrets!)."""
+    """Keep the terraform provider cache out of ``git add`` without touching the
+    repo's tracked .gitignore (local, idempotent) and drop the 1.5.3 rule that
+    excluded ``.terraform_runs/``. Returns an error text, '' on success."""
     info = repo / ".git" / "info"
     try:
         info.mkdir(parents=True, exist_ok=True)
         exclude = info / "exclude"
-        current = exclude.read_text() if exclude.exists() else ""
-        missing = [w for w in LOCAL_EXCLUDES if w not in current.splitlines()]
+        lines = exclude.read_text().splitlines() if exclude.exists() else []
+        kept = [ln for ln in lines if ln not in OBSOLETE_EXCLUDES and ln not in _OBSOLETE_HEADERS]
+        missing = [w for w in LOCAL_EXCLUDES if w not in kept]
         if missing:
-            with exclude.open("a") as fh:
-                if current and not current.endswith("\n"):
-                    fh.write("\n")
-                fh.write("# lyndrix iac-orchestrator: run artifacts are never state\n")
-                fh.write("\n".join(missing) + "\n")
+            kept += [_EXCLUDE_HEADER, *missing]
+        if kept != lines:
+            exclude.write_text("\n".join(kept) + "\n")
     except OSError as exc:
         return f"could not write .git/info/exclude: {exc}"
     return ""
@@ -187,7 +192,7 @@ async def publish_inventory_state(
     token: str | None,
     push: bool = True,
 ) -> PublishResult:
-    """Stage generated state (never run artifacts), commit only on a diff, push.
+    """Stage the generated tree (incl. ``.terraform_runs/``), commit only on a diff, push.
 
     The caller holds the engine's inventory_state lock (single writer per
     instance); cross-instance races are resolved by the rebase-and-retry push.
@@ -208,29 +213,8 @@ async def publish_inventory_state(
         return res
     git_id = ("-c", f"user.name={AUTHOR_NAME}", "-c", f"user.email={AUTHOR_EMAIL}")
 
-    # 1) Stop tracking run artifacts that older releases committed (index only;
-    #    the working files stay). A separate commit keeps the generation commit —
-    #    the one the rule engine diffs — free of thousands of unrelated paths.
-    for path in RUN_ARTIFACT_PATHS:
-        rc, out = await _git(repo, "ls-files", "--", path)
-        if rc == 0 and out:
-            rc, out = await _git(repo, "rm", "-r", "-q", "--cached", "--ignore-unmatch", "--", path)
-            if rc != 0:
-                res.detail = f"git rm --cached {path} failed: {out}"
-                return res
-            res.untracked_artifacts = True
-    if res.untracked_artifacts:
-        rc, out = await _git(repo, *git_id, "commit", "-q", "-m",
-                             "chore(state): stop tracking .terraform_runs run artifacts\n\n"
-                             "Terraform run directories hold rendered secrets and plans; the state\n"
-                             "lives in the S3 backend. Purging them from history is a manual step.\n")
-        if rc != 0:
-            res.detail = f"untrack commit failed: {out}"
-            return res
-        log.warning("inventory_state: un-tracked previously committed .terraform_runs/ "
-                    "(history still contains them — purge + rotate separately).")
-
-    # 2) Stage the generated tree only (run artifacts are ignored via info/exclude).
+    # Stage the whole generated tree, run directories included (only the
+    # provider cache is excluded via info/exclude).
     rc, out = await _git(repo, "add", "-A", "--", ".")
     if rc != 0:
         res.detail = f"git add failed: {out}"
@@ -251,13 +235,12 @@ async def publish_inventory_state(
                  len(res.files), (controller_sha or "unknown")[:12])
 
     res.commit_sha = await head_sha(repo)
-    needs_push = bool(res.files) or res.untracked_artifacts
-    if not needs_push:
+    if not res.files:
         return res
 
     rc, remotes = await _git(repo, "remote")
     if not push or rc != 0 or "origin" not in remotes.split():
-        res.status = COMMITTED_LOCALLY if res.files else NO_CHANGES
+        res.status = COMMITTED_LOCALLY
         return res
 
     branch = await _current_branch(repo)
@@ -280,7 +263,7 @@ async def publish_inventory_state(
                 log.warning("inventory_state: could not delete temporary SSH key file.")
     res.commit_sha = await head_sha(repo)   # a rebase rewrote it
     if ok:
-        res.status = PUSHED if res.files else NO_CHANGES
+        res.status = PUSHED
         log.info("inventory_state: pushed %s to origin/%s.", res.commit_sha[:12], branch)
     else:
         res.status = PUSH_FAILED

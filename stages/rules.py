@@ -62,7 +62,10 @@ class DynamicRuleExecutionStage(BaseStage):
                 return []
             raise RuntimeError(f"Git diff failed: {out}")
         changed = out.strip()
-        return [f for f in changed.split("\n") if f] if changed else []
+        # Terraform run directories are versioned alongside the generated state
+        # but are run artifacts: they must never trigger a rule.
+        return [f for f in changed.split("\n")
+                if f and not f.startswith(".terraform_runs/")] if changed else []
 
     @staticmethod
     def _capture_path_vars(filepath: str) -> dict:

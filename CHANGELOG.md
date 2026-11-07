@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.4] - 2026-11-08
+### Fixed
+- Reverts the 1.5.3 run-artifact exclusion: `.terraform_runs/` (incl. rendered `secrets.auto.tfvars`) is versioned in inventory_state again. The repo lives on the on-prem GitLab only (not reachable from outside) and is meant to keep them; SOPS encryption follows later. No more one-off `chore(state): stop tracking .terraform_runs` commit; the `.terraform_runs/` rule 1.5.3 wrote into `.git/info/exclude` is removed on the next publish. Only the terraform provider cache (`.terraform/`) stays excluded.
+- The rule engine ignores `.terraform_runs/` paths in the published diff — run artifacts never trigger a rule.
+
 ## [1.5.3] - 2026-11-07
 ### Fixed
 - inventory_state reaches GitLab after every iac-controller change: an iac-controller push on main triggers `infra_plan` (controller CI `trigger-orchestrator-infra-plan`), which generated but never committed — iac-inventory-state had no commit since 2026-10-12 and the generated files were reset by the next sync. `infra_plan` now publishes like `rollout`/`infra_apply`/`host_provision`/`compliance`.
