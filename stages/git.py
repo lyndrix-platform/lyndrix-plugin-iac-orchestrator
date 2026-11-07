@@ -34,6 +34,39 @@ class CommitPushStage(BaseStage):
             return StageResult(True, f"Git status for {self.role_slug}: {status}")
         return StageResult(False, f"Push failed for {self.role_slug} with status: {status}")
 
+class PublishInventoryStateStage(BaseStage):
+    """Commit + push the freshly generated inventory_state (diff-only).
+
+    Runs inside the engine's state lock right after NativeGenerateStage. The
+    resulting commit SHA is handed to the rule engine so it diffs exactly this
+    generation, not whatever HEAD is when it gets to run.
+    """
+
+    def __init__(self):
+        super().__init__("Commit & Push: inventory_state")
+
+    async def run(self, engine, context: dict) -> StageResult:
+        from ..app.controller.state_publisher import publish_inventory_state
+
+        repo = engine.base_git_dir / "inventory_state"
+        payload = context.get("payload") or {}
+        result = await publish_inventory_state(
+            repo,
+            controller_sha=await engine.repo_head_sha("iac_controller"),
+            job_id=context.get("job_id"),
+            pipeline=str(context.get("db_type") or payload.get("pipeline_type") or ""),
+            trigger="Manual" if payload.get("manual") else "Webhook",
+            token=engine.repo_token("inventory_state"),
+        )
+        context["inventory_state_commit_status"] = result.status
+        if result.files:
+            context["inventory_state_commit_sha"] = result.commit_sha
+        if result.ok:
+            return StageResult(True, f"inventory_state: {result.status}"
+                               + (f" ({len(result.files)} file(s), {result.commit_sha[:12]})" if result.files else ""))
+        return StageResult(False, f"inventory_state publish {result.status}: {result.detail}")
+
+
 class CloneServiceRepoStage(BaseStage):
     def __init__(self, service_name: str, branch: str, payload: dict):
         super().__init__(f"Clone Service Repo: {service_name}")
