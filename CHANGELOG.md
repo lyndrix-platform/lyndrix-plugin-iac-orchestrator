@@ -11,6 +11,9 @@ Forward-port of 1.5.3–1.5.5 (hotfix line, core < 1.11).
 ### Changed
 - Statistics read window 500 → 5000 jobs / 1500 → 15000 tasks (`STATS_JOB_WINDOW`/`STATS_TASK_WINDOW` in `app/controller/stats.py`): Overview KPIs, lifecycle phases and Terraform host states looked only at the newest 500 jobs. Job history itself is never pruned; only the read window grows. `GET /stats` and `GET /terraform/hosts` run their sync DB reads, disk scan and aggregation via `asyncio.to_thread`.
 
+### Security
+- UI build toolchain (dev dependencies only): `vite` 5.4.21 → 6.4.5, `@vitejs/plugin-react` range ^4.7.0 (already resolved 4.7.0), transitive `postcss` 8.5.32, `esbuild` 0.25.12, `browserslist` 4.29.5, `baseline-browser-mapping` 2.11.35, `source-map-js` 1.2.2, `nanoid` 3.3.20 — closes all 14 Dependabot alerts (GHSA-rq7h-c2jc-7f22, -698v-4r3x-3vcv, -587h-7wmj-h5pm, -v6wh-96g9-6wx3, -fx2h-pf6j-xcff, -4w7w-66w2-5vf9, -68fv-2mgg-jv7q, -w5vr-8v7q-w6rv, -73wf-gq98-2v4g, -fxqj-rqcc-2cmp, -r28c-9q8g-f849, -67mh-4wv8-2f99); `npm audit` clean. The shipped `ui_static/ui_bundle.js` builds byte-identical, so nothing changes at runtime. React stays on 18 (provided by the shell via window globals).
+
 ### Fixed
 - inventory_state reaches GitLab after every iac-controller change: an iac-controller push on main triggers `infra_plan` (controller CI `trigger-orchestrator-infra-plan`), which generated but never committed — iac-inventory-state had no commit since 2026-10-12 and the generated files were reset by the next sync. `infra_plan` now publishes like `rollout`/`infra_apply`/`host_provision`/`compliance`.
 - The rule engine of `infra_plan` diffed the last commit some *other* pipeline had made (HEAD/HEAD~1) instead of the change it just generated. Rules now diff exactly the commit their own pipeline published.
