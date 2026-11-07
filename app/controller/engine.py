@@ -2751,9 +2751,23 @@ class DeploymentEngine:
                             or "Could not match supplied host pattern" in decoded):
                         no_hosts_matched = True
 
-            wait_proc = await asyncio.create_subprocess_exec("docker", "wait", container_name, stdout=asyncio.subprocess.PIPE)
-            stdout, _ = await wait_proc.communicate()
-            exit_code = int(stdout.decode().strip())
+            wait_proc = await asyncio.create_subprocess_exec(
+                "docker", "wait", container_name,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await wait_proc.communicate()
+            wait_out = stdout.decode("utf-8", errors="replace").strip()
+            try:
+                exit_code: int | None = int(wait_out)
+            except ValueError:
+                # Container already gone (auto-removed / killed) — the exit code is
+                # lost. Say so in the job log instead of failing silently.
+                exit_code = None
+                wait_err = stderr.decode("utf-8", errors="replace").strip() or wait_out or "no output"
+                msg = (f"[ERROR] could not read the runner exit code ({wait_err}); "
+                       "the output above may be incomplete.")
+                log.error("[Runner] %s: %s", task_name, msg)
+                self._log_line(job_id, f"[{task_name}] {msg}")
             # Override failure if the only Terraform error was "already running" (desired state IS achieved)
             success = exit_code == 0 or tf_already_running
             # An empty --limit intersection exits non-zero with no PLAY RECAP on this
@@ -2762,7 +2776,9 @@ class DeploymentEngine:
             if not success and no_hosts_matched and successful_hosts == 0 and failed_hosts == 0:
                 log.info("[Ansible] '%s' matched no hosts (empty --limit) — skipping (no-op).", task_name)
                 success = True
-            
+            if not success and exit_code is not None:
+                self._log_line(job_id, f"[{task_name}] [ERROR] runner container exited with code {exit_code}.")
+
             if "active_tasks" in self.state and task_name in self.state["active_tasks"]:
                 self.state["active_tasks"][task_name]["status"] = "success" if success else "failed"
                 self._sync_runners(job_id, force=True)
@@ -2775,13 +2791,16 @@ class DeploymentEngine:
                 "hosts_to_create": hosts_to_create,
                 "hosts_to_destroy": hosts_to_destroy,
                 "plan_summary": plan_summary,
+                "exit_code": exit_code,
             }
-            
-        except Exception:
+
+        except Exception as exc:  # noqa: BLE001
+            log.exception("[Runner] watching '%s' (%s) failed", task_name, container_name)
+            self._log_line(job_id, f"[{task_name}] [ERROR] lost track of runner container '{container_name}': {exc!r}")
             if "active_tasks" in self.state and task_name in self.state["active_tasks"]:
                 self.state["active_tasks"][task_name]["status"] = "error"
                 self._sync_runners(job_id, force=True)
-            return False, {"successful_hosts": 0, "failed_hosts": 0}
+            return False, {"successful_hosts": 0, "failed_hosts": 0, "exit_code": None}
 
     def _resolve_host_ip(self, host_name: str) -> str | None:
         """Best-effort lookup of a host's ansible_host (IP) from generated inventory."""
@@ -3149,23 +3168,28 @@ class DeploymentEngine:
                 f"{tf_bin} plan -input=false -no-color -out=tfplan{target_flags}"
             )
             apply_cmd = (
-                f"{tf_bin} apply -input=false -no-color -auto-approve tfplan"
+                f"STEP=apply; {tf_bin} apply -input=false -no-color -auto-approve tfplan"
                 if do_apply
-                else f"{tf_bin} show -no-color tfplan"
+                else f"STEP=show; {tf_bin} show -no-color tfplan"
             )
-            action_cmd = f"{plan_cmd}; {apply_cmd}"
+            action_cmd = f"STEP=plan; {plan_cmd}; {apply_cmd}"
         # Optional adopt-existing step: import a live CT into state before plan/apply
         # so it's reconciled in place, not destroyed/recreated. Guarded (skip if
         # already tracked) and non-fatal (a not-yet-existing CT falls through to apply).
         import_cmd = ""
         if import_specs and (mode == "import" or do_apply):
             import_cmd = self._build_import_cmd(tf_bin, import_specs)
+        # stderr is folded into stdout so tofu's "Error:" blocks reach the job log
+        # in order, and the EXIT trap names the failing step + exit code — before,
+        # a failure right after `init` left nothing in the job log but the FATAL.
         shell_cmd = (
-            "set -euo pipefail; "
+            "exec 2>&1; set -euo pipefail; STEP=init; "
+            "trap 'rc=$?; if [ \"$rc\" -ne 0 ]; then "
+            "echo \"[TF] step <$STEP> failed with exit code $rc\"; fi; exit \"$rc\"' EXIT; "
             f"cd '{run_dir}'; "
             f"{tf_bin} init -input=false -no-color; "
-            f"{import_cmd}"
-            f"{action_cmd}"
+            f"STEP=import; {import_cmd}"
+            f"STEP={mode}; {action_cmd}"
         )
 
         h_git = self.config.host_git_repos_dir
@@ -3196,7 +3220,10 @@ class DeploymentEngine:
             "env_vars": env_vars,
             "mounts": mounts,
             "command": ["/bin/sh", "-lc", shell_cmd],
-            "remove": True,
+            # No auto-remove: a fast-failing tofu run would otherwise vanish before
+            # `docker logs -f` drained it and before `docker wait` read the exit code
+            # (→ empty output, swallowed error). _watch_detached_runner removes it.
+            "remove": False,
             "networks": [],
         }
 
@@ -3237,6 +3264,7 @@ class DeploymentEngine:
             "hosts_to_create": _stats.get("hosts_to_create") or [],
             "hosts_to_destroy": _stats.get("hosts_to_destroy") or [],
             "plan_summary": _stats.get("plan_summary") or "",
+            "exit_code": _stats.get("exit_code"),
         }
 
     @staticmethod
