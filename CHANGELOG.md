@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - Reverts the 1.5.3 run-artifact exclusion: `.terraform_runs/` (incl. rendered `secrets.auto.tfvars`) is versioned in inventory_state again. The repo lives on the on-prem GitLab only (not reachable from outside) and is meant to keep them; SOPS encryption follows later. No more one-off `chore(state): stop tracking .terraform_runs` commit; the `.terraform_runs/` rule 1.5.3 wrote into `.git/info/exclude` is removed on the next publish. Only the terraform provider cache (`.terraform/`) stays excluded.
 - The rule engine ignores `.terraform_runs/` paths in the published diff — run artifacts never trigger a rule.
+- "Clear Failed Jobs" and "Clear Statistics" failed with "see logs" (MariaDB 1451): since 1.4 every job has rows in `iac_orchestrator_job_logs` (FK on the job), which were never deleted before the job itself. Both now delete logs → tasks → jobs, in committed batches of 100 jobs (stays under the DB statement cap, retries on 1020/1205/1213).
 
 ## [1.5.3] - 2026-11-07
 ### Fixed
