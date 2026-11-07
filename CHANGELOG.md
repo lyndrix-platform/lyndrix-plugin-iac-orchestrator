@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.5] - 2026-11-08
+Hotfix line (core 1.10 / API < 1.13). Same content goes to main as 1.6.1.
+
+### Changed
+- Statistics read window 500 → 5000 jobs / 1500 → 15000 tasks (`STATS_JOB_WINDOW`/`STATS_TASK_WINDOW` in `app/controller/stats.py`; port of PR #17): Overview KPIs, lifecycle phases and Terraform host states looked only at the newest 500 jobs. Job history itself is never pruned; only the read window grows. `GET /stats` and `GET /terraform/hosts` run their sync DB reads, disk scan and aggregation via `asyncio.to_thread`.
+
+### Security
+- UI build toolchain (dev dependencies only): `vite` 5.4.21 → 6.4.5, `@vitejs/plugin-react` range ^4.7.0 (already resolved 4.7.0), transitive `postcss` 8.5.32, `esbuild` 0.25.12, `browserslist` 4.29.5, `baseline-browser-mapping` 2.11.35, `source-map-js` 1.2.2, `nanoid` 3.3.20 — closes the 14 Dependabot alerts reported on main, which applied to this line's identical lockfile as well; `npm audit` clean. The shipped `ui_static/ui_bundle.js` builds byte-identical, so nothing changes at runtime. No Python dependency changes (the core provides SQLAlchemy/FastAPI/hvac).
+
 ## [1.5.4] - 2026-11-08
 ### Fixed
 - Reverts the 1.5.3 run-artifact exclusion: `.terraform_runs/` (incl. rendered `secrets.auto.tfvars`) is versioned in inventory_state again. The repo lives on the on-prem GitLab only (not reachable from outside) and is meant to keep them; SOPS encryption follows later. No more one-off `chore(state): stop tracking .terraform_runs` commit; the `.terraform_runs/` rule 1.5.3 wrote into `.git/info/exclude` is removed on the next publish. Only the terraform provider cache (`.terraform/`) stays excluded.
