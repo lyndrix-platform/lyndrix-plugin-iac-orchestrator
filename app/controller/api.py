@@ -1581,8 +1581,9 @@ async def do_terraform_hosts():
     """Return per-host Terraform metadata + status (tfvars index + job-derived state)."""
     if not _engine:
         raise HTTPException(status_code=500, detail="Engine offline")
+    # Disk scan + job-window read (STATS_JOB_WINDOW rows) are sync — keep them off the loop.
     try:
-        return _scan_terraform_hosts()
+        return await asyncio.to_thread(_scan_terraform_hosts)
     except Exception as exc:
         _ctx and _ctx.log.error(f"API: terraform host scan failed: {exc}")
         raise HTTPException(status_code=500, detail="Terraform host scan failed")

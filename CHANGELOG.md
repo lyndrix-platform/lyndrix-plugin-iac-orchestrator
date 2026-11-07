@@ -6,7 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [1.6.1] - 2026-11-07
-Forward-port of 1.5.3 (hotfix line, core < 1.11).
+Forward-port of 1.5.3–1.5.5 (hotfix line, core < 1.11).
+
+### Changed
+- Statistics read window 500 → 5000 jobs / 1500 → 15000 tasks (`STATS_JOB_WINDOW`/`STATS_TASK_WINDOW` in `app/controller/stats.py`): Overview KPIs, lifecycle phases and Terraform host states looked only at the newest 500 jobs. Job history itself is never pruned; only the read window grows. `GET /stats` and `GET /terraform/hosts` run their sync DB reads, disk scan and aggregation via `asyncio.to_thread`.
 
 ### Fixed
 - inventory_state reaches GitLab after every iac-controller change: an iac-controller push on main triggers `infra_plan` (controller CI `trigger-orchestrator-infra-plan`), which generated but never committed — iac-inventory-state had no commit since 2026-10-12 and the generated files were reset by the next sync. `infra_plan` now publishes like `rollout`/`infra_apply`/`host_provision`/`compliance`.
