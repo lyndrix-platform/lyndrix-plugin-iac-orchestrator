@@ -19,7 +19,7 @@ from .utils import StageResult, JobFileLogBridge, current_job_id as _job_id_ctxv
 from .queue import JobLogWriter
 from ...stages.git import (
     SyncRepoStage,
-    CommitPushStage,
+    PublishInventoryStateStage,
     CloneServiceRepoStage,
     SyncAllServicesStage
 )
@@ -151,6 +151,29 @@ class NativeGenerateStage:
             return StageResult(True, "Native artifacts generated.")
         except Exception as e:
             return StageResult(False, f"Native generation failed: {e}")
+
+
+class StatePrepareStage:
+    """Shared pipeline prefix — sync the core repos, generate, optionally publish —
+    run as ONE critical section under ``engine._state_publish_lock``.
+
+    Each child is still logged as its own ``--- STAGE`` line. The lock makes the
+    sequence atomic per instance: no other pipeline can reset inventory_state or
+    move iac_controller between this run's generation and its commit.
+    """
+
+    def __init__(self, stages: list):
+        self.name = "Prepare State (sync · generate · publish)"
+        self.stages = stages
+
+    async def run(self, engine, context: dict) -> StageResult:
+        async with engine._state_publish_lock:
+            for stage in self.stages:
+                log.info(f"--- STAGE: {stage.name} ---")
+                res = await stage.run(engine, context)
+                if not res.success:
+                    return StageResult(False, f"{stage.name}: {res.message}")
+        return StageResult(True, "State prepared.")
 
 
 class TerraformProvisionStage(BaseStage):
@@ -642,7 +665,12 @@ class PipelineStrategy:
 
     #: also sync the infra_engine repo before generation
     sync_infra_engine: bool = False
-    #: commit/push the generated inventory_state after generation
+    #: commit/push the generated inventory_state after generation. True for every
+    #: pipeline that runs DynamicRuleExecutionStage: the rule engine diffs exactly
+    #: the commit made here. Pipelines WITHOUT the rule engine (single_service,
+    #: state_check, adopt_host) must stay False — committing there would consume an
+    #: iac-controller change silently, and the next infra_plan/rollout would see
+    #: "no_changes" and skip the rules (terraform plan, baseline roles) for it.
     commit_state: bool = True
     #: execute via the named-task organizer (host_provision tracking) rather than
     #: the flat stage loop
@@ -823,8 +851,11 @@ class ComplianceStrategy(PipelineStrategy):
 
 
 class InfraPlanStrategy(PipelineStrategy):
+    # infra_plan is what an iac-controller push on main triggers (controller CI job
+    # trigger-orchestrator-infra-plan). It publishes the generated state like
+    # rollout/infra_apply: before 1.5.3 it did not, so the remote went stale and
+    # its rule engine kept diffing the last commit that some other pipeline made.
     sync_infra_engine = True
-    commit_state = False
 
     def build_stages(self, engine, payload, context):
         return [InfraPlanStage(), DynamicRuleExecutionStage("infra_plan")]
@@ -925,6 +956,12 @@ class DeploymentEngine:
         # mid-deploy reading it, leaking CHANGE_ME/example.com placeholder defaults.
         # Held only around generation; deploys then read an immutable per-job snapshot.
         self._shared_state_lock = asyncio.Lock()
+        # Single writer for the whole sync → generate → commit/push sequence of
+        # inventory_state (outer lock; _shared_state_lock stays the inner one). Without
+        # it, pipeline B's "Sync Repo: inventory_state" (reset --hard origin) wiped
+        # pipeline A's freshly generated files before A committed them, and the
+        # iac-controller SHA recorded in the commit could belong to another sync.
+        self._state_publish_lock = asyncio.Lock()
         ctx.subscribe("git:status_update")(self._on_git_status)
         # Cluster control plane (plugin ≥ 1.4): the shared JobQueue (set by the
         # service) receives log lines and runner snapshots so every instance can
@@ -1510,28 +1547,26 @@ class DeploymentEngine:
             severity="info",
         )
 
-        context = {"payload": payload, "job_id": current_job_id}
+        context = {"payload": payload, "job_id": current_job_id, "db_type": db_type}
 
         # Shared prefix: sync the core repos, generate inventory, optionally
-        # commit it back. The strategy supplies the type-specific suffix.
-        pipeline = [
+        # commit it back — one critical section (StatePrepareStage). The strategy
+        # supplies the type-specific suffix.
+        prefix = [
             SyncRepoStage("iac_controller"),
             SyncRepoStage("inventory_state"),
             SyncRepoStage("config_engine"),
             SyncRepoStage("aac_factory"),
         ]
         if strategy.sync_infra_engine:
-            pipeline.append(SyncRepoStage("infra_engine"))
-        pipeline.extend([
-            # Refresh inventory_state right before generation to minimize staleness windows.
-            SyncRepoStage("inventory_state"),
-            NativeGenerateStage(),
-        ])
-
-        # Read-only / focused pipelines (single_service, infra_plan, adopt_host,
-        # state_check) do not persist generated inventory back to inventory_state.
+            prefix.append(SyncRepoStage("infra_engine"))
+        prefix.append(NativeGenerateStage())
+        # Pipelines that own the rule engine publish what they generated (diff-only,
+        # never .terraform_runs/, message carries the iac-controller SHA). See
+        # PipelineStrategy.commit_state for why the others must not.
         if strategy.commit_state:
-            pipeline.append(CommitPushStage("inventory_state", "ci: automated state update"))
+            prefix.append(PublishInventoryStateStage())
+        pipeline = [StatePrepareStage(prefix)]
 
         # Type-specific stages (polymorphic strategy replaces the if/elif ladder).
         pipeline.extend(strategy.build_stages(self, payload, context))
@@ -1999,6 +2034,23 @@ class DeploymentEngine:
         except asyncio.TimeoutError: return False
         finally:
             self.pending_syncs.pop(request_id, None)
+
+    def repo_token(self, role_slug: str) -> str | None:
+        """Access token for a configured core repo (``repo_<slug>_config.token_key``)."""
+        raw = self.ctx.get_secret(f"repo_{role_slug}_config")
+        if not raw:
+            return None
+        try:
+            key = (json.loads(raw) or {}).get("token_key")
+        except Exception:
+            return None
+        return self.ctx.get_secret(key) if key else None
+
+    async def repo_head_sha(self, role_slug: str) -> str:
+        """HEAD commit of a synced core repo working tree ('' when unknown)."""
+        from .state_publisher import head_sha
+        repo = self.base_git_dir / role_slug
+        return await head_sha(repo) if (repo / ".git").exists() else ""
 
     async def execute_git_commit_push(self, role_slug: str, message: str) -> str:
         request_id = f"commit:{role_slug}:{uuid.uuid4().hex[:12]}"
