@@ -38,6 +38,10 @@ class DynamicRuleExecutionStage(BaseStage):
     def __init__(self, pipeline_type: str):
         super().__init__("Dynamic Rule-Based Execution")
         self.pipeline_type = pipeline_type
+        # Commit to evaluate. run() pins it to the SHA this pipeline's
+        # PublishInventoryStateStage created, so a commit pushed by a concurrent
+        # pipeline in between never changes which diff these rules act on.
+        self._ref = "HEAD"
 
     # ------------------------------------------------------------------ utils
     async def _git(self, engine, *args) -> tuple[int, str]:
@@ -51,14 +55,17 @@ class DynamicRuleExecutionStage(BaseStage):
 
     async def _get_changed_files(self, engine) -> list[str]:
         rc, out = await self._git(
-            engine, "diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"
+            engine, "diff-tree", "--no-commit-id", "--name-only", "-r", self._ref
         )
         if rc != 0:
             if "bad object HEAD" in out:
                 return []
             raise RuntimeError(f"Git diff failed: {out}")
         changed = out.strip()
-        return [f for f in changed.split("\n") if f] if changed else []
+        # Terraform run directories are versioned alongside the generated state
+        # but are run artifacts: they must never trigger a rule.
+        return [f for f in changed.split("\n")
+                if f and not f.startswith(".terraform_runs/")] if changed else []
 
     @staticmethod
     def _capture_path_vars(filepath: str) -> dict:
@@ -92,10 +99,10 @@ class DynamicRuleExecutionStage(BaseStage):
         """Diff the previous vs current ``terraform.tfvars.json`` and return the
         hostnames whose container definition actually changed (added or mutated).
         This is what keeps a terraform rule from reprovisioning a whole env."""
-        rc_new, new_raw = await self._git(engine, "show", f"HEAD:{tfvars_file}")
+        rc_new, new_raw = await self._git(engine, "show", f"{self._ref}:{tfvars_file}")
         if rc_new != 0:
             return []
-        rc_old, old_raw = await self._git(engine, "show", f"HEAD~1:{tfvars_file}")
+        rc_old, old_raw = await self._git(engine, "show", f"{self._ref}~1:{tfvars_file}")
         try:
             new_containers = (json.loads(new_raw) or {}).get("containers", {}) or {}
         except Exception:
@@ -144,7 +151,7 @@ class DynamicRuleExecutionStage(BaseStage):
         """Diff per-host ``baseline_roles`` between HEAD~1 and HEAD of the generated
         inventory. Returns ``{host: [added_roles]}`` for hosts that *gained* a role,
         so a single newly-assigned role deploys only that role on only that host."""
-        rc_new, new_raw = await self._git(engine, "show", f"HEAD:{inventory_file}")
+        rc_new, new_raw = await self._git(engine, "show", f"{self._ref}:{inventory_file}")
         if rc_new != 0:
             return {}
         try:
@@ -152,7 +159,7 @@ class DynamicRuleExecutionStage(BaseStage):
         except Exception:
             return {}
         old_inv = {}
-        rc_old, old_raw = await self._git(engine, "show", f"HEAD~1:{inventory_file}")
+        rc_old, old_raw = await self._git(engine, "show", f"{self._ref}~1:{inventory_file}")
         if rc_old == 0:
             try:
                 old_inv = yaml.safe_load(old_raw) or {}
@@ -353,6 +360,7 @@ class DynamicRuleExecutionStage(BaseStage):
             log.info("No state changes generated. Bypassing execution.")
             return StageResult(True, "No state changes generated. Bypassing execution.")
 
+        self._ref = str(context.get("inventory_state_commit_sha") or "HEAD")
         changed_files = await self._get_changed_files(engine)
         if not changed_files:
             return StageResult(True, "No changes in git diff, no actions required.")

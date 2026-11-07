@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.1] - 2026-11-07
+Forward-port of 1.5.3 (hotfix line, core < 1.11).
+
+### Fixed
+- inventory_state reaches GitLab after every iac-controller change: an iac-controller push on main triggers `infra_plan` (controller CI `trigger-orchestrator-infra-plan`), which generated but never committed — iac-inventory-state had no commit since 2026-10-12 and the generated files were reset by the next sync. `infra_plan` now publishes like `rollout`/`infra_apply`/`host_provision`/`compliance`.
+- The rule engine of `infra_plan` diffed the last commit some *other* pipeline had made (HEAD/HEAD~1) instead of the change it just generated. Rules now diff exactly the commit their own pipeline published.
+- Single writer: sync → generate → commit/push run as one critical section per instance (`Prepare State` stage). Before, a concurrent pipeline's `Sync Repo: inventory_state` (reset --hard origin) could wipe another pipeline's generated files before they were committed.
+- `.terraform_runs/` (incl. rendered `secrets.auto.tfvars`) is versioned in inventory_state with the generated tree — the repo lives on the on-prem GitLab only (not reachable from outside); SOPS encryption follows later. Only the terraform provider cache (`.terraform/`) is kept out via `.git/info/exclude`; the `.terraform_runs/` exclude rule 1.5.3 wrote there is removed on the next publish. The rule engine ignores `.terraform_runs/` paths, so run artifacts never trigger a rule. (Same as 1.5.4; supersedes the 1.5.3 un-tracking.)
+- Commit only on a real diff; the message carries the iac-controller SHA, job id, pipeline and trigger (`ci: automated state update — iac-controller@<sha>`). A rejected push is detected (the core path reported `pushed` on a non-fast-forward reject), rebased onto the remote and retried; a conflicting concurrent generation fails the stage instead of silently diverging.
+- `single_service`, `state_check` and `adopt_host` deliberately still do not commit: they do not run the rule engine, and committing there would consume an iac-controller change so the next `infra_plan`/`rollout` saw `no_changes` and skipped its rules. Supersedes the best-effort single_service commit of PR #16.
+- "Clear Failed Jobs" and "Clear Statistics" failed with "see logs" (MariaDB 1451): since 1.4 every job has rows in `iac_orchestrator_job_logs` (FK on the job), which were never deleted before the job itself. Both now delete logs → tasks → jobs, in committed batches of 100 jobs (stays under the DB statement cap, retries on 1020/1205/1213).
+
 ## [1.6.0] - 2026-10-18
 
 Maintenance windows (core API 1.13, `core.api.maintenance`; plan `lyndrix-core/features/maintenance-windows/plan-iac-orchestrator.md`). Requires core ≥ 1.11.0.

@@ -197,6 +197,40 @@ def test_terraform_action_never_force_applies():
     assert captured["adopt_existing"] is True
 
 
+def test_rules_diff_the_pinned_publish_commit_not_head():
+    """1.5.3: run() pins the diff to the commit this pipeline published, so a
+    concurrent pipeline's later commit cannot change which diff the rules see."""
+    stage = Stage("infra_plan")
+    seen = []
+
+    async def fake_git(engine, *args):
+        seen.append(args)
+        return (0, "")
+
+    stage._git = fake_git  # type: ignore[assignment]
+    stage._ref = "abc123"
+    tfvars = "onprem/prod/terraform/terraform.tfvars.json"
+    asyncio.run(stage._get_changed_files(None))
+    assert seen[-1][-1] == "abc123"
+    asyncio.run(stage._changed_terraform_hosts(None, tfvars))
+    assert ("show", f"abc123:{tfvars}") in seen
+    assert ("show", f"abc123~1:{tfvars}") in seen
+
+
+def test_run_dirs_never_reach_the_rules():
+    """1.5.4: .terraform_runs/ is versioned again but must never trigger a rule."""
+    stage = Stage("infra_plan")
+
+    async def fake_git(engine, *args):
+        return (0, ".terraform_runs/onprem_prod__plan/prod/terraform/terraform.tfvars.json\n"
+                   ".terraform_runs/aac-x__apply/main.tf\n"
+                   "onprem/prod/terraform/terraform.tfvars.json\n")
+
+    stage._git = fake_git  # type: ignore[assignment]
+    changed = asyncio.run(stage._get_changed_files(None))
+    assert changed == ["onprem/prod/terraform/terraform.tfvars.json"]
+
+
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-v"]))
