@@ -28,12 +28,12 @@ def render_overview_dashboard(ctx, service):
     @ui.refreshable
     def _board():
         try:
-            jobs = engine.db.get_jobs_for_stats(500)
+            jobs = engine.db.get_jobs_for_stats(stats_mod.STATS_JOB_WINDOW)
         except Exception as exc:  # pragma: no cover - defensive
             ctx.log.error(f"UI: stats query failed: {exc}")
             jobs = []
         try:
-            tasks = engine.db.get_job_tasks_for_stats(1500)
+            tasks = engine.db.get_job_tasks_for_stats(stats_mod.STATS_TASK_WINDOW)
         except Exception as exc:
             ctx.log.error(f"UI: task stats query failed: {exc}")
             tasks = []

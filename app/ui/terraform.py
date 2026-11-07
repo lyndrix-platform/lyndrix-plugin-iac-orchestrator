@@ -111,7 +111,8 @@ def _scan_terraform_hosts(ctx, service) -> list:
     # generated tfvars (not the source host YAML), status from job history.
     tf_index = _tfvars_host_index(config)
     try:
-        recent_jobs = service.db.get_jobs_for_stats(500)
+        from ..controller.stats import STATS_JOB_WINDOW
+        recent_jobs = service.db.get_jobs_for_stats(STATS_JOB_WINDOW)
     except Exception:
         recent_jobs = []
 
