@@ -1562,7 +1562,7 @@ class DeploymentEngine:
             prefix.append(SyncRepoStage("infra_engine"))
         prefix.append(NativeGenerateStage())
         # Pipelines that own the rule engine publish what they generated (diff-only,
-        # never .terraform_runs/, message carries the iac-controller SHA). See
+        # incl. .terraform_runs/, message carries the iac-controller SHA). See
         # PipelineStrategy.commit_state for why the others must not.
         if strategy.commit_state:
             prefix.append(PublishInventoryStateStage())

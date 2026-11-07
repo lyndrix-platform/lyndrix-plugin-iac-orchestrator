@@ -217,6 +217,20 @@ def test_rules_diff_the_pinned_publish_commit_not_head():
     assert ("show", f"abc123~1:{tfvars}") in seen
 
 
+def test_run_dirs_never_reach_the_rules():
+    """1.5.4: .terraform_runs/ is versioned again but must never trigger a rule."""
+    stage = Stage("infra_plan")
+
+    async def fake_git(engine, *args):
+        return (0, ".terraform_runs/onprem_prod__plan/prod/terraform/terraform.tfvars.json\n"
+                   ".terraform_runs/aac-x__apply/main.tf\n"
+                   "onprem/prod/terraform/terraform.tfvars.json\n")
+
+    stage._git = fake_git  # type: ignore[assignment]
+    changed = asyncio.run(stage._get_changed_files(None))
+    assert changed == ["onprem/prod/terraform/terraform.tfvars.json"]
+
+
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-v"]))

@@ -56,33 +56,67 @@ def remote_files(remote):
     return set(git(remote, "ls-tree", "-r", "--name-only", "main").splitlines())
 
 
-def test_untracks_run_artifacts_and_commits_generated_state(repos):
+def test_commits_generated_state_and_run_dirs(repos):
     remote, _seed, work = repos
+    before = git(remote, "rev-parse", "main")
     (work / "onprem" / "prod" / "inventory.yml").write_text("all: {hosts: {a: {}}}\n")
     (work / ".terraform_runs" / "onprem_prod__plan" / "secrets.auto.tfvars").write_text("pw = \"new\"\n")
 
     res = publish(work)
 
     assert res.status == sp.PUSHED and res.ok
-    assert res.untracked_artifacts is True
-    assert res.files == ["onprem/prod/inventory.yml"]
+    assert sorted(res.files) == [".terraform_runs/onprem_prod__plan/secrets.auto.tfvars",
+                                 "onprem/prod/inventory.yml"]
     files = remote_files(remote)
-    assert "onprem/prod/inventory.yml" in files
-    assert not any(f.startswith(".terraform_runs/") for f in files)
-    # working copy keeps the run dir; git ignores it from now on
-    assert (work / ".terraform_runs" / "onprem_prod__plan" / "secrets.auto.tfvars").exists()
+    assert {"onprem/prod/inventory.yml", ".terraform_runs/onprem_prod__plan/secrets.auto.tfvars"} <= files
+    # exactly one generation commit, no separate untrack commit
+    assert git(remote, "rev-list", "--count", f"{before}..main") == "1"
     log = git(remote, "log", "--format=%B", "-1", "main")
     assert "iac-controller@0123456789ab" in log and "job: #1340" in log
     assert log.startswith("ci: automated state update")
     assert git(remote, "rev-parse", "main") == res.commit_sha
 
 
+def test_provider_cache_is_never_staged(repos):
+    remote, _seed, work = repos
+    cache = work / ".terraform_runs" / "x__apply" / ".terraform" / "providers"
+    cache.mkdir(parents=True)
+    (cache / "provider.bin").write_text("binary\n")
+    (work / ".terraform_runs" / "x__apply" / "main.tf").write_text("# run dir\n")
+
+    res = publish(work)
+
+    assert res.status == sp.PUSHED
+    files = remote_files(remote)
+    assert ".terraform_runs/x__apply/main.tf" in files
+    assert not any("/.terraform/" in f for f in files)
+
+
+def test_drops_obsolete_153_exclude_rule(repos):
+    remote, _seed, work = repos
+    exclude = work / ".git" / "info" / "exclude"
+    exclude.write_text("# keep me\n*.swp\n"
+                       "# lyndrix iac-orchestrator: run artifacts are never state\n"
+                       ".terraform_runs/\n.terraform/\n")
+    (work / ".terraform_runs" / "onprem_prod__plan" / "secrets.auto.tfvars").write_text("pw = \"y\"\n")
+
+    res = publish(work)
+
+    lines = exclude.read_text().splitlines()
+    assert ".terraform_runs/" not in lines and ".terraform/" in lines
+    assert "*.swp" in lines and "# keep me" in lines
+    assert not any("run artifacts are never state" in ln for ln in lines)
+    assert res.status == sp.PUSHED
+    assert res.files == [".terraform_runs/onprem_prod__plan/secrets.auto.tfvars"]
+    # idempotent
+    publish(work)
+    assert exclude.read_text().splitlines() == lines
+
+
 def test_no_diff_means_no_commit(repos):
     remote, _seed, work = repos
-    publish(work)                      # untrack commit
+    publish(work)
     before = git(remote, "rev-parse", "main")
-    (work / ".terraform_runs" / "x__apply").mkdir(parents=True)
-    (work / ".terraform_runs" / "x__apply" / "main.tf").write_text("# run artifact\n")
 
     res = publish(work)
 

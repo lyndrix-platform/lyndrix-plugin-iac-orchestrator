@@ -2,7 +2,7 @@ import json
 import logging
 from datetime import datetime
 from core.api import db_instance
-from .models import IaCJob, IaCState, IaCJobTask
+from .models import IaCJob, IaCJobLog, IaCState, IaCJobTask
 from sqlalchemy import or_
 
 log = logging.getLogger("IaC:Database")
@@ -46,6 +46,36 @@ def retry_write(fn, *, attempts: int = 4, pause: float = 0.05):
                 _time.sleep(pause * (attempt + 1))
                 continue
             raise
+
+
+_DELETE_BATCH = 100
+
+
+def _delete_jobs(session, job_ids: list) -> int:
+    """Delete jobs together with every child row, children first.
+
+    MariaDB enforces the foreign keys of ``iac_orchestrator_job_logs`` and
+    ``iac_orchestrator_job_tasks`` (error 1451 if the parent goes first). Jobs are
+    removed in committed batches so a large log table stays well under the core's
+    per-statement time cap; each batch retries on 1020/1205/1213.
+    """
+    deleted = 0
+    for start in range(0, len(job_ids), _DELETE_BATCH):
+        batch = job_ids[start:start + _DELETE_BATCH]
+
+        def _tx(batch=batch):
+            try:
+                session.query(IaCJobLog).filter(IaCJobLog.job_id.in_(batch)).delete(synchronize_session=False)
+                session.query(IaCJobTask).filter(IaCJobTask.job_id.in_(batch)).delete(synchronize_session=False)
+                n = session.query(IaCJob).filter(IaCJob.id.in_(batch)).delete(synchronize_session=False)
+                session.commit()
+                return int(n or 0)
+            except Exception:
+                session.rollback()
+                raise
+
+        deleted += retry_write(_tx)
+    return deleted
 
 
 class JobDatabase:
@@ -265,17 +295,13 @@ class JobDatabase:
         try:
             fail_statuses = ["FAILED", "ERROR", "ABORTED"]
             job_ids = [
-                j.id for j in session.query(IaCJob)
+                row.id for row in session.query(IaCJob.id)
                 .filter(IaCJob.status.in_(fail_statuses))
                 .all()
             ]
-            if not job_ids:
-                return 0
-            session.query(IaCJobTask).filter(IaCJobTask.job_id.in_(job_ids)).delete(synchronize_session=False)
-            deleted = session.query(IaCJob).filter(IaCJob.id.in_(job_ids)).delete(synchronize_session=False)
-            session.commit()
+            deleted = _delete_jobs(session, job_ids)
             log.info(f"Cleared {deleted} failed job record(s) from statistics.")
-            return int(deleted or 0)
+            return deleted
         except Exception as e:
             log.error(f"Failed to clear failed job statistics: {e}")
             session.rollback()
@@ -297,15 +323,10 @@ class JobDatabase:
             job_query = session.query(IaCJob)
             if keep_running:
                 job_query = job_query.filter(IaCJob.status != "RUNNING")
-            job_ids = [j.id for j in job_query.all()]
-            if not job_ids:
-                return 0
-            # Delete child tasks first to satisfy the FK constraint.
-            session.query(IaCJobTask).filter(IaCJobTask.job_id.in_(job_ids)).delete(synchronize_session=False)
-            deleted = session.query(IaCJob).filter(IaCJob.id.in_(job_ids)).delete(synchronize_session=False)
-            session.commit()
+            job_ids = [row.id for row in job_query.with_entities(IaCJob.id).all()]
+            deleted = _delete_jobs(session, job_ids)
             log.info(f"Cleared {deleted} job record(s) from statistics (keep_running={keep_running}).")
-            return int(deleted or 0)
+            return deleted
         except Exception as e:
             log.error(f"Failed to clear job statistics: {e}")
             session.rollback()
