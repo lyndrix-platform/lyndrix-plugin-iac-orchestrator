@@ -1509,7 +1509,8 @@ def _scan_terraform_hosts() -> list:
     ``state`` of tfvars-managed hosts is always derived from the shared job table."""
     hosts = _collect_terraform_hosts_from_disk() if _has_repo_checkout() else (_snapshot_items("terraform_hosts") or [])
     try:
-        recent_jobs = _engine.db.get_jobs_for_stats(500)
+        from .stats import STATS_JOB_WINDOW
+        recent_jobs = _engine.db.get_jobs_for_stats(STATS_JOB_WINDOW)
     except Exception:
         recent_jobs = []
     results = []
@@ -1594,15 +1595,16 @@ async def do_get_stats():
     if not _engine:
         raise HTTPException(status_code=500, detail="Engine offline")
     from . import stats as _stats
+    # Sync DB reads + aggregation run off the event loop (window is 5000 rows now).
     try:
-        jobs = _engine.db.get_jobs_for_stats(500)
+        jobs = await asyncio.to_thread(_engine.db.get_jobs_for_stats, _stats.STATS_JOB_WINDOW)
     except Exception:
         jobs = []
     try:
-        tasks = _engine.db.get_job_tasks_for_stats(1500)
+        tasks = await asyncio.to_thread(_engine.db.get_job_tasks_for_stats, _stats.STATS_TASK_WINDOW)
     except Exception:
         tasks = []
-    s = _stats.compute(jobs, tasks)
+    s = await asyncio.to_thread(_stats.compute, jobs, tasks)
 
     def _ser_recent(j: dict) -> dict:
         return {
