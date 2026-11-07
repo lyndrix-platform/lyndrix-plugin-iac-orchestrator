@@ -793,6 +793,8 @@ class PipelineStrategy:
     sync_infra_engine: bool = False
     #: commit/push the generated inventory_state after generation
     commit_state: bool = True
+    #: a failed commit/push aborts the pipeline; False → logged, pipeline goes on
+    commit_state_required: bool = True
     #: execute via the named-task organizer (host_provision tracking) rather than
     #: the flat stage loop
     organizes_tasks: bool = False
@@ -807,7 +809,13 @@ class PipelineStrategy:
 
 
 class SingleServiceStrategy(PipelineStrategy):
-    commit_state = False
+    # Service webhooks are the only pipelines that run day to day; with
+    # commit_state=False the generated inventory_state was regenerated on every
+    # deploy but never pushed (GitLab iac-inventory-state stood still from
+    # 2026-10-12 while only single_service jobs ran). Persist it, but never let a
+    # git hiccup block a service deploy.
+    commit_state = True
+    commit_state_required = False
 
     def db_tag(self, payload):
         return f"single_service:{payload.get('service_name')}"
@@ -1862,10 +1870,13 @@ class DeploymentEngine:
             NativeGenerateStage(),
         ])
 
-        # Read-only / focused pipelines (single_service, infra_plan, adopt_host,
-        # state_check) do not persist generated inventory back to inventory_state.
+        # Read-only / focused pipelines (infra_plan, adopt_host, state_check) do not
+        # persist generated inventory back to inventory_state.
         if strategy.commit_state:
-            pipeline.append(CommitPushStage("inventory_state", "ci: automated state update"))
+            pipeline.append(CommitPushStage(
+                "inventory_state", "ci: automated state update",
+                required=strategy.commit_state_required,
+            ))
 
         # Type-specific stages (polymorphic strategy replaces the if/elif ladder).
         pipeline.extend(strategy.build_stages(self, payload, context))

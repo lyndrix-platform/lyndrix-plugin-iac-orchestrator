@@ -22,17 +22,23 @@ class SyncRepoStage(BaseStage):
         return StageResult(False, f"Failed to sync {self.role_slug}")
 
 class CommitPushStage(BaseStage):
-    def __init__(self, role_slug: str, message: str):
+    def __init__(self, role_slug: str, message: str, required: bool = True):
         super().__init__(f"Commit & Push: {role_slug}")
         self.role_slug = role_slug
         self.message = message
+        # required=False: a failed push is reported but does not abort the pipeline.
+        self.required = required
 
     async def run(self, engine, context: dict) -> StageResult:
         status = await engine.execute_git_commit_push(self.role_slug, self.message)
         context[f"{self.role_slug}_commit_status"] = status
         if status in ["pushed", "committed_locally", "no_changes"]:
             return StageResult(True, f"Git status for {self.role_slug}: {status}")
-        return StageResult(False, f"Push failed for {self.role_slug} with status: {status}")
+        msg = f"Push failed for {self.role_slug} with status: {status}"
+        if not self.required:
+            log.warning(f"{msg} (non-fatal for this pipeline type)")
+            return StageResult(True, f"{msg} — continuing")
+        return StageResult(False, msg)
 
 class CloneServiceRepoStage(BaseStage):
     def __init__(self, service_name: str, branch: str, payload: dict):
