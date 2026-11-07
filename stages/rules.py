@@ -223,7 +223,12 @@ class DynamicRuleExecutionStage(BaseStage):
             except Exception as e:
                 return StageResult(False, f"Terraform {verb} failed for '{host}': {e}")
             if not ok:
-                return StageResult(False, f"Terraform {verb} failed for host '{host}'.")
+                rc = stats.get("exit_code") if isinstance(stats, dict) else None
+                detail = f"exit code {rc}" if rc is not None else "exit code unknown"
+                return StageResult(
+                    False,
+                    f"Terraform {verb} failed for host '{host}' ({detail}; tofu output is in the job log above).",
+                )
             if isinstance(stats, dict) and stats.get("container_created"):
                 created_hosts.append(host)
         # A rule-driven apply that actually created a CT must bootstrap it too —
