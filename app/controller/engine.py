@@ -3175,7 +3175,8 @@ class DeploymentEngine:
             action_cmd = f"STEP=plan; {plan_cmd}; {apply_cmd}"
         # Optional adopt-existing step: import a live CT into state before plan/apply
         # so it's reconciled in place, not destroyed/recreated. Guarded (skip if
-        # already tracked) and non-fatal (a not-yet-existing CT falls through to apply).
+        # already tracked), every decision is echoed into the job log, and a
+        # not-yet-existing CT falls through to apply (see _build_import_cmd).
         import_cmd = ""
         if import_specs and (mode == "import" or do_apply):
             import_cmd = self._build_import_cmd(tf_bin, import_specs)
@@ -3271,40 +3272,71 @@ class DeploymentEngine:
     def _build_import_cmd(tf_bin: str, import_specs: list[dict]) -> str:
         """Shell for the guarded adopt step, one block per spec.
 
-        A CT that moved to another Proxmox node (``node_name`` changed) is still
-        tracked under the OLD per-node module (``module.lxc_<old>…ct["<host>"]``):
-        importing it under the new module would create a second state entry and
-        the old one — now without a for_each key — breaks ``output "info"`` on
-        refresh (``var.containers[name]`` → Invalid index) and would be planned
-        for destruction. So: already at the target address → nothing; tracked
-        under another ``lxc_*`` module → ``state mv``; tracked nowhere → import.
-        The OpenTofu image has sh+grep but no bash/jq — keep it POSIX.
+        Runs inside the runner prelude ``set -euo pipefail`` with stderr folded
+        into stdout, so every decision is echoed and tofu's own errors reach the
+        job log. No ``tofu … | grep -q`` pipelines: under ``pipefail`` grep -q
+        quitting early SIGPIPEs tofu and a ``$(… | grep)`` without a match
+        aborts the whole script (1.4.3–1.5.1: silent "step <import> failed with
+        exit code 1"). The state list is snapshotted to a file once instead.
+
+        Cases, per CT (``ref`` = ``<node>/<vmid>`` of the live CT):
+        - at the target address and its state ``node_name`` matches → nothing;
+        - at the target address but state ``node_name`` names another node, or
+          tracked under another ``lxc_*`` module → ``state rm`` + import from the
+          live node. A ``state mv`` would keep the old ``node_name``: the refresh
+          then reads the CT on the old node, finds nothing, drops it and plans a
+          create (the onp-netp-prv case). A failed re-import here is fatal, so
+          an apply never tries to create a CT that exists;
+        - tracked nowhere → import; failure is non-fatal (not created yet).
+        The OpenTofu image has sh+grep+sed but no bash/jq — keep it POSIX.
         """
-        parts = []
+        sl = ".adopt_state_list"
+        parts = [
+            f"echo '[adopt] reading state'; "
+            f"{tf_bin} state list > {sl}; "
+            f"echo \"[adopt] state tracks $(grep -c . {sl} || true) resource(s)\"; "
+        ]
         for spec in import_specs:
             addr, ref = spec.get("addr", ""), spec.get("ref", "")
             if not addr or not ref:
                 continue
             host = str(spec.get("host") or "").strip()
+            want_node = ref.split("/", 1)[0]
             ct_suffix = f'.proxmox_virtual_environment_container.ct["{host}"]' if host else ""
+            reimport = (
+                f"{tf_bin} import -input=false -no-color '{addr}' '{ref}' || "
+                f"{{ echo '[adopt] ERROR: re-import of {addr} from {ref} failed - "
+                f"the CT is no longer in state; fix by hand before any apply'; exit 1; }}; "
+            )
+            # At the target address: the stored node_name must be the live node.
+            tracked_block = (
+                f"{tf_bin} state show -no-color '{addr}' > .adopt_show || true; "
+                "NODE=$(sed -n '/^ *node_name *= *\"/{s/^[^\"]*\"//;s/\".*$//;p;q;}' .adopt_show); "
+                "rm -f .adopt_show; "
+                f"if [ -n \"$NODE\" ] && [ \"$NODE\" != '{want_node}' ]; then "
+                f"echo '[adopt] {addr}'\" is tracked with node_name=$NODE but the CT lives on {want_node} "
+                f"- state rm + import from {ref}\"; "
+                f"{tf_bin} state rm -no-color '{addr}'; {reimport}"
+                f"else echo '[adopt] {addr}'\" already in state (node_name=${{NODE:-?}})\"; fi; "
+            )
             move_block = (
-                f"OLD=$({tf_bin} state list 2>/dev/null | grep -F '{ct_suffix}' | grep -vxF '{addr}' | head -n 1); "
+                f"OLD=$(grep -F '{ct_suffix}' {sl} | grep -vxF '{addr}' | sed -n 1p || true); "
                 "if [ -n \"$OLD\" ]; then "
-                f"echo \"[adopt] moving $OLD -> \"'{addr}'\" (node changed)\"; "
-                f"{tf_bin} state mv -no-color \"$OLD\" '{addr}' || echo \"[adopt] state mv failed for $OLD\"; "
+                f"echo \"[adopt] $OLD is tracked under another node module - state rm + import as \"'{addr}'\" from {ref}\"; "
+                f"{tf_bin} state rm -no-color \"$OLD\"; {reimport}"
                 "else "
             ) if ct_suffix else ""
             import_block = (
-                f"echo '[adopt] importing {addr}'; "
+                f"echo '[adopt] {addr} not in state - importing {ref}'; "
                 f"{tf_bin} import -input=false -no-color '{addr}' '{ref}' || "
                 f"echo '[adopt] import skipped for {addr} (not present yet)'; "
             )
             close_move = "fi; " if ct_suffix else ""
             parts.append(
-                f"if ! {tf_bin} state list 2>/dev/null | grep -qxF '{addr}'; then "
-                f"{move_block}{import_block}{close_move}"
-                f"else echo '[adopt] {addr} already in state'; fi; "
+                f"if grep -qxF '{addr}' {sl}; then {tracked_block}"
+                f"else {move_block}{import_block}{close_move}fi; "
             )
+        parts.append(f"rm -f {sl}; ")
         return "".join(parts)
 
     def is_known_site(self, name: str) -> bool:
