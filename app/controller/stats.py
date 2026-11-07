@@ -17,6 +17,13 @@ _SUCCESS = {"SUCCESS"}
 _FAILURE = {"FAILED", "ERROR", "ABORTED"}
 _RUNNING = {"RUNNING"}
 
+# Read window for statistics / host-state derivation (newest N rows). This only
+# bounds what the Overview KPIs, lifecycle phases and Terraform host states look
+# at — job history itself is never pruned automatically. The queries select a
+# handful of narrow columns ordered by primary key, so 5000/15000 rows stay cheap.
+STATS_JOB_WINDOW = 5000
+STATS_TASK_WINDOW = 15000
+
 
 @dataclass
 class PhaseStat:
