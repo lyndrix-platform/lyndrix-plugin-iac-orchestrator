@@ -103,7 +103,11 @@ def _build_fields() -> list[SettingField]:
             "auto_apply", "Auto-Apply on webhook", kind="bool", category="Pipeline",
             default=False, vault_key="iac_auto_apply", state_key="auto_apply_enabled",
             bool_format="python", env_var="PLUGIN_IAC_ORCHESTRATOR_AUTO_APPLY",
-            description="Execute immediately when a verified webhook arrives, without a manual plan gate.",
+            description=(
+                "Infrastructure only: let Terraform apply (infra_apply, rule mode: apply) and "
+                "rule-engine Ansible actions run without a manual gate. Off = plan / --check for "
+                "those. Service deploys, rollouts and compliance runs are never affected."
+            ),
         ),
         SettingField(
             "test_deploy_allowed_hosts", "Test-Deploy allowed hosts", category="Pipeline",

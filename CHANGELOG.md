@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.6] - 2026-11-08
+Hotfix line (core 1.10 / API < 1.13). Same content goes to main.
+
+### Fixed
+- Service deploys changed nothing while `auto_apply` was off: the Ansible runner appended `--check` to EVERY playbook run whenever the global `auto_apply` switch was off, so `single_service` deploys from GitLab CI/UI, rollouts, compliance and bootstrap ran as dry-runs. Some reported SUCCESS without changing anything (e.g. aac-kea-dhcp); others failed because check mode skips the local `rsync` in `cd_rollout_single_service.yml` (`lookup('file') … service.yml` missing, e.g. aac-renovate). `auto_apply` now gates only infrastructure applies: Terraform `apply` (`infra_apply`, rule `mode: apply`) and the Ansible actions the rule engine fires on its own (`baseline_role`, `baseline`, legacy rule playbooks). Explicit deploys (`single_service`, `rollout`, `host_provision` service deploy, `compliance`, `bootstrap_compliance`, bootstrap of newly created hosts) always run for real.
+- A `--check` rollout no longer persists `last_known_good`, so the drift of a dry-run stays visible to the next real rollout.
+
+### Added
+- Explicit dry-run: job payload `dry_run: true` (`POST /deploy/service/{service}`, its `/gitlab` CI variant and `POST /pipeline` accept `"dry_run": true`) runs every Ansible stage of the job with `--check`. Dry-runs are labelled: job log banner `DRY-RUN`, `[DRY-RUN --check]` on each playbook, dry-run summaries, final step "Completed (Dry-Run, nothing changed)", "(Dry-Run)" in the notification title. Terraform is not affected (`infra_plan`/`state_check` are plan/read-only already).
+
 ## [1.5.5] - 2026-11-08
 Hotfix line (core 1.10 / API < 1.13). Same content goes to main as 1.6.1.
 
