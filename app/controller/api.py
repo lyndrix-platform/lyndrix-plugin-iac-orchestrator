@@ -400,6 +400,9 @@ def _build_orchestrator_event(payload: dict) -> tuple[dict | None, str]:
 
 class DeployRequest(BaseModel):
     branch: str = "main"
+    # Explicit dry-run: ansible --check, nothing changed. Deploys are real by
+    # default; the global auto_apply switch does not affect them (1.5.6).
+    dry_run: bool = False
 
 
 class TestHostDeployRequest(BaseModel):
@@ -415,6 +418,7 @@ class PipelineRequest(BaseModel):
     pipeline_type: str
     limit: str | None = None       # "all" | "<site>" | "<host>"
     host_name: str | None = None   # exact host token for host-scoped actions
+    dry_run: bool = False          # ansible --check for every playbook of the job
 
 
 class SettingsRequest(BaseModel):
@@ -651,9 +655,13 @@ async def do_trigger_service_deployment(service_name: str, payload: DeployReques
         "service_branch": branch,
         "manual": True,
     }
+    if payload.dry_run:
+        event_payload["dry_run"] = True
     _ctx.emit("iac:webhook_verified", event_payload)
     _emit_webhook_verified(event_payload)
-    return {"status": "accepted", "message": f"Deployment queued for {normalized_service}"}
+    kind = "Dry-run (--check)" if payload.dry_run else "Deployment"
+    return {"status": "accepted", "dry_run": bool(payload.dry_run),
+            "message": f"{kind} queued for {normalized_service}"}
 
 
 async def do_get_service_status(service_name: str, since_epoch: int = 0):
@@ -1114,13 +1122,17 @@ async def do_run_pipeline(payload: PipelineRequest):
         event_payload["limit"] = limit
     if host:
         event_payload["host_name"] = host
+    if payload.dry_run:
+        event_payload["dry_run"] = True
 
     _ctx.emit("iac:webhook_verified", event_payload)
     _emit_webhook_verified(event_payload)
     target = host or limit
+    suffix = " (dry-run, --check)" if payload.dry_run else ""
     return {
         "status": "accepted",
-        "message": f"Pipeline '{pipeline_type}' queued for '{target}'.",
+        "message": f"Pipeline '{pipeline_type}' queued for '{target}'{suffix}.",
+        "dry_run": bool(payload.dry_run),
         "pipeline_type": pipeline_type,
         "limit": limit or None,
         "host_name": host or None,

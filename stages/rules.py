@@ -44,6 +44,22 @@ class DynamicRuleExecutionStage(BaseStage):
         self._ref = "HEAD"
 
     # ------------------------------------------------------------------ utils
+    @staticmethod
+    def _ansible_check_mode(engine, context: dict) -> bool:
+        """--check for the Ansible actions this rule engine fires on its own.
+
+        Rule actions are automatic infrastructure changes derived from a
+        controller diff, so they stay gated by the global auto_apply switch
+        (like Terraform ``mode: apply``). A job-level ``dry_run`` forces --check
+        too. Explicit deploys outside the rule engine are NOT gated (1.5.6).
+        """
+        if context.get("dry_run"):
+            return True
+        if not bool(getattr(getattr(engine, "config", None), "auto_apply", False)):
+            log.info("Rule action runs as DRY-RUN (--check): auto_apply is off for rule-engine changes.")
+            return True
+        return False
+
     async def _git(self, engine, *args) -> tuple[int, str]:
         repo = engine.base_git_dir / "inventory_state"
         proc = await asyncio.create_subprocess_exec(
@@ -182,11 +198,13 @@ class DynamicRuleExecutionStage(BaseStage):
     # --------------------------------------------------------------- actions
     async def _run_legacy_action(self, engine, context, action, changed_services):
         target = action.get("playbook", "")
+        check = self._ansible_check_mode(engine, context)
         if "cd_rollout_service.yml" in target:
             stage = AsyncBulkRolloutStage(
                 inventory_path=action.get("inventory"),
                 limit=action.get("limit"),
                 target_services=changed_services if changed_services else None,
+                check_mode=check,
             )
         else:
             stage = AnsiblePlaybookStage(
@@ -194,6 +212,7 @@ class DynamicRuleExecutionStage(BaseStage):
                 playbook_path=target,
                 inventory_path=action.get("inventory"),
                 limit=action.get("limit"),
+                check_mode=check,
             )
         return await stage.run(engine, context)
 
@@ -268,6 +287,7 @@ class DynamicRuleExecutionStage(BaseStage):
             inventory_path=action.get("inventory", "global/ansible/inventory.yml"),
             limit=limit,
             target_services=target_services,
+            check_mode=self._ansible_check_mode(engine, context),
         )
         res = await stage.run(engine, context)
         if target_services:
@@ -302,6 +322,7 @@ class DynamicRuleExecutionStage(BaseStage):
                     inventory_path=inventory,
                     limit=host,
                     extra_vars={"role_to_run": role},
+                    check_mode=self._ansible_check_mode(engine, context),
                 )
                 res = await stage.run(engine, context)
                 if not res.success:
@@ -331,6 +352,7 @@ class DynamicRuleExecutionStage(BaseStage):
                 playbook_path=playbook,
                 inventory_path=action.get("inventory", "global/ansible/inventory.yml"),
                 limit=self._substitute(action.get("limit", "all"), path_vars),
+                check_mode=self._ansible_check_mode(engine, context),
             )
             return await stage.run(engine, context)
         log.warning(f"Unknown rule action type '{atype}', skipping.")
@@ -341,7 +363,10 @@ class DynamicRuleExecutionStage(BaseStage):
         rules_file_path = engine.base_git_dir / "config_engine" / "pipeline_rules.yml"
         if not rules_file_path.exists():
             log.warning("pipeline_rules.yml not found. Falling back to default hardcoded behavior.")
+            check = self._ansible_check_mode(engine, context)
             for stage in engine.get_default_ansible_stages(self.pipeline_type):
+                if hasattr(stage, "check_mode"):
+                    stage.check_mode = check
                 res = await stage.run(engine, context)
                 if not res.success:
                     return res
