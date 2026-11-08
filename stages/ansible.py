@@ -19,6 +19,19 @@ SERVICE_ROLLOUT_PLAYBOOK_ANSIBLE = "playbooks/cd_playbooks/cd_rollout_single_ser
 ANSIBLE_BUILD_ROLES_DIR_TPL = "/tmp/aac_builds/_ansible_roles/{service}"
 
 
+def resolve_check_mode(explicit: bool | None, context: dict | None) -> bool:
+    """Effective ansible ``--check`` flag for one run.
+
+    An explicit stage value wins; otherwise the job's ``dry_run`` decides. The
+    global auto_apply switch is deliberately NOT consulted here: explicit deploys
+    (single_service, rollout, compliance, bootstrap) always run for real unless
+    the job asked for a dry-run.
+    """
+    if explicit is not None:
+        return bool(explicit)
+    return bool((context or {}).get("dry_run"))
+
+
 def service_deploy_type(engine, service_name: str) -> str:
     """Return the service's ``deploy_type`` from the controller service catalog.
 
@@ -72,7 +85,7 @@ def host_assigned_services(engine, host_name: str) -> list[str]:
 
 
 class AnsiblePlaybookStage(BaseStage):
-    def __init__(self, playbook_path: str, inventory_path: str, limit: str = None, name_override: str = None, extra_vars: dict = None, ssh_key_secret: str = "ansible_ssh_key", remote_user: str = "ansible-agent", extra_roles_paths: list = None):
+    def __init__(self, playbook_path: str, inventory_path: str, limit: str = None, name_override: str = None, extra_vars: dict = None, ssh_key_secret: str = "ansible_ssh_key", remote_user: str = "ansible-agent", extra_roles_paths: list = None, check_mode: bool | None = None):
         self.display_name = name_override or f"Ansible: {playbook_path}"
         super().__init__(self.display_name)
         self.playbook_path = playbook_path
@@ -84,8 +97,12 @@ class AnsiblePlaybookStage(BaseStage):
         # Extra dirs appended to ANSIBLE_ROLES_PATH in the runner container
         # (native/ansible deploys: the per-run rendered build roles dir).
         self.extra_roles_paths = extra_roles_paths or []
+        # None → follow the job (context["dry_run"]); True/False → explicit
+        # (the rule engine passes its auto_apply gate here).
+        self.check_mode = check_mode
 
     async def run(self, engine, context: dict) -> StageResult:
+        check = resolve_check_mode(self.check_mode, context)
         success, stats = await engine.execute_ansible_docker(
             playbook_subpath=self.playbook_path,
             inventory_subpath=self.inventory_path,
@@ -96,16 +113,21 @@ class AnsiblePlaybookStage(BaseStage):
             ssh_key_secret=self.ssh_key_secret,
             remote_user=self.remote_user,
             extra_roles_paths=self.extra_roles_paths,
+            check_mode=check,
         )
-        msg = "Ansible execution completed." if success else "Ansible execution failed."
-        return StageResult(success, msg, data=stats)
+        if check:
+            msg = "Ansible dry-run (--check) completed, nothing changed." if success else "Ansible dry-run (--check) failed."
+        else:
+            msg = "Ansible execution completed." if success else "Ansible execution failed."
+        return StageResult(success, msg, data={**(stats or {}), "check_mode": check})
 
 class AsyncBulkRolloutStage(BaseStage):
-    def __init__(self, inventory_path: str, limit: str = "all", target_services: list[str] = None):
+    def __init__(self, inventory_path: str, limit: str = "all", target_services: list[str] = None, check_mode: bool | None = None):
         super().__init__(f"Async Bulk Rollout (Limit: {limit})")
         self.inventory_path = inventory_path
         self.limit = limit
         self.target_services = target_services
+        self.check_mode = check_mode  # None → follow context["dry_run"]
 
     async def run(self, engine, context: dict) -> StageResult:
         job_id = context.get("job_id", 0)
@@ -156,7 +178,7 @@ class AsyncBulkRolloutStage(BaseStage):
                 svc_group = f"service_{sanitized_name}"
                 eff_limit = f"{self.limit}:&{svc_group}" if self.limit and self.limit != "all" else svc_group
                 pb_path, extra_roles = service_rollout_selector(engine, svc_name)
-                stage = AnsiblePlaybookStage(name_override=svc_name, playbook_path=pb_path, inventory_path=self.inventory_path, limit=eff_limit, extra_vars={"target_service": svc_name, "target_group": eff_limit, "LOCAL_SERVICES_DIR": str(engine.config.services_dir)}, extra_roles_paths=extra_roles)
+                stage = AnsiblePlaybookStage(name_override=svc_name, playbook_path=pb_path, inventory_path=self.inventory_path, limit=eff_limit, extra_vars={"target_service": svc_name, "target_group": eff_limit, "LOCAL_SERVICES_DIR": str(engine.config.services_dir)}, extra_roles_paths=extra_roles, check_mode=self.check_mode)
                 res = await stage.run(engine, context)
                 report[svc_name] = {"success": res.success, "successful_hosts": res.data.get("successful_hosts", 0), "failed_hosts": res.data.get("failed_hosts", 0)}
                 if not res.success: failed_services.append(svc_name)
@@ -169,7 +191,9 @@ class AsyncBulkRolloutStage(BaseStage):
                             engine.db.update_progress(job_id, progress=None, current_step=f"Bulk Deploying ({completed}/{total_services})")
                     except Exception: pass
         await asyncio.gather(*[bounded_deploy(s) for s in svc_names])
-        summary = ["\n" + "="*60, "🚀 BULK ROLLOUT DEPLOYMENT SUMMARY", "="*60]
+        dry = resolve_check_mode(self.check_mode, context)
+        title = "🧪 BULK ROLLOUT DRY-RUN SUMMARY (--check, nothing changed)" if dry else "🚀 BULK ROLLOUT DEPLOYMENT SUMMARY"
+        summary = ["\n" + "="*60, title, "="*60]
         tot_succ, tot_fail = 0, 0
         for svc, stats in sorted(report.items()):
             status_icon = "✅" if stats['success'] else "❌"
@@ -246,7 +270,9 @@ class ServiceDeployStage(BaseStage):
         
         await asyncio.gather(*[bounded_deploy(s) for s in svc_names])
         
-        summary = ["\n" + "="*60, f"🚀 SERVICE DEPLOYMENT FOR {self.host_name}", "="*60]
+        dry = resolve_check_mode(None, context)
+        title = f"🧪 SERVICE DRY-RUN FOR {self.host_name} (--check, nothing changed)" if dry else f"🚀 SERVICE DEPLOYMENT FOR {self.host_name}"
+        summary = ["\n" + "="*60, title, "="*60]
         tot_deployed, tot_skipped, tot_failed = 0, 0, 0
         for svc, stats in sorted(report.items()):
             sh = stats['successful_hosts']

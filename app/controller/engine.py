@@ -68,6 +68,17 @@ def _pipeline_label_with_target(pipeline_type: str, payload: dict) -> str:
     return f"{base} {target}" if target else base
 
 
+def _payload_dry_run(payload: dict) -> bool:
+    """True when the job payload explicitly asks for a dry-run (``dry_run``).
+
+    Accepts bools and the usual string spellings from webhooks/CI variables.
+    """
+    raw = (payload or {}).get("dry_run")
+    if isinstance(raw, str):
+        return raw.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(raw)
+
+
 def _fmt_duration(secs: int) -> str:
     if secs < 60:
         return f"{secs}s"
@@ -781,6 +792,11 @@ class PersistStateStage(BaseStage):
     def __init__(self):
         super().__init__("Persist State to DB")
     async def run(self, engine, context: dict) -> StageResult:
+        if context.get("dry_run"):
+            # A --check rollout deployed nothing; recording the desired state as
+            # last_known_good would hide the drift from the next real rollout.
+            log.info("DRY-RUN: not persisting 'last_known_good' (nothing was deployed).")
+            return StageResult(True, "Dry-run: state not persisted.")
         log.info("Persisting new 'last_known_good' state to database...")
         new_state = context.get("current_desired_state")
         if new_state:
@@ -1855,6 +1871,16 @@ class DeploymentEngine:
         _run_start_mono = time.monotonic()
         _run_start_ts = datetime.now(timezone.utc).isoformat()
         pipeline_label = _pipeline_label_with_target(pipeline_type, payload)
+        # Explicit dry-run (payload ``dry_run``): every Ansible stage of this job runs
+        # with --check and no deploy state is persisted. Independent of auto_apply,
+        # which only gates infrastructure applies (Terraform, rule-engine actions).
+        dry_run = _payload_dry_run(payload)
+        if dry_run:
+            pipeline_label = f"{pipeline_label} (Dry-Run)"
+            log.warning(
+                "[SYSTEM] DRY-RUN job: Ansible runs with --check, nothing is changed "
+                "and no deploy state is persisted."
+            )
 
         # Sticky "started" notification routed through the central router.
         # The same notification_id will be upserted by later succeeded/failed
@@ -1881,7 +1907,7 @@ class DeploymentEngine:
             severity="info",
         )
 
-        context = {"payload": payload, "job_id": current_job_id, "db_type": db_type}
+        context = {"payload": payload, "job_id": current_job_id, "db_type": db_type, "dry_run": dry_run}
 
         # Shared prefix: sync the core repos, generate inventory, optionally
         # commit it back — one critical section (StatePrepareStage). The strategy
@@ -1929,18 +1955,24 @@ class DeploymentEngine:
             log.info("[SYSTEM] Pipeline completed successfully.")
             final_status = "SUCCESS"
             self.state["last_deployment"] = final_status
-            self.db.update_progress(current_job_id, progress=100, current_step="Completed Successfully")
-            
+            self.db.update_progress(
+                current_job_id, progress=100,
+                current_step="Completed (Dry-Run, nothing changed)" if dry_run else "Completed Successfully",
+            )
+
             # Upsert the sticky bell entry in-place with the success result.
             if pipeline_type == "single_service":
                 service_name = str(payload.get("service_name") or "unknown-service")
                 service_branch = str(payload.get("service_branch") or "main")
                 success_message = (
-                    f"Service '{service_name}' deployed successfully "
-                    f"(branch: {service_branch}, job #{current_job_id})."
+                    f"Service '{service_name}' "
+                    + ("dry-run (--check) passed, nothing changed " if dry_run else "deployed successfully ")
+                    + f"(branch: {service_branch}, job #{current_job_id})."
                 )
             else:
-                success_message = "Completed successfully."
+                success_message = (
+                    "Dry-run completed (--check), nothing changed." if dry_run else "Completed successfully."
+                )
             duration_secs = int(time.monotonic() - _run_start_mono)
             self.ctx.notify(
                 "deployment_succeeded",
@@ -2089,6 +2121,8 @@ class DeploymentEngine:
             },
         )
         
+        # TODO(agent): the original job payload (incl. dry_run) is not available here,
+        # so a resumed rollout always deploys for real.
         context = {"payload": {}, "job_id": job_id}
         stage = AsyncBulkRolloutStage(inventory_path="global/ansible/inventory.yml", limit="all", target_services=pending_services)
 
@@ -3563,7 +3597,15 @@ class DeploymentEngine:
             "pending_envs": len(pending_envs),
         }
 
-    async def execute_ansible_docker(self, playbook_subpath: str, inventory_subpath: str, limit: str = None, extra_vars: dict = None, task_name: str = "global", job_id: int = 0, ssh_key_secret: str = "ansible_ssh_key", remote_user: str = "ansible-agent", extra_roles_paths: list = None):
+    async def execute_ansible_docker(self, playbook_subpath: str, inventory_subpath: str, limit: str = None, extra_vars: dict = None, task_name: str = "global", job_id: int = 0, ssh_key_secret: str = "ansible_ssh_key", remote_user: str = "ansible-agent", extra_roles_paths: list = None, check_mode: bool = False):
+        """Run one ansible-playbook in a detached runner container.
+
+        ``check_mode`` adds ``--check`` (dry-run, nothing is changed). It is an
+        explicit per-call decision of the caller (job payload ``dry_run`` or the
+        rule engine's auto_apply gate). The global ``auto_apply`` switch no longer
+        turns every Ansible run into a dry-run: before 1.5.6 single_service
+        deploys ran ``--check`` and reported SUCCESS while changing nothing.
+        """
         key_path = None # Safe default so the 'finally' block doesn't crash on early exit
         
         if not shutil.which("docker"): return False, {"successful_hosts": 0, "failed_hosts": 0}
@@ -3572,7 +3614,8 @@ class DeploymentEngine:
         self.state["active_tasks"][task_name] = {
             "status": "pulling_image",
             "logs": [],
-            "job_id": job_id
+            "job_id": job_id,
+            "check_mode": bool(check_mode),
         }
         self._sync_runners(job_id, force=True)
 
@@ -3647,9 +3690,15 @@ class DeploymentEngine:
             if limit: cmd.extend(["--limit", limit])
             if extra_vars:
                 for k, v in extra_vars.items(): cmd.extend(["-e", f"{k}={v}"])
-            if not self.config.auto_apply: cmd.append("--check")
+            if check_mode:
+                cmd.append("--check")
+                log.warning(
+                    f"DRY-RUN: {playbook_subpath} runs with ansible --check; "
+                    "nothing is changed on the target hosts."
+                )
 
-            log.info(f"Executing: {playbook_subpath} (Limit: {limit or 'None'})")
+            dry_tag = " [DRY-RUN --check]" if check_mode else ""
+            log.info(f"Executing: {playbook_subpath} (Limit: {limit or 'None'}){dry_tag}")
             self.state["active_tasks"][task_name]["status"] = "running_ansible"
             self._sync_runners(job_id, force=True)
 

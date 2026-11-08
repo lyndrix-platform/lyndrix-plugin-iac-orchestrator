@@ -5,8 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.6.1] - 2026-11-07
-Forward-port of 1.5.3–1.5.5 (hotfix line, core < 1.11).
+## [1.6.1] - 2026-11-08
+Forward-port of 1.5.3–1.5.6 (hotfix line, core < 1.11).
+
+### Added
+- Explicit dry-run: job payload `dry_run: true` (`POST /deploy/service/{service}`, its `/gitlab` CI variant and `POST /pipeline` accept `"dry_run": true`) runs every Ansible stage of the job with `--check`. Dry-runs are labelled: job log banner `DRY-RUN`, `[DRY-RUN --check]` on each playbook, dry-run summaries, final step "Completed (Dry-Run, nothing changed)", "(Dry-Run)" in the notification title. Terraform is not affected (`infra_plan`/`state_check` are plan/read-only already). (Port of 1.5.6.)
 
 ### Changed
 - Statistics read window 500 → 5000 jobs / 1500 → 15000 tasks (`STATS_JOB_WINDOW`/`STATS_TASK_WINDOW` in `app/controller/stats.py`): Overview KPIs, lifecycle phases and Terraform host states looked only at the newest 500 jobs. Job history itself is never pruned; only the read window grows. `GET /stats` and `GET /terraform/hosts` run their sync DB reads, disk scan and aggregation via `asyncio.to_thread`.
@@ -15,6 +18,7 @@ Forward-port of 1.5.3–1.5.5 (hotfix line, core < 1.11).
 - UI build toolchain (dev dependencies only): `vite` 5.4.21 → 6.4.5, `@vitejs/plugin-react` range ^4.7.0 (already resolved 4.7.0), transitive `postcss` 8.5.32, `esbuild` 0.25.12, `browserslist` 4.29.5, `baseline-browser-mapping` 2.11.35, `source-map-js` 1.2.2, `nanoid` 3.3.20 — closes all 14 Dependabot alerts (GHSA-rq7h-c2jc-7f22, -698v-4r3x-3vcv, -587h-7wmj-h5pm, -v6wh-96g9-6wx3, -fx2h-pf6j-xcff, -4w7w-66w2-5vf9, -68fv-2mgg-jv7q, -w5vr-8v7q-w6rv, -73wf-gq98-2v4g, -fxqj-rqcc-2cmp, -r28c-9q8g-f849, -67mh-4wv8-2f99); `npm audit` clean. The shipped `ui_static/ui_bundle.js` builds byte-identical, so nothing changes at runtime. React stays on 18 (provided by the shell via window globals).
 
 ### Fixed
+- Service deploys changed nothing while `auto_apply` was off: the Ansible runner appended `--check` to EVERY playbook run whenever the global `auto_apply` switch was off, so `single_service` deploys from GitLab CI/UI, rollouts, compliance and bootstrap ran as dry-runs. Some reported SUCCESS without changing anything (e.g. aac-kea-dhcp); others failed because check mode skips the local `rsync` in `cd_rollout_single_service.yml` (`lookup('file') … service.yml` missing, e.g. aac-renovate). `auto_apply` now gates only infrastructure applies: Terraform `apply` (`infra_apply`, rule `mode: apply`) and the Ansible actions the rule engine fires on its own (`baseline_role`, `baseline`, legacy rule playbooks). Explicit deploys (`single_service`, `rollout`, `host_provision` service deploy, `compliance`, `bootstrap_compliance`, bootstrap of newly created hosts) always run for real. A `--check` rollout no longer persists `last_known_good`. (Port of 1.5.6.)
 - inventory_state reaches GitLab after every iac-controller change: an iac-controller push on main triggers `infra_plan` (controller CI `trigger-orchestrator-infra-plan`), which generated but never committed — iac-inventory-state had no commit since 2026-10-12 and the generated files were reset by the next sync. `infra_plan` now publishes like `rollout`/`infra_apply`/`host_provision`/`compliance`.
 - The rule engine of `infra_plan` diffed the last commit some *other* pipeline had made (HEAD/HEAD~1) instead of the change it just generated. Rules now diff exactly the commit their own pipeline published.
 - Single writer: sync → generate → commit/push run as one critical section per instance (`Prepare State` stage). Before, a concurrent pipeline's `Sync Repo: inventory_state` (reset --hard origin) could wipe another pipeline's generated files before they were committed.
