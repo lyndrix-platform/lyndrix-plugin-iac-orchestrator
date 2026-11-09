@@ -1759,10 +1759,15 @@ class DeploymentEngine:
                 rollout_key = f"rollout:{incoming_limit}" if (incoming_limit and incoming_limit != "all") else "rollout:all"
                 # Combine DB RUNNING jobs with in-flight keys reserved this dispatch
                 # but not yet marked RUNNING (closes the create_job TOCTOU window).
+                # Exclude this job's own row: a job claimed from the queue is already
+                # RUNNING with tag rollout:<host> (or "rollout"), so counting it made
+                # every queued rollout block itself ("rollout for '<host>' already
+                # running", ABORTED without logs) — the same j.id != job_id rule the
+                # single_service / host / infra guards below use.
                 active_rollout_types = {
                     str(j.pipeline_type or "")
                     for j in self.db.get_jobs_by_status("RUNNING")
-                    if str(j.pipeline_type or "").startswith("rollout")
+                    if str(j.pipeline_type or "").startswith("rollout") and j.id != job_id
                 } | set(self._active_rollout_keys)
                 if active_rollout_types:
                     if not incoming_limit or incoming_limit == "all":
@@ -1835,6 +1840,26 @@ class DeploymentEngine:
                     self._notify("Pipeline Ignored", "An infrastructure plan/apply is already running.", "warning")
                     return self._skip_claimed(job_id, "an infrastructure plan/apply is already running")
 
+        # Every key reserved above is released in this finally — also when the
+        # pipeline set-up raises before its own try/finally is reached (job row,
+        # strategy, log bridge, notify). A leaked key blocks that target on this
+        # instance until the process restarts.
+        try:
+            await self._execute_dispatched(payload, job_id, pipeline_type)
+        finally:
+            if single_key:
+                async with self._pipeline_dispatch_lock:
+                    self._active_single_service_keys.discard(single_key)
+            if terraform_key:
+                async with self._pipeline_dispatch_lock:
+                    self._active_terraform_host_keys.discard(terraform_key)
+            if rollout_key:
+                async with self._pipeline_dispatch_lock:
+                    self._active_rollout_keys.discard(rollout_key)
+
+    async def _execute_dispatched(self, payload: dict, job_id: int | None, pipeline_type: str):
+        """Run a pipeline that passed the dispatch guard of :meth:`run_pipeline`
+        (which owns and releases the in-memory dispatch keys)."""
         # Safely increment running job counter
         self.state["running_jobs"] = self.state.get("running_jobs", 0) + 1
         self.state["is_running"] = self.state["running_jobs"] > 0
@@ -2084,15 +2109,6 @@ class DeploymentEngine:
             await self._close_log_writer(current_job_id)
             self._cleanup_inventory_snapshot(current_job_id)
             await self._publish_snapshots()
-            if single_key:
-                async with self._pipeline_dispatch_lock:
-                    self._active_single_service_keys.discard(single_key)
-            if terraform_key:
-                async with self._pipeline_dispatch_lock:
-                    self._active_terraform_host_keys.discard(terraform_key)
-            if rollout_key:
-                async with self._pipeline_dispatch_lock:
-                    self._active_rollout_keys.discard(rollout_key)
 
     async def resume_bulk_rollout(self, job_id: int, pending_services: list[str]):
         if not pending_services: return
