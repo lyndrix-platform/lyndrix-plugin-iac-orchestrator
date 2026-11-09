@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.7] - 2026-11-09
+Hotfix line (core 1.10 / API < 1.13). Same content goes to main.
+
+### Fixed
+- Every rollout started from the job queue aborted at once with `Skipped: rollout for '<host>' already running` (or `a rollout is already in progress` for a global rollout) and no logs: the rollout dispatch guard counted the job's own row, which the runner had already claimed and set RUNNING with tag `rollout:<host>`. It now excludes its own job id, like the single_service / host / infra guards do. This also broke the hand-off from `infra_apply` / `host_provision` to the host rollout of freshly created hosts (e.g. docker-sec, docker-store after #1352): they were bootstrapped but never got their services. Rollouts are not subject to the infra plan/apply lock, so the hand-off rollout runs while the apply is still finishing.
+- In-memory dispatch keys (rollout, single_service, host-scoped) are released in an outer `finally`, so an error or cancel during pipeline set-up (before the pipeline's own error handling) no longer blocks that target on the runner until the process restarts.
+
 ## [1.5.6] - 2026-11-08
 Hotfix line (core 1.10 / API < 1.13). Same content goes to main.
 
