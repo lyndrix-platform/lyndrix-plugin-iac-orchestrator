@@ -231,6 +231,290 @@ def test_run_dirs_never_reach_the_rules():
     assert changed == ["onprem/prod/terraform/terraform.tfvars.json"]
 
 
+# ---------------------------------------------------------- service reconcile (1.7)
+import json as _json  # noqa: E402
+from types import SimpleNamespace  # noqa: E402
+
+
+class _Ctx:
+    def __init__(self):
+        self.notifications = []
+        self.emitted = []
+
+    def notify(self, endpoint, **kw):
+        self.notifications.append((endpoint, kw))
+
+    def emit(self, topic, payload):
+        self.emitted.append((topic, payload))
+
+
+class _Store:
+    """In-memory stand-in for ReconcileStore (same surface the action uses)."""
+
+    def __init__(self):
+        self.items = []
+
+    def add(self, **kw):
+        rec = {"id": f"r{len(self.items) + 1}", **kw}
+        self.items.append(rec)
+        return rec
+
+    def update(self, rid, **fields):
+        for it in self.items:
+            if it["id"] == rid:
+                it.update(fields)
+                return it
+        return None
+
+    def remove(self, rid):
+        before = len(self.items)
+        self.items = [i for i in self.items if i["id"] != rid]
+        return len(self.items) != before
+
+    def deferred(self):
+        return [i for i in self.items if i.get("status") == "deferred"]
+
+
+class DuplicateJob(Exception):
+    """Shape of queue.DuplicateJob (matched by name + ``key`` in rules.py)."""
+
+    def __init__(self, key, existing_id=None):
+        super().__init__(key)
+        self.key = key
+        self.existing_id = existing_id
+
+
+class _Engine:
+    def __init__(self, mode="deploy", *, max_hosts=10, max_services=3, store=True, enqueue=None):
+        self.config = SimpleNamespace(service_reconcile_mode=mode, service_reconcile_max_hosts=max_hosts,
+                                      service_reconcile_max_services=max_services, auto_apply=False)
+        self.ctx = _Ctx()
+        self.reconcile_store = _Store() if store else None
+        self.enqueued = []
+        self._enqueue_impl = enqueue
+        self.enqueue_pipeline = self._enqueue
+
+    def _enqueue(self, payload, requested_by=None):
+        if self._enqueue_impl is not None:
+            return self._enqueue_impl(payload)
+        self.enqueued.append(payload)
+        return 100 + len(self.enqueued)
+
+
+SECRET = "sup3r-s3cret-value"
+PROD = "onprem/prod/ansible/inventory.yml"
+DEV = "onprem/dev/ansible/inventory.yml"
+GLOBAL = "global/ansible/inventory.yml"
+CHANGED = [PROD, DEV, GLOBAL, "onprem/prod/terraform/terraform.tfvars.json"]
+CONTEXT = {"job_id": 7, "inventory_state_commit_sha": "abc123def4567"}
+
+
+def _svc(name, manager="m.old", secret=SECRET):
+    return {"name": name, "config": {"vars": {"WAZUH_MANAGER": manager}, "secrets": {"KEY": secret}}}
+
+
+def _inv(hosts):
+    return {"all": {"hosts": hosts, "children": {}}}
+
+
+def _renders(manager_new="m.new", secret_new=SECRET, extra_dev_service=False, prod_hosts=("docker-a", "docker-b", "pve-1")):
+    """old/new renders: prod inventory with hosts sharing the wazuh profile, dev with one host.
+    The global inventory repeats the prod hosts and must NOT be counted again."""
+    old_prod = _inv({h: {"services": [_svc("aac-wazuh-agent")]} for h in prod_hosts})
+    new_prod = _inv({h: {"services": [_svc("aac-wazuh-agent", manager_new, secret_new)]} for h in prod_hosts})
+    old_dev = _inv({"docker-dev": {"services": [_svc("aac-wazuh-agent")]}})
+    dev_services = [_svc("aac-wazuh-agent", manager_new, secret_new)]
+    if extra_dev_service:
+        dev_services.append(_svc("aac-renovate"))
+    new_dev = _inv({"docker-dev": {"services": dev_services}})
+    return {PROD: (old_prod, new_prod), DEV: (old_dev, new_dev), GLOBAL: (old_prod, new_prod)}
+
+
+def _stage_with_renders(renders, pipeline_type="infra_plan", ref="abc123def4567"):
+    stage = Stage(pipeline_type)
+    stage._ref = ref
+
+    async def fake_git(engine, *args):
+        if args[0] == "show":
+            ref_part, _, path = args[1].partition(":")
+            if path in renders:
+                old, new = renders[path]
+                return (0, _yaml_dump(old if ref_part.endswith("~1") else new))
+        return (1, "missing")
+
+    stage._git = fake_git  # type: ignore[assignment]
+    return stage
+
+
+def _reconcile(engine, renders=None, pipeline_type="infra_plan"):
+    stage = _stage_with_renders(renders or _renders(), pipeline_type)
+    return asyncio.run(stage._run_service_reconcile_action(engine, dict(CONTEXT), {"type": "service_reconcile"}, CHANGED))
+
+
+def _notification_text(engine):
+    return _json.dumps(engine.ctx.notifications, default=str)
+
+
+def test_reconcile_mode_off_detects_but_dispatches_nothing():
+    eng = _Engine("off")
+    res = _reconcile(eng)
+    assert res.success and "mode 'off'" in res.message
+    assert eng.enqueued == [] and eng.ctx.notifications == [] and eng.ctx.emitted == []
+
+
+def test_reconcile_unknown_mode_is_treated_as_off():
+    eng = _Engine("yolo")
+    assert _reconcile(eng).success
+    assert eng.enqueued == [] and eng.ctx.notifications == []
+
+
+def test_reconcile_notify_mode_only_notifies_with_key_names():
+    eng = _Engine("notify")
+    res = _reconcile(eng)
+    assert res.success and "notify only" in res.message
+    assert eng.enqueued == []
+    assert len(eng.ctx.notifications) == 1
+    endpoint, kw = eng.ctx.notifications[0]
+    assert endpoint == "service_reconcile" and kw["severity"] == "warning"
+    assert "aac-wazuh-agent (prod, 3 host(s))" in kw["body"]
+    assert "config.vars.WAZUH_MANAGER" in kw["body"]
+    assert kw["notification_id"] == "service_reconcile_abc123d"
+    assert SECRET not in _notification_text(eng)
+
+
+def test_reconcile_deploy_queues_one_job_per_service_and_stage():
+    eng = _Engine("deploy")
+    res = _reconcile(eng)
+    assert res.success and "2 queued, 0 deferred, 0 pending" in res.message
+    by_branch = {p["service_branch"]: p for p in eng.enqueued}
+    prod, dev = by_branch["main"], by_branch["dev"]
+    assert prod["pipeline_type"] == "single_service" and prod["service_name"] == "aac-wazuh-agent"
+    assert prod["target_hosts"] == ["docker-a", "docker-b", "pve-1"]      # global inventory not double counted
+    assert prod["trigger"] == "controller-diff" and prod["source"] == "service_reconcile"
+    assert prod["dry_run"] is False and prod["stage"] == "prod" and prod["site"] == "onprem"
+    assert prod["changed_keys"] == ["config.vars.WAZUH_MANAGER"]
+    assert prod["inventory_commit"] == "abc123def4567" and prod["source_job_id"] == 7
+    assert dev["target_hosts"] == ["docker-dev"] and dev["stage"] == "dev"
+    assert eng.reconcile_store.items == []                                # records removed after queueing
+    endpoint, kw = eng.ctx.notifications[0]
+    assert kw["severity"] == "info" and "queued job #101" in kw["body"]
+    assert SECRET not in _notification_text(eng) and SECRET not in _json.dumps(eng.enqueued)
+
+
+def test_reconcile_dry_run_mode_flags_the_jobs():
+    eng = _Engine("dry_run")
+    assert _reconcile(eng).success
+    assert eng.enqueued and all(p["dry_run"] is True for p in eng.enqueued)
+
+
+def test_reconcile_max_hosts_threshold_parks_the_big_job_only():
+    eng = _Engine("deploy", max_hosts=2)
+    res = _reconcile(eng)
+    assert res.success and "1 queued, 0 deferred, 1 pending" in res.message
+    assert [p["stage"] for p in eng.enqueued] == ["dev"]
+    pending = eng.reconcile_store.items
+    assert len(pending) == 1 and pending[0]["status"] == "pending"
+    assert "max_hosts" in pending[0]["reason"] and pending[0]["payload"]["stage"] == "prod"
+    assert "pending approval" in eng.ctx.notifications[0][1]["body"]
+    assert eng.ctx.notifications[0][1]["severity"] == "warning"
+
+
+def test_reconcile_max_services_threshold_parks_everything():
+    eng = _Engine("deploy", max_services=2)
+    res = _reconcile(eng, _renders(extra_dev_service=True))       # wazuh prod + wazuh dev + renovate dev
+    assert res.success and "0 queued, 0 deferred, 3 pending" in res.message
+    assert eng.enqueued == []
+    assert len(eng.reconcile_store.items) == 3
+    assert all("max_services" in i["reason"] for i in eng.reconcile_store.items)
+
+
+def test_reconcile_duplicate_job_is_deferred_not_lost():
+    def dup(payload):
+        raise DuplicateJob(f"single_service:{payload['service_name']}", 55)
+
+    eng = _Engine("deploy", enqueue=dup)
+    res = _reconcile(eng)
+    assert res.success and "0 queued, 2 deferred, 0 pending" in res.message
+    deferred = eng.reconcile_store.deferred()
+    assert len(deferred) == 2 and all(d["waiting_for_job"] == 55 for d in deferred)
+    assert "deferred (job #55 active)" in eng.ctx.notifications[0][1]["body"]
+
+
+def test_reconcile_dispatch_error_keeps_pending_and_never_fails_the_stage():
+    def boom(payload):
+        raise RuntimeError("db down")
+
+    eng = _Engine("deploy", enqueue=boom)
+    res = _reconcile(eng)
+    assert res.success and "0 queued, 0 deferred, 2 pending" in res.message
+    assert all(i["status"] == "pending" and "dispatch failed" in i["reason"] for i in eng.reconcile_store.items)
+
+
+def test_reconcile_rollout_pipeline_never_dispatches():
+    eng = _Engine("deploy")
+    res = _reconcile(eng, pipeline_type="rollout")
+    assert res.success and "rollout pipeline" in res.message
+    assert eng.enqueued == [] and len(eng.ctx.notifications) == 1
+
+
+def test_reconcile_detection_error_is_swallowed():
+    eng = _Engine("deploy")
+    stage = Stage("infra_plan")
+
+    async def broken_git(engine, *args):
+        raise RuntimeError("git exploded")
+
+    stage._git = broken_git  # type: ignore[assignment]
+    res = asyncio.run(stage._run_service_reconcile_action(eng, dict(CONTEXT), {"type": "service_reconcile"}, CHANGED))
+    assert res.success and "error ignored" in res.message
+    assert eng.enqueued == []
+
+
+def test_reconcile_no_change_is_a_quiet_noop():
+    eng = _Engine("deploy")
+    same = _inv({"docker-a": {"services": [_svc("aac-x")]}})
+    res = _reconcile(eng, {PROD: (same, same)})
+    assert res.success and "no service entries changed" in res.message
+    assert eng.enqueued == [] and eng.ctx.notifications == []
+
+
+def test_reconcile_logs_key_names_never_values(caplog):
+    eng = _Engine("deploy")
+    with caplog.at_level(logging.INFO):
+        _reconcile(eng, _renders(secret_new="other-s3cret"))
+    assert "config.secrets.KEY" in caplog.text and "config.vars.WAZUH_MANAGER" in caplog.text
+    assert SECRET not in caplog.text and "other-s3cret" not in caplog.text
+
+
+def test_reconcile_without_store_still_dispatches_below_thresholds():
+    eng = _Engine("deploy", store=False)
+    res = _reconcile(eng)
+    assert res.success and len(eng.enqueued) == 2
+
+
+def test_reconcile_falls_back_to_the_bus_without_enqueue_hook():
+    eng = _Engine("deploy")
+    eng.enqueue_pipeline = None
+    res = _reconcile(eng)
+    assert res.success
+    topics = [t for t, _ in eng.ctx.emitted]
+    assert topics == ["iac:webhook_verified", "iac:webhook_verified"]
+    assert eng.reconcile_store.items == []
+
+
+def test_run_action_routes_service_reconcile_type():
+    stage = Stage("infra_plan")
+    seen = {}
+
+    async def fake(engine, context, action, changed_files):
+        seen["called"] = (action, changed_files)
+        return rules.StageResult(True, "ok")
+
+    stage._run_service_reconcile_action = fake  # type: ignore[assignment]
+    res = asyncio.run(stage._run_action(None, {}, {"type": "service_reconcile"}, CHANGED, [], {}))
+    assert res.success and seen["called"][1] == CHANGED
+
+
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-v"]))

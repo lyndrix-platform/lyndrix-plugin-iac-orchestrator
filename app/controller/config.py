@@ -160,6 +160,29 @@ class IaCConfig:
         return self._get_bool("PLUGIN_IAC_ORCHESTRATOR_MAINTENANCE_REPORT_MISSING_WINDOW",
                               "iac_maintenance_report_missing_window", True)
 
+    # --- SERVICE RECONCILE (plugin 1.7) — controller-diff → single_service jobs ---
+    SERVICE_RECONCILE_MODES = ("off", "notify", "dry_run", "deploy")
+
+    @property
+    def service_reconcile_mode(self) -> str:
+        """``off`` (default) / ``notify`` / ``dry_run`` / ``deploy`` — what the
+        ``service_reconcile`` rule action does with a detected service change."""
+        raw = str(self._get("PLUGIN_IAC_ORCHESTRATOR_SERVICE_RECONCILE_MODE",
+                            "iac_service_reconcile_mode", "off")).strip().lower()
+        return raw if raw in self.SERVICE_RECONCILE_MODES else "off"
+
+    @property
+    def service_reconcile_max_hosts(self) -> int:
+        """More target hosts than this in ONE service job → pending approval instead of a deploy."""
+        return self._get_int("PLUGIN_IAC_ORCHESTRATOR_SERVICE_RECONCILE_MAX_HOSTS",
+                             "iac_service_reconcile_max_hosts", 10, minimum=1)
+
+    @property
+    def service_reconcile_max_services(self) -> int:
+        """More changed services than this in ONE controller change → every one waits for approval."""
+        return self._get_int("PLUGIN_IAC_ORCHESTRATOR_SERVICE_RECONCILE_MAX_SERVICES",
+                             "iac_service_reconcile_max_services", 3, minimum=1)
+
     def get_log_path(self, job_id: int) -> Path:
         return self.logs_dir / f"job_{job_id}.log"
 

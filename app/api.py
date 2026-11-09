@@ -32,7 +32,7 @@ PLUGIN_ID = "lyndrix.plugin.iac_orchestrator"
 # versa — so gating on the bare ids would lock out groups holding only this
 # plugin's qualified viewer/operator role permissions. Gate on the scoped ids:
 # scoped grants unlock exactly this plugin, global grants keep working.
-PLUGIN_VERSION = "1.6.1"   # mirrors entrypoint.manifest.version
+PLUGIN_VERSION = "1.7.0"   # mirrors entrypoint.manifest.version
 PERM_READ = f"plugin:{PLUGIN_ID}:api:read"
 PERM_WRITE = f"plugin:{PLUGIN_ID}:api:write"
 
@@ -114,6 +114,14 @@ def build_plugin_router(service) -> APIRouter:
     async def maintenance_default(identity: ApiIdentity = Depends(require_permission(PERM_READ))):
         """Read-only ``maintenance_default`` per site/stage (edited in the iac-controller repo)."""
         return await _api.do_maintenance_default()
+
+    # ── Service reconcile (plugin 1.7): controller-diff → single_service jobs ─
+    @router.get("/reconcile/pending")
+    async def reconcile_pending(identity: ApiIdentity = Depends(require_permission(PERM_READ))):
+        """Service changes detected from an iac-controller diff that wait for approval
+        (above the blast-radius thresholds / dispatch failed) or are deferred behind an
+        active job of the same service. Key names only, never values."""
+        return await _api.do_list_reconcile_pending()
 
     @router.get("/stats")
     async def stats(identity: ApiIdentity = Depends(require_permission(PERM_READ))):
@@ -251,6 +259,33 @@ def build_plugin_router(service) -> APIRouter:
     ):
         """Cancel a parked deploy (SCHEDULED → ABORTED)."""
         return await _api.do_cancel_schedule(job_id)
+
+    @router.post("/reconcile/pending/approve-all")
+    async def reconcile_approve_all(
+        payload: _api.ReconcileApproveRequest | None = None,
+        identity: ApiIdentity = Depends(require_permission(PERM_WRITE)),
+    ):
+        """Queue every *pending* service change as its single_service job (deferred ones
+        are re-queued automatically when their blocking job ends)."""
+        return await _api.do_approve_all_reconcile(payload, requested_by=getattr(identity, "username", None))
+
+    @router.post("/reconcile/pending/{record_id}/approve")
+    async def reconcile_approve(
+        record_id: str,
+        payload: _api.ReconcileApproveRequest | None = None,
+        identity: ApiIdentity = Depends(require_permission(PERM_WRITE)),
+    ):
+        """Queue one pending service change as its single_service job (host-limited).
+        Body: ``{"dry_run": bool, "force": bool}`` — ``force`` skips the maintenance window."""
+        return await _api.do_approve_reconcile(record_id, payload, requested_by=getattr(identity, "username", None))
+
+    @router.post("/reconcile/pending/{record_id}/dismiss")
+    async def reconcile_dismiss(
+        record_id: str,
+        identity: ApiIdentity = Depends(require_permission(PERM_WRITE)),
+    ):
+        """Drop a pending/deferred service change without deploying it."""
+        return await _api.do_dismiss_reconcile(record_id)
 
     @router.post("/deploy/service/{service_name}")
     async def deploy_service(

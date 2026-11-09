@@ -239,6 +239,38 @@ def _build_fields() -> list[SettingField]:
             env_var="PLUGIN_IAC_ORCHESTRATOR_MAINTENANCE_REPORT_MISSING_WINDOW",
             description="Emit maintenance:window_missing when a window deploy runs without a window (ITSM opens a task).",
         ),
+        # ── Service reconcile (plugin 1.7) ────────────────────────────────────
+        # Read by IaCConfig.service_reconcile_* (env > Vault > default). Second opt-in
+        # besides the `service_reconcile` rule in config_engine/pipeline_rules.yml.
+        SettingField(
+            "service_reconcile_mode", "Controller-diff service deploys", kind="select",
+            category="Service Reconcile", default="off",
+            options=["off", "notify", "dry_run", "deploy"],
+            vault_key="iac_service_reconcile_mode",
+            env_var="PLUGIN_IAC_ORCHESTRATOR_SERVICE_RECONCILE_MODE",
+            description=(
+                "What happens when an iac-controller change alters a service's rendered entry "
+                "(profile vars, secrets, …): off = log only, notify = bell/Discord, dry_run = one "
+                "single_service --check job per service limited to the changed hosts, deploy = real deploys. "
+                "Independent of auto_apply."
+            ),
+        ),
+        SettingField(
+            "service_reconcile_max_hosts", "Max hosts per auto job", kind="int",
+            category="Service Reconcile", default=10,
+            vault_key="iac_service_reconcile_max_hosts",
+            env_var="PLUGIN_IAC_ORCHESTRATOR_SERVICE_RECONCILE_MAX_HOSTS",
+            description="A service change touching more hosts than this is not deployed automatically; it waits "
+                        "under /reconcile/pending for approval.",
+        ),
+        SettingField(
+            "service_reconcile_max_services", "Max services per controller change", kind="int",
+            category="Service Reconcile", default=3,
+            vault_key="iac_service_reconcile_max_services",
+            env_var="PLUGIN_IAC_ORCHESTRATOR_SERVICE_RECONCILE_MAX_SERVICES",
+            description="More changed services than this in one controller commit (e.g. an edit to a shared "
+                        "profile) → every one waits for approval.",
+        ),
     ]
 
     # ── Repository Roles (each persisted into repo_<slug>_config JSON) ─────────

@@ -43,9 +43,13 @@ class IaCService:
         self.queue = JobQueue()
         self.engine = DeploymentEngine(ctx, self.state, self.db, self.config, self.socket_client)
         self.engine.queue = self.queue
+        # Service reconcile (1.7): the rule engine queues single_service jobs through the
+        # service so it sees DuplicateJob (→ deferred record) instead of the bus swallowing it.
+        self.engine.enqueue_pipeline = self.enqueue_pipeline
         # Maintenance windows (1.6): a job the queue closes itself (orphan sweep →
-        # mark_failed) still ends its maintenance override exactly once.
-        self.queue.on_terminal = self.engine.end_override_for
+        # mark_failed) still ends its maintenance override exactly once — and (1.7) drains
+        # deferred service-reconcile records whose blocking job just ended.
+        self.queue.on_terminal = self.engine.on_job_terminal
         self.worker: JobWorker | None = None
 
         # Restore the Auto-Apply setting from Vault/Config on boot
