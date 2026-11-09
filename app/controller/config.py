@@ -119,6 +119,18 @@ class IaCConfig:
             if host and host.strip()
         }
 
+    # --- SERVICE RECONCILE (1.5.8: detection + notify; dispatch modes are plugin 1.7) ---
+    SERVICE_RECONCILE_MODES = ("off", "notify", "dry_run", "deploy")
+
+    @property
+    def service_reconcile_mode(self) -> str:
+        """``off`` (default) / ``notify`` — what the ``service_reconcile`` rule action does
+        with a detected service change. ``dry_run`` / ``deploy`` are accepted but act like
+        ``notify`` on the 1.5.x line."""
+        raw = str(self._get("PLUGIN_IAC_ORCHESTRATOR_SERVICE_RECONCILE_MODE",
+                            "iac_service_reconcile_mode", "off")).strip().lower()
+        return raw if raw in self.SERVICE_RECONCILE_MODES else "off"
+
     def get_log_path(self, job_id: int) -> Path:
         return self.logs_dir / f"job_{job_id}.log"
 

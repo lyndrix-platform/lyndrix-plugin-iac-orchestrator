@@ -231,6 +231,145 @@ def test_run_dirs_never_reach_the_rules():
     assert changed == ["onprem/prod/terraform/terraform.tfvars.json"]
 
 
+# ------------------------------------- service reconcile (1.5.8: detection + notify)
+import json as _json  # noqa: E402
+from types import SimpleNamespace  # noqa: E402
+
+
+class _Ctx:
+    def __init__(self):
+        self.notifications = []
+        self.emitted = []
+
+    def notify(self, endpoint, **kw):
+        self.notifications.append((endpoint, kw))
+
+    def emit(self, topic, payload):
+        self.emitted.append((topic, payload))
+
+
+class _Engine:
+    def __init__(self, mode="notify"):
+        self.config = SimpleNamespace(service_reconcile_mode=mode, auto_apply=False)
+        self.ctx = _Ctx()
+
+
+SECRET = "sup3r-s3cret-value"
+PROD = "onprem/prod/ansible/inventory.yml"
+DEV = "onprem/dev/ansible/inventory.yml"
+GLOBAL = "global/ansible/inventory.yml"
+CHANGED = [PROD, DEV, GLOBAL, "onprem/prod/terraform/terraform.tfvars.json"]
+CONTEXT = {"job_id": 7, "inventory_state_commit_sha": "abc123def4567"}
+
+
+def _svc(name, manager="m.old", secret=SECRET):
+    return {"name": name, "config": {"vars": {"WAZUH_MANAGER": manager}, "secrets": {"KEY": secret}}}
+
+
+def _inv(hosts):
+    return {"all": {"hosts": hosts, "children": {}}}
+
+
+def _renders(manager_new="m.new", secret_new=SECRET, prod_hosts=("docker-a", "docker-b", "pve-1")):
+    old_prod = _inv({h: {"services": [_svc("aac-wazuh-agent")]} for h in prod_hosts})
+    new_prod = _inv({h: {"services": [_svc("aac-wazuh-agent", manager_new, secret_new)]} for h in prod_hosts})
+    old_dev = _inv({"docker-dev": {"services": [_svc("aac-wazuh-agent")]}})
+    new_dev = _inv({"docker-dev": {"services": [_svc("aac-wazuh-agent", manager_new, secret_new)]}})
+    return {PROD: (old_prod, new_prod), DEV: (old_dev, new_dev), GLOBAL: (old_prod, new_prod)}
+
+
+def _stage_with_renders(renders, pipeline_type="infra_plan", ref="abc123def4567"):
+    stage = Stage(pipeline_type)
+    stage._ref = ref
+
+    async def fake_git(engine, *args):
+        if args[0] == "show":
+            ref_part, _, path = args[1].partition(":")
+            if path in renders:
+                old, new = renders[path]
+                return (0, _yaml_dump(old if ref_part.endswith("~1") else new))
+        return (1, "missing")
+
+    stage._git = fake_git  # type: ignore[assignment]
+    return stage
+
+
+def _reconcile(engine, renders=None, pipeline_type="infra_plan"):
+    stage = _stage_with_renders(renders or _renders(), pipeline_type)
+    return asyncio.run(stage._run_service_reconcile_action(engine, dict(CONTEXT), {"type": "service_reconcile"}, CHANGED))
+
+
+def test_reconcile_mode_off_detects_but_stays_silent():
+    eng = _Engine("off")
+    res = _reconcile(eng)
+    assert res.success and "mode 'off'" in res.message
+    assert eng.ctx.notifications == [] and eng.ctx.emitted == []
+
+
+def test_reconcile_notify_reports_service_stage_hosts_and_key_names_only():
+    eng = _Engine("notify")
+    res = _reconcile(eng)
+    assert res.success and "notified" in res.message
+    assert len(eng.ctx.notifications) == 1
+    endpoint, kw = eng.ctx.notifications[0]
+    assert endpoint == "service_reconcile" and kw["severity"] == "warning"
+    assert "aac-wazuh-agent (prod, 3 host(s))" in kw["body"]      # global inventory not double counted
+    assert "aac-wazuh-agent (dev, 1 host(s))" in kw["body"]
+    assert "config.vars.WAZUH_MANAGER" in kw["body"]
+    assert kw["notification_id"] == "service_reconcile_abc123d"
+    assert SECRET not in _json.dumps(eng.ctx.notifications, default=str)
+    assert eng.ctx.emitted == []                                    # 1.5.x never queues jobs
+
+
+def test_reconcile_dispatch_modes_act_like_notify_on_the_hotfix_line(caplog):
+    eng = _Engine("deploy")
+    with caplog.at_level(logging.INFO):
+        res = _reconcile(eng)
+    assert res.success and len(eng.ctx.notifications) == 1 and eng.ctx.emitted == []
+    assert "needs plugin ≥ 1.7.0" in caplog.text
+
+
+def test_reconcile_logs_key_names_never_values(caplog):
+    eng = _Engine("notify")
+    with caplog.at_level(logging.INFO):
+        _reconcile(eng, _renders(secret_new="other-s3cret"))
+    assert "config.secrets.KEY" in caplog.text
+    assert SECRET not in caplog.text and "other-s3cret" not in caplog.text
+
+
+def test_reconcile_detection_error_never_fails_the_stage():
+    eng = _Engine("notify")
+    stage = Stage("infra_plan")
+
+    async def broken_git(engine, *args):
+        raise RuntimeError("git exploded")
+
+    stage._git = broken_git  # type: ignore[assignment]
+    res = asyncio.run(stage._run_service_reconcile_action(eng, dict(CONTEXT), {"type": "service_reconcile"}, CHANGED))
+    assert res.success and "error ignored" in res.message
+
+
+def test_reconcile_no_change_is_a_quiet_noop():
+    eng = _Engine("notify")
+    same = _inv({"docker-a": {"services": [_svc("aac-x")]}})
+    res = _reconcile(eng, {PROD: (same, same)})
+    assert res.success and "no service entries changed" in res.message
+    assert eng.ctx.notifications == []
+
+
+def test_run_action_routes_service_reconcile_type():
+    stage = Stage("infra_plan")
+    seen = {}
+
+    async def fake(engine, context, action, changed_files):
+        seen["called"] = (action, changed_files)
+        return rules.StageResult(True, "ok")
+
+    stage._run_service_reconcile_action = fake  # type: ignore[assignment]
+    res = asyncio.run(stage._run_action(None, {}, {"type": "service_reconcile"}, CHANGED, [], {}))
+    assert res.success and seen["called"][1] == CHANGED
+
+
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-v"]))

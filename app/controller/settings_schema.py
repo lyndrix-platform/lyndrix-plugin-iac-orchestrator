@@ -198,6 +198,21 @@ def _build_fields() -> list[SettingField]:
             vault_key="iac_tf_backend_secret_key",
             description="Shared backend secret across all sites/stages.",
         ),
+        # ── Service reconcile (1.5.8: detection + notify) ─────────────────────
+        # Read by IaCConfig.service_reconcile_mode (env > Vault > default). Second opt-in
+        # besides the `service_reconcile` rule in config_engine/pipeline_rules.yml.
+        SettingField(
+            "service_reconcile_mode", "Controller-diff service changes", kind="select",
+            category="Service Reconcile", default="off",
+            options=["off", "notify"],
+            vault_key="iac_service_reconcile_mode",
+            env_var="PLUGIN_IAC_ORCHESTRATOR_SERVICE_RECONCILE_MODE",
+            description=(
+                "What happens when an iac-controller change alters a service's rendered entry "
+                "(profile vars, secrets, …): off = job log only, notify = bell/Discord notification with "
+                "service, stage, host count and changed key names. Automatic deploys need plugin 1.7."
+            ),
+        ),
     ]
 
     # ── Repository Roles (each persisted into repo_<slug>_config JSON) ─────────

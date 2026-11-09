@@ -7,8 +7,16 @@ from core.logger import get_logger
 from .base import BaseStage
 from ..utils import StageResult
 from .ansible import AnsiblePlaybookStage, AsyncBulkRolloutStage
+from . import service_diff as sdiff
 
 log = get_logger("IaC:Engine:Rules")
+
+#: Modes of the ``service_reconcile`` action. The 1.5.x hotfix line implements detection and
+#: ``notify`` only; ``dry_run`` / ``deploy`` (job dispatch, thresholds, approval) are 1.7.0 —
+#: here they behave like ``notify`` and say so in the job log.
+SERVICE_RECONCILE_MODES = ("off", "notify", "dry_run", "deploy")
+#: Shell deep link to the plugin UI (deploy buttons live there).
+_PLUGIN_UI_PATH = "/apps/lyndrix-plugin-iac_orchestrator/iac"
 
 
 class DynamicRuleExecutionStage(BaseStage):
@@ -30,6 +38,13 @@ class DynamicRuleExecutionStage(BaseStage):
                               (``scope: all``) to the captured ``limit``.
         - ``baseline``        run a baseline roles playbook at ``limit``.
         - ``connectivity``    run a read-only connectivity playbook.
+        - ``service_reconcile`` (1.5.8, detection + notify) diff the generated stage
+                              inventories host by host and report which services'
+                              rendered entries changed (profile edits!) — service,
+                              stage, host count and key *names* only. Setting
+                              ``service_reconcile_mode`` ``off`` (default) logs,
+                              ``notify`` also raises a bell/Discord notification.
+                              Job dispatch (``dry_run``/``deploy``) is plugin 1.7.0.
 
       ``limit`` may contain capture variables ``{site}`` / ``{stage}`` derived
       from the changed path (e.g. ``onprem/dev/...`` -> site=onprem, stage=dev).
@@ -332,6 +347,124 @@ class DynamicRuleExecutionStage(BaseStage):
             True, f"Baseline roles: applied {applied} role(s) across {len(host_roles)} host(s)."
         )
 
+    # ----------------------------------- service reconcile (1.5.8: detect + notify)
+    @staticmethod
+    def _reconcile_mode(engine) -> str:
+        raw = str(getattr(getattr(engine, "config", None), "service_reconcile_mode", "off") or "off").strip().lower()
+        return raw if raw in SERVICE_RECONCILE_MODES else "off"
+
+    async def _load_inventory_pair(self, engine, path: str) -> tuple[dict, dict] | None:
+        """``(old, new)`` render of one inventory file at ``ref~1`` / ``ref``; ``None`` when
+        either side is missing or unparsable (first commit → nothing to diff)."""
+        rc_new, new_raw = await self._git(engine, "show", f"{self._ref}:{path}")
+        if rc_new != 0:
+            return None
+        rc_old, old_raw = await self._git(engine, "show", f"{self._ref}~1:{path}")
+        if rc_old != 0:
+            return None
+        try:
+            return (yaml.safe_load(old_raw) or {}), (yaml.safe_load(new_raw) or {})
+        except Exception:
+            return None
+
+    async def _detect_service_changes(self, engine, changed_files: list[str]) -> tuple[dict, dict]:
+        """Diff every changed *stage* inventory. Returns ``(plan, removed)`` with
+        ``plan = {(service, stage): {service, stage, site, sites, hosts, changed_keys}}`` and
+        ``removed = {service: [hosts]}`` (reported only). Values never leave the diff — only
+        key paths such as ``config.vars.WAZUH_MANAGER``."""
+        plan: dict[tuple[str, str], dict] = {}
+        removed_all: dict[str, list[str]] = {}
+        for path in changed_files:
+            scope = sdiff.inventory_path_scope(path)
+            if scope is None:
+                continue
+            site, stage = scope
+            pair = await self._load_inventory_pair(engine, path)
+            if pair is None:
+                continue
+            changed, removed = sdiff.diff_host_services(*pair)
+            for name, change in changed.items():
+                entry = plan.setdefault((name, stage), {
+                    "service": name, "stage": stage, "site": site, "sites": [], "hosts": [], "changed_keys": [],
+                })
+                if site not in entry["sites"]:
+                    entry["sites"].append(site)
+                for host in change.hosts:
+                    if host not in entry["hosts"]:
+                        entry["hosts"].append(host)
+                for key in change.changed_keys:
+                    if key not in entry["changed_keys"]:
+                        entry["changed_keys"].append(key)
+            for name, hosts in removed.items():
+                bucket = removed_all.setdefault(name, [])
+                bucket.extend(h for h in hosts if h not in bucket)
+        return plan, removed_all
+
+    @staticmethod
+    def _reconcile_notify(engine, *, mode: str, entries: list[dict], removed: dict,
+                          inventory_commit: str | None) -> None:
+        """One bell/Discord notification per controller change. Service, stage, host count
+        and key *names* only — never a value (profiles carry plaintext secrets)."""
+        lines = []
+        for entry in entries:
+            keys = ", ".join(entry["changed_keys"][:8]) + (" …" if len(entry["changed_keys"]) > 8 else "")
+            lines.append(f"• {entry['service']} ({entry['stage']}, {len(entry['hosts'])} host(s)) — {keys or '-'} → deploy pending")
+        for name, hosts in sorted(removed.items()):
+            lines.append(f"• {name}: removed on {len(hosts)} host(s) — no automatic cleanup")
+        sha = str(inventory_commit or "")[:7] or "n/a"
+        title = f"Service changes detected ({len(entries)}) — inventory@{sha}"
+        body = "\n".join(lines) + f"\nMode: {mode}. Deploy: {_PLUGIN_UI_PATH}"
+        payload = {
+            "message": body,
+            "mode": mode,
+            "inventory_commit": inventory_commit,
+            "services": [{"service": e["service"], "stage": e["stage"], "hosts": len(e["hosts"]),
+                          "changed_keys": list(e["changed_keys"]), "outcome": "notify"} for e in entries],
+            "removed": {k: len(v) for k, v in removed.items()},
+            "ui_path": _PLUGIN_UI_PATH,
+        }
+        notify = getattr(getattr(engine, "ctx", None), "notify", None)
+        if callable(notify):
+            try:
+                notify("service_reconcile", payload=payload, notification_id=f"service_reconcile_{sha}",
+                       title=title, body=body, severity="warning")
+                return
+            except Exception as exc:
+                log.debug(f"Service reconcile: ctx.notify failed ({exc}); falling back to messaging.")
+        fallback = getattr(engine, "_notify", None)
+        if callable(fallback):
+            fallback(title, body, "warning", notification_id=f"service_reconcile_{sha}", broadcast=True)
+
+    async def _run_service_reconcile_action(self, engine, context, action, changed_files):
+        """Never fails the job: a broken detection is logged, the infra pipeline that carried
+        the rule finishes normally."""
+        try:
+            return await self._service_reconcile(engine, context, action, changed_files)
+        except Exception as exc:
+            log.error(f"Service reconcile failed (ignored, pipeline continues): {type(exc).__name__}: {exc}")
+            return StageResult(True, f"Service reconcile: error ignored ({type(exc).__name__}).")
+
+    async def _service_reconcile(self, engine, context, action, changed_files):
+        mode = self._reconcile_mode(engine)
+        plan, removed = await self._detect_service_changes(engine, changed_files)
+        if not plan and not removed:
+            return StageResult(True, "Service reconcile: no service entries changed.")
+        entries = sorted(plan.values(), key=lambda e: (e["service"], e["stage"]))
+        for entry in entries:
+            log.info(f"Service reconcile: {entry['service']} ({entry['stage']}) changed on {len(entry['hosts'])} host(s): "
+                     f"{', '.join(entry['hosts'])}; keys: {', '.join(entry['changed_keys']) or '-'}")
+        for name, hosts in sorted(removed.items()):
+            log.warning(f"Service reconcile: {name} removed on {len(hosts)} host(s) ({', '.join(hosts)}) — orphan cleanup is not implemented.")
+        if mode == "off":
+            return StageResult(True, f"Service reconcile: {len(entries)} service change(s) detected — mode 'off', nothing dispatched.")
+        if not entries:
+            return StageResult(True, "Service reconcile: only removals detected — nothing to deploy.")
+        if mode in ("dry_run", "deploy"):
+            log.warning(f"Service reconcile: mode '{mode}' needs plugin ≥ 1.7.0 — this release notifies only.")
+        self._reconcile_notify(engine, mode=mode, entries=entries, removed=removed,
+                               inventory_commit=context.get("inventory_state_commit_sha"))
+        return StageResult(True, f"Service reconcile: {len(entries)} service change(s) → notified (deploy manually).")
+
     async def _run_action(self, engine, context, action, changed_files, changed_services, path_vars):
         atype = str(action.get("type", "")).strip().lower()
         if not atype:
@@ -342,6 +475,8 @@ class DynamicRuleExecutionStage(BaseStage):
             return await self._run_service_rollout_action(engine, context, action, changed_services, path_vars)
         if atype == "baseline_role":
             return await self._run_baseline_role_action(engine, context, action, changed_files)
+        if atype == "service_reconcile":
+            return await self._run_service_reconcile_action(engine, context, action, changed_files)
         if atype in ("baseline", "connectivity"):
             playbook = action.get("playbook") or (
                 "playbooks/cd_playbooks/cd_baseline_roles.yml" if atype == "baseline"

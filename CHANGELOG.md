@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.8] - 2026-11-09
+Hotfix line (core 1.10 / API < 1.13). Backport of the **detection + notify** half of 1.7.0 service reconcile; job dispatch, thresholds, approval and the deferred queue stay on main (1.7.0).
+
+### Added
+- Rule action `type: service_reconcile` (`stages/rules.py`, pure diff in `stages/service_diff.py`): after the publish commit, every changed `<site>/<stage>/ansible/inventory.yml` is diffed host by host (`all.hosts[*].services`, canonical JSON → order noise never triggers; the global inventory is skipped so no host counts twice) and reports, per changed service and stage, the hosts whose rendered entry changed and the changed **key paths** (`config.vars.WAZUH_MANAGER`, `+service` for a new entry) — never values (profiles carry plaintext secrets; job logs and notifications go to Discord). Hosts absent from the previous render are skipped; removed entries are reported only. The action never fails the carrying job. Closes the gap where a profile/host edit of service *configuration* triggered nothing after a controller push (the rollout drift check compares service names only).
+- Setting `service_reconcile_mode` (category **Service Reconcile**; env `PLUGIN_IAC_ORCHESTRATOR_SERVICE_RECONCILE_MODE` wins over Vault): `off` (default, job log only) / `notify` (bell + Discord via the new notification endpoint `service_reconcile`: service, stage, host count, key names, UI path). `dry_run`/`deploy` are accepted for forward compatibility and act like `notify` here (job-log warning "needs plugin ≥ 1.7.0").
+- Tests: `tests/test_service_diff.py`, service-reconcile cases in `tests/test_rules.py` (off/notify, dispatch modes act like notify, no values in logs/notifications, detection error never fails the stage).
+- Companion change: rule `Service Reconcile (changed service entries)` in iac-ansible-automation `pipeline_rules.yml` (paths `*/*/ansible/inventory.yml`).
+
 ## [1.5.7] - 2026-11-09
 Hotfix line (core 1.10 / API < 1.13). Same content goes to main.
 
