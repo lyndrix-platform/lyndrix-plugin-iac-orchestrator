@@ -33,6 +33,10 @@ from pydantic import BaseModel, Field
 from .settings_schema import OrchestratorSettings
 from .queue import DuplicateJob as _DuplicateJob
 from . import maintenance_resolver as _mres
+from ...stages.service_diff import (
+    DEFAULT_EXCLUDE_SERVICES as _DEFAULT_EXCLUDE_SERVICES,
+    normalize_service_names as _normalize_service_names,
+)
 
 # Internal references to be set by init_api
 _ctx = None
@@ -820,6 +824,23 @@ def _public_reconcile_record(item: dict) -> dict:
     }
 
 
+def _reconcile_excluded_services() -> list[str]:
+    """Sorted exclude list for the API (setting ``service_reconcile_exclude_services``;
+    the built-in default when the config does not expose it)."""
+    try:
+        excluded = getattr(_engine.config, "service_reconcile_exclude_services", None) if _engine else None
+        if not isinstance(excluded, (set, frozenset, list, tuple, str)):
+            excluded = _DEFAULT_EXCLUDE_SERVICES
+        return sorted(_normalize_service_names(excluded))
+    except Exception:
+        return []
+
+
+def _reconcile_service_excluded(service_name) -> bool:
+    check = getattr(_engine, "reconcile_service_excluded", None)
+    return bool(check(service_name)) if callable(check) else False
+
+
 async def do_list_reconcile_pending():
     """Pending (approval) and deferred (waiting for an active job) service changes."""
     store = _reconcile_store()
@@ -831,6 +852,7 @@ async def do_list_reconcile_pending():
         "pending": sum(1 for i in public if i["status"] == "pending"),
         "deferred": sum(1 for i in public if i["status"] == "deferred"),
         "mode": getattr(_engine.config, "service_reconcile_mode", "off") if _engine else "off",
+        "excluded_services": _reconcile_excluded_services(),
     }
 
 
@@ -839,6 +861,14 @@ async def _approve_record(store, item: dict, options: "ReconcileApproveRequest |
     if not payload.get("service_name"):
         await asyncio.to_thread(store.remove, item["id"])
         raise HTTPException(status_code=409, detail=f"Record {item['id']} has no deployable payload (removed)")
+    if _reconcile_service_excluded(payload.get("service_name")):
+        # An approval must not bypass the exclude list: the record stays for /dismiss, the
+        # deploy (if wanted) goes through the explicit single-service rollout.
+        raise HTTPException(
+            status_code=409,
+            detail=f"{item.get('service')} is excluded from automatic deploys (service_reconcile_exclude_services) — "
+                   f"dismiss the record or deploy it explicitly via the single-service rollout",
+        )
     if options is not None and options.dry_run is not None:
         payload["dry_run"] = bool(options.dry_run)
     if options is not None and options.force:

@@ -271,6 +271,16 @@ def _build_fields() -> list[SettingField]:
             description="More changed services than this in one controller commit (e.g. an edit to a shared "
                         "profile) → every one waits for approval.",
         ),
+        SettingField(
+            "service_reconcile_exclude_services", "Excluded services", category="Service Reconcile",
+            default="aac-hermes-agent",
+            vault_key="iac_service_reconcile_exclude_services",
+            env_var="PLUGIN_IAC_ORCHESTRATOR_SERVICE_RECONCILE_EXCLUDE_SERVICES",
+            description="Comma-separated service names the controller-diff reconcile never deploys — no job, "
+                        "no approval, no deferred re-queue; they only appear as 'excluded' in the notification. "
+                        "Default protects aac-hermes-agent (a single_service deploy tears the agent stack down). "
+                        "Save an empty value to exclude nothing.",
+        ),
     ]
 
     # ── Repository Roles (each persisted into repo_<slug>_config JSON) ─────────

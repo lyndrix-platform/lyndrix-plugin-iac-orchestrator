@@ -1,6 +1,9 @@
 import os
 from pathlib import Path
 
+from ...stages.service_diff import DEFAULT_EXCLUDE_SERVICES, normalize_service_names
+
+
 class IaCConfig:
     def __init__(self, ctx):
         self.ctx = ctx
@@ -182,6 +185,15 @@ class IaCConfig:
         """More changed services than this in ONE controller change → every one waits for approval."""
         return self._get_int("PLUGIN_IAC_ORCHESTRATOR_SERVICE_RECONCILE_MAX_SERVICES",
                              "iac_service_reconcile_max_services", 3, minimum=1)
+
+    @property
+    def service_reconcile_exclude_services(self) -> set[str]:
+        """Services the reconcile action never dispatches — not from the rule, not after an
+        approval, not from the deferred drain (comma-separated, case-insensitive; default
+        ``aac-hermes-agent``). An operator who saves an empty value excludes nothing."""
+        raw = self._get("PLUGIN_IAC_ORCHESTRATOR_SERVICE_RECONCILE_EXCLUDE_SERVICES",
+                        "iac_service_reconcile_exclude_services", ",".join(DEFAULT_EXCLUDE_SERVICES))
+        return normalize_service_names(raw)
 
     def get_log_path(self, job_id: int) -> Path:
         return self.logs_dir / f"job_{job_id}.log"

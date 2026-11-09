@@ -285,9 +285,11 @@ class DuplicateJob(Exception):
 
 
 class _Engine:
-    def __init__(self, mode="deploy", *, max_hosts=10, max_services=3, store=True, enqueue=None):
+    def __init__(self, mode="deploy", *, max_hosts=10, max_services=3, store=True, enqueue=None, exclude=None):
         self.config = SimpleNamespace(service_reconcile_mode=mode, service_reconcile_max_hosts=max_hosts,
                                       service_reconcile_max_services=max_services, auto_apply=False)
+        if exclude is not None:          # None → attribute absent → built-in default applies
+            self.config.service_reconcile_exclude_services = exclude
         self.ctx = _Ctx()
         self.reconcile_store = _Store() if store else None
         self.enqueued = []
@@ -513,6 +515,108 @@ def test_run_action_routes_service_reconcile_type():
     stage._run_service_reconcile_action = fake  # type: ignore[assignment]
     res = asyncio.run(stage._run_action(None, {}, {"type": "service_reconcile"}, CHANGED, [], {}))
     assert res.success and seen["called"][1] == CHANGED
+
+
+# ------------------------------------------------ exclude list (aac-hermes-agent by default)
+HERMES = "aac-hermes-agent"
+
+
+def _renders_with_hermes(hermes_name=HERMES):
+    """prod: wazuh (3 hosts) + hermes (docker-gpu) change; dev: wazuh changes."""
+    base = _renders()
+    old_prod, new_prod = base[PROD]
+    old_prod["all"]["hosts"]["docker-gpu"] = {"services": [_svc(hermes_name, "m.old")]}
+    new_prod["all"]["hosts"]["docker-gpu"] = {"services": [_svc(hermes_name, "m.new")]}
+    return base
+
+
+def _reconcile_with_action(engine, action, renders=None):
+    stage = _stage_with_renders(renders or _renders_with_hermes())
+    return asyncio.run(stage._run_service_reconcile_action(engine, dict(CONTEXT), action, CHANGED))
+
+
+def test_reconcile_excludes_hermes_by_default_and_reports_it_as_excluded():
+    eng = _Engine("deploy")
+    res = _reconcile(eng, _renders_with_hermes())
+    assert res.success and "2 queued, 0 deferred, 0 pending approval, 1 excluded" in res.message
+    assert sorted(p["service_name"] for p in eng.enqueued) == ["aac-wazuh-agent", "aac-wazuh-agent"]
+    assert eng.reconcile_store.items == []                       # no pending/deferred record either
+    endpoint, kw = eng.ctx.notifications[0]
+    assert kw["title"].startswith("Service changes detected (3)")
+    assert f"{HERMES} (prod, 1 host(s))" in kw["body"] and "→ excluded" in kw["body"]
+    assert kw["severity"] == "warning"                           # operator must act by hand
+    by_outcome = {(s["service"], s["outcome"]) for s in kw["payload"]["services"]}
+    assert (HERMES, "excluded") in by_outcome
+    assert kw["payload"]["excluded"] == [HERMES]
+    assert SECRET not in _notification_text(eng)
+
+
+def test_reconcile_exclusion_is_case_insensitive_and_tolerates_spaces():
+    eng = _Engine("deploy", exclude=" AAC-Hermes-Agent ; aac-other,")
+    res = _reconcile(eng, _renders_with_hermes())
+    assert "1 excluded" in res.message
+    assert all(p["service_name"] != HERMES for p in eng.enqueued) and len(eng.enqueued) == 2
+
+
+def test_reconcile_cleared_exclude_setting_dispatches_hermes():
+    eng = _Engine("deploy", exclude="")
+    res = _reconcile(eng, _renders_with_hermes())
+    assert res.success and "3 queued" in res.message and "excluded" not in res.message
+    assert HERMES in {p["service_name"] for p in eng.enqueued}
+
+
+def test_reconcile_rule_parameter_exclude_services_adds_to_the_setting():
+    eng = _Engine("deploy", exclude=set())
+    res = _reconcile_with_action(eng, {"type": "service_reconcile", "exclude_services": ["aac-wazuh-agent"]})
+    assert "1 queued" in res.message and "2 excluded" in res.message
+    assert [p["service_name"] for p in eng.enqueued] == [HERMES]
+    eng2 = _Engine("deploy")
+    res2 = _reconcile_with_action(eng2, {"type": "service_reconcile", "exclude_services": "aac-wazuh-agent"})
+    assert "0 queued" not in res2.message and "3 excluded" in res2.message and eng2.enqueued == []
+
+
+def test_reconcile_only_excluded_changes_notify_but_dispatch_nothing():
+    eng = _Engine("deploy")
+    only_hermes = _inv({"docker-gpu": {"services": [_svc(HERMES, "m.old")]}})
+    only_hermes_new = _inv({"docker-gpu": {"services": [_svc(HERMES, "m.new")]}})
+    res = _reconcile(eng, {PROD: (only_hermes, only_hermes_new)})
+    assert res.success and "1 excluded service change(s) only" in res.message
+    assert eng.enqueued == [] and eng.reconcile_store.items == [] and eng.ctx.emitted == []
+    assert len(eng.ctx.notifications) == 1 and "→ excluded" in eng.ctx.notifications[0][1]["body"]
+
+
+def test_reconcile_excluded_services_do_not_count_against_max_services():
+    eng = _Engine("deploy", max_services=2)
+    res = _reconcile(eng, _renders_with_hermes())                 # wazuh prod + wazuh dev + hermes prod
+    assert "2 queued, 0 deferred, 0 pending approval, 1 excluded" in res.message
+    assert eng.reconcile_store.items == []
+
+
+def test_reconcile_excluded_in_notify_mode_and_mode_off():
+    eng = _Engine("notify")
+    res = _reconcile(eng, _renders_with_hermes())
+    assert "notify only, 1 excluded" in res.message
+    body = eng.ctx.notifications[0][1]["body"]
+    assert f"{HERMES} (prod, 1 host(s))" in body and "→ excluded" in body
+    assert "aac-wazuh-agent (prod, 3 host(s))" in body and "→ notify only" in body
+    off = _Engine("off")
+    res_off = _reconcile(off, _renders_with_hermes())
+    assert "2 service change(s) detected, 1 excluded — mode 'off'" in res_off.message
+    assert off.ctx.notifications == [] and off.enqueued == []
+
+
+def test_reconcile_excluded_is_logged_without_values(caplog):
+    eng = _Engine("deploy")
+    with caplog.at_level(logging.INFO):
+        _reconcile(eng, _renders_with_hermes())
+    assert "EXCLUDED" in caplog.text and HERMES in caplog.text
+    assert SECRET not in caplog.text and "m.new" not in caplog.text
+
+
+def test_reconcile_excluded_helper_falls_back_to_default_without_config():
+    assert Stage._reconcile_excluded(SimpleNamespace(), None) == {HERMES}
+    assert Stage._reconcile_excluded(None, {"exclude_services": "aac-x"}) == {HERMES, "aac-x"}
+    assert Stage._reconcile_excluded(_Engine(exclude=set()), {}) == set()
 
 
 if __name__ == "__main__":

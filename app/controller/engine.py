@@ -34,6 +34,7 @@ from ...stages.ansible import (
     service_rollout_selector
 )
 from ...stages.rules import DynamicRuleExecutionStage
+from ...stages.service_diff import DEFAULT_EXCLUDE_SERVICES, is_excluded, normalize_service_names
 
 log = logging.getLogger("IaC:Engine")
 
@@ -1715,6 +1716,16 @@ class DeploymentEngine:
     # Service reconcile (1.7): deferred detections re-queued when the blocking job ends
     # ------------------------------------------------------------------
 
+    def reconcile_service_excluded(self, service_name) -> bool:
+        """``True`` when the setting ``service_reconcile_exclude_services`` lists the service.
+        Such a service is never dispatched by service reconcile — not by the rule, not by an
+        operator approval, not by the deferred drain. Without a readable setting (older
+        config, tests) the built-in default (``aac-hermes-agent``) applies."""
+        excluded = getattr(getattr(self, "config", None), "service_reconcile_exclude_services", None)
+        if not isinstance(excluded, (set, frozenset, list, tuple, str)):
+            excluded = DEFAULT_EXCLUDE_SERVICES
+        return is_excluded(service_name, normalize_service_names(excluded))
+
     def drain_deferred_reconcile(self) -> list[int]:
         """Re-queue every *deferred* service-reconcile record (its ``single_service`` job was
         refused as DuplicateJob while the same service was queued/running). Idempotent and
@@ -1735,6 +1746,13 @@ class DeploymentEngine:
             payload = dict(record.get("payload") or {})
             if not payload.get("service_name"):
                 store.remove(record["id"])
+                continue
+            if self.reconcile_service_excluded(payload.get("service_name")):
+                # The exclude list may have changed after the record was deferred — an
+                # excluded service never leaves the store as a job.
+                store.remove(record["id"])
+                log.warning(f"RECONCILE: deferred {record.get('service')} ({record.get('stage')}) dropped — service is "
+                            f"excluded from automatic deploys (service_reconcile_exclude_services).")
                 continue
             try:
                 job_id = enqueue(payload, requested_by="controller-diff")

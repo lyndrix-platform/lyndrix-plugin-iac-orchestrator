@@ -51,8 +51,11 @@ class DynamicRuleExecutionStage(BaseStage):
                               (``off`` default / ``notify`` / ``dry_run`` / ``deploy``);
                               above ``service_reconcile_max_hosts`` /
                               ``service_reconcile_max_services`` the change waits for
-                              operator approval (``/reconcile/pending``). Never fails
-                              the job.
+                              operator approval (``/reconcile/pending``). Services in the
+                              setting ``service_reconcile_exclude_services`` (default
+                              ``aac-hermes-agent``) or the rule parameter
+                              ``exclude_services`` are only reported, never dispatched.
+                              Never fails the job.
 
       ``limit`` may contain capture variables ``{site}`` / ``{stage}`` derived
       from the changed path (e.g. ``onprem/dev/...`` -> site=onprem, stage=dev).
@@ -368,6 +371,21 @@ class DynamicRuleExecutionStage(BaseStage):
         except (TypeError, ValueError):
             return default
 
+    @staticmethod
+    def _reconcile_excluded(engine, action) -> set[str]:
+        """Services this action never dispatches: the setting
+        ``service_reconcile_exclude_services`` (default ``aac-hermes-agent``; an operator who
+        clears it excludes nothing) plus the rule parameter ``exclude_services`` (list or comma
+        string in ``pipeline_rules.yml``). Normalised, case-insensitive."""
+        cfg = getattr(engine, "config", None)
+        if cfg is not None and hasattr(cfg, "service_reconcile_exclude_services"):
+            excluded = sdiff.normalize_service_names(getattr(cfg, "service_reconcile_exclude_services"))
+        else:
+            excluded = sdiff.normalize_service_names(sdiff.DEFAULT_EXCLUDE_SERVICES)
+        if isinstance(action, dict):
+            excluded |= sdiff.normalize_service_names(action.get("exclude_services"))
+        return excluded
+
     async def _load_inventory_pair(self, engine, path: str) -> tuple[dict, dict] | None:
         """``(old, new)`` render of one inventory file at ``ref~1`` / ``ref``; ``None`` when
         either side is missing or unparsable (first commit → nothing to diff)."""
@@ -454,21 +472,31 @@ class DynamicRuleExecutionStage(BaseStage):
 
     @staticmethod
     def _reconcile_notify(engine, *, mode: str, entries: list[dict], removed: dict, outcomes: dict,
-                          inventory_commit: str | None, note: str) -> None:
+                          inventory_commit: str | None, note: str, excluded: list[dict] | None = None) -> None:
         """One bell/Discord notification per controller change. Service, stage, host count,
-        key *names* and the outcome — never a value (profiles carry plaintext secrets)."""
+        key *names* and the outcome — never a value (profiles carry plaintext secrets).
+        ``excluded`` entries are listed with outcome ``excluded`` so the operator sees the
+        change exists but was deliberately not deployed."""
+        excluded = excluded or []
         lines = []
+
+        def _keys(entry: dict) -> str:
+            return ", ".join(entry["changed_keys"][:8]) + (" …" if len(entry["changed_keys"]) > 8 else "")
+
         for entry in entries:
             key = (entry["service"], entry["stage"])
             outcome = outcomes.get(key, note)
-            keys = ", ".join(entry["changed_keys"][:8]) + (" …" if len(entry["changed_keys"]) > 8 else "")
-            lines.append(f"• {entry['service']} ({entry['stage']}, {len(entry['hosts'])} host(s)) — {keys or '-'} → {outcome}")
+            lines.append(f"• {entry['service']} ({entry['stage']}, {len(entry['hosts'])} host(s)) — {_keys(entry) or '-'} → {outcome}")
+        for entry in excluded:
+            lines.append(f"• {entry['service']} ({entry['stage']}, {len(entry['hosts'])} host(s)) — {_keys(entry) or '-'} "
+                         f"→ excluded (never deployed automatically — deploy by hand if intended)")
         for name, hosts in sorted(removed.items()):
             lines.append(f"• {name}: removed on {len(hosts)} host(s) — no automatic cleanup")
         sha = str(inventory_commit or "")[:7] or "n/a"
-        title = f"Service changes detected ({len(entries)}) — inventory@{sha}"
+        title = f"Service changes detected ({len(entries) + len(excluded)}) — inventory@{sha}"
         body = "\n".join(lines) + f"\nMode: {mode}. Deploy / approve: {_PLUGIN_UI_PATH}"
-        attention = mode == "notify" or any(str(v).startswith(("pending", "deferred", "notify")) for v in outcomes.values())
+        attention = (mode == "notify" or bool(excluded)
+                     or any(str(v).startswith(("pending", "deferred", "notify")) for v in outcomes.values()))
         severity = "warning" if attention else "info"
         payload = {
             "message": body,
@@ -476,7 +504,10 @@ class DynamicRuleExecutionStage(BaseStage):
             "inventory_commit": inventory_commit,
             "services": [{"service": e["service"], "stage": e["stage"], "hosts": len(e["hosts"]),
                           "changed_keys": list(e["changed_keys"]),
-                          "outcome": outcomes.get((e["service"], e["stage"]), note)} for e in entries],
+                          "outcome": outcomes.get((e["service"], e["stage"]), note)} for e in entries]
+                        + [{"service": e["service"], "stage": e["stage"], "hosts": len(e["hosts"]),
+                            "changed_keys": list(e["changed_keys"]), "outcome": "excluded"} for e in excluded],
+            "excluded": sorted({e["service"] for e in excluded}),
             "removed": {k: len(v) for k, v in removed.items()},
             "ui_path": _PLUGIN_UI_PATH,
         }
@@ -507,23 +538,38 @@ class DynamicRuleExecutionStage(BaseStage):
         if not plan and not removed:
             return StageResult(True, "Service reconcile: no service entries changed.")
         entries = sorted(plan.values(), key=lambda e: (e["service"], e["stage"]))
+        # Excluded services (setting / rule parameter) leave the dispatch path right here:
+        # they never become a job, a pending record or a deferred one — only a log line and an
+        # "excluded" item in the notification. They also do not count against max_services.
+        excluded_names = self._reconcile_excluded(engine, action)
+        excluded = [e for e in entries if sdiff.is_excluded(e["service"], excluded_names)]
+        entries = [e for e in entries if not sdiff.is_excluded(e["service"], excluded_names)]
         for entry in entries:
             log.info(f"Service reconcile: {entry['service']} ({entry['stage']}) changed on {len(entry['hosts'])} host(s): "
                      f"{', '.join(entry['hosts'])}; keys: {', '.join(entry['changed_keys']) or '-'}")
+        for entry in excluded:
+            log.warning(f"Service reconcile: {entry['service']} ({entry['stage']}) changed on {len(entry['hosts'])} host(s) "
+                        f"({', '.join(entry['hosts'])}); keys: {', '.join(entry['changed_keys']) or '-'} — EXCLUDED from "
+                        f"automatic deploys (service_reconcile_exclude_services / rule exclude_services), nothing dispatched.")
         for name, hosts in sorted(removed.items()):
             log.warning(f"Service reconcile: {name} removed on {len(hosts)} host(s) ({', '.join(hosts)}) — orphan cleanup is not implemented.")
+        excluded_note = f", {len(excluded)} excluded" if excluded else ""
         if mode == "off":
-            return StageResult(True, f"Service reconcile: {len(entries)} service change(s) detected — mode 'off', nothing dispatched.")
-        if not entries:
-            return StageResult(True, "Service reconcile: only removals detected — nothing to deploy.")
+            return StageResult(True, f"Service reconcile: {len(entries)} service change(s) detected{excluded_note} — mode 'off', nothing dispatched.")
 
         inventory_commit = context.get("inventory_state_commit_sha")
         outcomes: dict[tuple[str, str], str] = {}
+        if not entries:
+            if excluded:
+                self._reconcile_notify(engine, mode=mode, entries=[], excluded=excluded, removed=removed, outcomes=outcomes,
+                                       inventory_commit=inventory_commit, note="n/a")
+                return StageResult(True, f"Service reconcile: {len(excluded)} excluded service change(s) only — nothing to deploy.")
+            return StageResult(True, "Service reconcile: only removals detected — nothing to deploy.")
         if mode == "notify" or self.pipeline_type == "rollout":
             note = "notify only" if mode == "notify" else "notify only (rollout pipeline deploys inline)"
-            self._reconcile_notify(engine, mode=mode, entries=entries, removed=removed, outcomes=outcomes,
+            self._reconcile_notify(engine, mode=mode, entries=entries, excluded=excluded, removed=removed, outcomes=outcomes,
                                    inventory_commit=inventory_commit, note=note)
-            return StageResult(True, f"Service reconcile: {len(entries)} service change(s) → {note}.")
+            return StageResult(True, f"Service reconcile: {len(entries)} service change(s) → {note}{excluded_note}.")
 
         max_hosts = self._reconcile_limit(engine, "service_reconcile_max_hosts", 10)
         max_services = self._reconcile_limit(engine, "service_reconcile_max_services", 3)
@@ -577,9 +623,9 @@ class DynamicRuleExecutionStage(BaseStage):
                 if record is not None:
                     await asyncio.to_thread(store.update, record["id"], reason=f"dispatch failed: {detail}")
                 log.error(f"Service reconcile: dispatch of {entry['service']} ({entry['stage']}) failed: {detail} — kept as pending.")
-        self._reconcile_notify(engine, mode=mode, entries=entries, removed=removed, outcomes=outcomes,
+        self._reconcile_notify(engine, mode=mode, entries=entries, excluded=excluded, removed=removed, outcomes=outcomes,
                                inventory_commit=inventory_commit, note="n/a")
-        return StageResult(True, f"Service reconcile ({mode}): {queued} queued, {deferred} deferred, {pending} pending approval.")
+        return StageResult(True, f"Service reconcile ({mode}): {queued} queued, {deferred} deferred, {pending} pending approval{excluded_note}.")
 
     async def _run_action(self, engine, context, action, changed_files, changed_services, path_vars):
         atype = str(action.get("type", "")).strip().lower()
