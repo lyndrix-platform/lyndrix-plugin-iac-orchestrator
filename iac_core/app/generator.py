@@ -52,6 +52,29 @@ def discover_stages(inventory_dir: Path, site: str) -> List[str]:
         return []
     return [d.name for d in stages_path.iterdir() if d.is_dir()]
 
+def merge_services_by_name(base: List[Any], incoming: List[Any]) -> List[Any]:
+    """Merge ``incoming`` service entries into ``base`` keyed by ``name``.
+
+    An entry whose name already exists is deep-merged ON TOP of the existing
+    one (incoming wins, nested dicts merge), so a host can override a single
+    value of a profile-provided service without restating the whole entry.
+    Without this the generic list merge appended a second, partial entry with
+    the same name — and the single-service rollout (``| first``) silently used
+    the profile entry while the full host rollout deployed both in sequence.
+    Entries without a name keep the old unique-append behaviour.
+    """
+    index = {svc.get("name"): svc for svc in base if isinstance(svc, dict) and svc.get("name")}
+    for svc in incoming:
+        name = svc.get("name") if isinstance(svc, dict) else None
+        if name and name in index:
+            unique_merger.merge(index[name], copy.deepcopy(svc))
+        elif svc not in base:
+            base.append(copy.deepcopy(svc))
+            if name:
+                index[name] = base[-1]
+    return base
+
+
 def resolve_profiles(config: Dict[str, Any]) -> None:
     """Generic engine to merge profiles into nodes."""
     profiles = config.get("profiles", {})
@@ -64,17 +87,25 @@ def resolve_profiles(config: Dict[str, Any]) -> None:
         assigned = node.pop("profiles", [])
         if not assigned:
             return
-        
+
         merged = {}
+        services: List[Any] = []
         for p in assigned:
             if p in profiles:
                 # FIX 1: Deepcopy prevents shared memory mutation across multiple hosts
-                unique_merger.merge(merged, copy.deepcopy(profiles[p]))
+                profile = copy.deepcopy(profiles[p])
+                merge_services_by_name(services, profile.pop("services", None) or [])
+                unique_merger.merge(merged, profile)
             else:
                 log.warning(f"Profile '{p}' referenced but not found.")
-        
-        # Merge original host data ON TOP of profile data
+
+        # Merge original host data ON TOP of profile data; same-named services
+        # are merged per entry (host wins) instead of being appended twice.
+        host_services = node.pop("services", None) or []
         unique_merger.merge(merged, node)
+        merge_services_by_name(services, host_services)
+        if services:
+            merged["services"] = services
         node.clear()
         node.update(merged)
 
