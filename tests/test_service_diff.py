@@ -139,6 +139,24 @@ def test_inventory_path_scope_and_branch_mapping():
     assert sd.branch_for_stage("staging") == "main"
 
 
+def test_normalize_service_names_accepts_strings_and_iterables():
+    assert sd.normalize_service_names(None) == set()
+    assert sd.normalize_service_names("") == set()
+    assert sd.normalize_service_names(" AAC-Hermes-Agent, aac-x ;aac-y\naac-z,,") == {"aac-hermes-agent", "aac-x", "aac-y", "aac-z"}
+    assert sd.normalize_service_names(["aac-a", " AAC-B ", None, "aac-c,aac-d"]) == {"aac-a", "aac-b", "aac-c", "aac-d"}
+    assert sd.normalize_service_names({"aac-a"}) == {"aac-a"}
+
+
+def test_is_excluded_is_case_insensitive_and_default_protects_hermes():
+    excluded = sd.normalize_service_names(sd.DEFAULT_EXCLUDE_SERVICES)
+    assert excluded == {"aac-hermes-agent"}
+    assert sd.is_excluded("aac-hermes-agent", excluded)
+    assert sd.is_excluded(" AAC-HERMES-AGENT ", excluded)
+    assert not sd.is_excluded("aac-wazuh-agent", excluded)
+    assert not sd.is_excluded(None, excluded)
+    assert not sd.is_excluded("aac-hermes-agent", set())
+
+
 def test_changed_keys_are_capped():
     old = {"name": "aac-x", "config": {"vars": {f"K{i}": "a" for i in range(80)}}}
     new = {"name": "aac-x", "config": {"vars": {f"K{i}": "b" for i in range(80)}}}

@@ -89,10 +89,21 @@ Job shape (`trigger: controller-diff`): `service_name`, `service_branch` (`main`
 |---|---|---|
 | `service_reconcile_max_hosts` | 10 | more hosts in one job → **pending approval** |
 | `service_reconcile_max_services` | 3 | more services in one controller change (e.g. an edit to `docker_standard`) → every one pending |
+| `service_reconcile_exclude_services` | `aac-hermes-agent` | comma-separated, case-insensitive: **never dispatched** — not from the rule, not after an approval (409), not from the deferred drain; only logged and listed as `excluded` in the notification |
+
+Excluded services exist because a `single_service` deploy tears the whole compose stack down
+and recreates it (`compose down` + `docker rm -f <name>*`). For the AI agent on docker-gpu
+that is an outage mid-session, so a controller diff only reports it and the operator deploys
+it deliberately via the single-service rollout. The rule itself can add more names
+(`exclude_services: [aac-x, aac-y]` or a comma string on the `service_reconcile` action);
+excluded entries do not count against `max_services`. Save an empty setting to exclude
+nothing. There is no other per-service protection in the deploy chain:
+`deployment_strategy.<branch>.enabled` in the service repo (→ `deployment_enabled` gatekeeper
+in `cd_rollout_single_service.yml`) is `true` for aac-hermes-agent on `main`.
 
 Pending and deferred records live in the shared DB (every instance sees them):
 
-- `GET /reconcile/pending` → `{items[], count, pending, deferred, mode}`; each item carries
+- `GET /reconcile/pending` → `{items[], count, pending, deferred, mode, excluded_services[]}`; each item carries
   `id, status (pending|deferred), reason, service, stage, site, branch, hosts, changed_keys,
   dry_run, waiting_for_job, inventory_commit, source_job_id`.
 - `POST /reconcile/pending/{id}/approve` body `{"dry_run": bool|null, "force": bool}` → queues

@@ -1,9 +1,14 @@
 """Engine side of service reconcile (1.7): host-limited single_service jobs, the
-``controller-diff`` trigger under the maintenance policy, and the deferred drain.
-Needs the core on the path (see conftest)."""
+``controller-diff`` trigger under the maintenance policy, the deferred drain and the
+exclude list on the approval path. Needs the core on the path (see conftest)."""
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
+from fastapi import HTTPException
+
+from iac_plugin.app.controller import api as api_mod
 from iac_plugin.app.controller import maintenance_resolver as mres
 from iac_plugin.app.controller.engine import DeploymentEngine, SingleServiceStrategy
 from iac_plugin.app.controller.queue import DuplicateJob
@@ -126,3 +131,60 @@ def test_on_job_terminal_ends_override_and_drains():
     eng.reconcile_store.add(payload=_payload(), status="deferred", reason="w", waiting_for_job=3)
     eng.on_job_terminal(3)          # queue is None → end_override_for is a no-op, drain still runs
     assert eng.reconcile_store.list() == []
+
+
+# --- exclude list (default aac-hermes-agent) on the engine + approval paths ------------
+
+HERMES = "aac-hermes-agent"
+
+
+def test_reconcile_service_excluded_reads_the_setting_or_the_default():
+    eng = _engine(lambda p, requested_by=None: 1)
+    assert eng.reconcile_service_excluded(HERMES)                    # config has no attr → default
+    assert eng.reconcile_service_excluded(" AAC-HERMES-AGENT ")
+    assert not eng.reconcile_service_excluded("aac-wazuh-agent")
+    eng.config.service_reconcile_exclude_services = {"aac-wazuh-agent"}
+    assert eng.reconcile_service_excluded("aac-wazuh-agent") and not eng.reconcile_service_excluded(HERMES)
+    eng.config.service_reconcile_exclude_services = set()           # operator cleared the list
+    assert not eng.reconcile_service_excluded(HERMES)
+
+
+def test_drain_drops_a_deferred_record_of_an_excluded_service_without_queueing():
+    queued = []
+    eng = _engine(lambda p, requested_by=None: queued.append(p) or 5)
+    eng.reconcile_store.add(payload=_payload(HERMES), status="deferred", reason="w", waiting_for_job=1)
+    eng.reconcile_store.add(payload=_payload("aac-y"), status="deferred", reason="w", waiting_for_job=1)
+    assert eng.drain_deferred_reconcile() == [5]
+    assert [p["service_name"] for p in queued] == ["aac-y"]
+    assert eng.reconcile_store.list() == []                          # hermes record removed, never queued
+
+
+def _api_env(monkeypatch, enqueue):
+    eng = _engine(enqueue)
+    monkeypatch.setattr(api_mod, "_engine", eng)
+    monkeypatch.setattr(api_mod, "_service", SimpleNamespace(enqueue_pipeline=enqueue))
+    return eng
+
+
+def test_approve_refuses_an_excluded_service_and_keeps_the_record(monkeypatch):
+    queued = []
+    eng = _api_env(monkeypatch, lambda p, requested_by=None: queued.append(p) or 8)
+    rec = eng.reconcile_store.add(payload=_payload(HERMES), status="pending", reason="dispatch failed: x")
+    with pytest.raises(HTTPException) as info:
+        asyncio.run(api_mod.do_approve_reconcile(rec["id"], api_mod.ReconcileApproveRequest(force=True)))
+    assert info.value.status_code == 409 and "excluded" in str(info.value.detail)
+    assert queued == [] and eng.reconcile_store.get(rec["id"]) is not None   # still there for /dismiss
+    listing = asyncio.run(api_mod.do_list_reconcile_pending())
+    assert listing["excluded_services"] == [HERMES] and listing["pending"] == 1
+
+
+def test_approve_all_skips_excluded_and_queues_the_rest(monkeypatch):
+    queued = []
+    eng = _api_env(monkeypatch, lambda p, requested_by=None: queued.append(p) or 9)
+    eng.reconcile_store.add(payload=_payload(HERMES), status="pending", reason="x")
+    eng.reconcile_store.add(payload=_payload("aac-y"), status="pending", reason="x")
+    out = asyncio.run(api_mod.do_approve_all_reconcile())
+    assert out["queued"] == 1 and [p["service_name"] for p in queued] == ["aac-y"]
+    statuses = {r.get("status") for r in out["results"]}
+    assert statuses == {"queued", "error"}
+    assert [i["service"] for i in eng.reconcile_store.list()] == [HERMES]

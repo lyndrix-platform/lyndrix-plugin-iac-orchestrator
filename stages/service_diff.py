@@ -21,6 +21,37 @@ MAX_CHANGED_KEYS = 50
 
 _BRANCH_FOR_STAGE = {"prod": "main", "dev": "dev", "test": "test"}
 
+#: Services the ``service_reconcile`` action never dispatches unless the operator clears the
+#: setting ``service_reconcile_exclude_services``. The single_service playbook tears the whole
+#: compose stack down and recreates it (cd_rollout_single_service.yml: compose down + ``docker rm
+#: -f`` by name prefix) — for the AI agent (aac-hermes-agent) that is a hard outage mid-session,
+#: so a controller diff only *reports* it and the operator deploys deliberately.
+DEFAULT_EXCLUDE_SERVICES = ("aac-hermes-agent",)
+
+
+def normalize_service_names(values) -> set[str]:
+    """Lower-cased, stripped service names from a comma/semicolon/newline separated string or
+    an iterable (``None``/empty → empty set). The one normalisation every exclude-list check
+    uses (setting, rule parameter, approval, deferred drain), so a stray space or capital letter
+    in the settings dialog never un-protects a service."""
+    if values is None:
+        return set()
+    if isinstance(values, str):
+        parts = values.replace(";", ",").replace("\n", ",").split(",")
+    else:
+        parts = []
+        for value in values:
+            if isinstance(value, str):
+                parts.extend(value.replace(";", ",").split(","))
+            elif value is not None:
+                parts.append(str(value))
+    return {p.strip().lower() for p in parts if p and p.strip()}
+
+
+def is_excluded(service, excluded: set[str]) -> bool:
+    """``True`` when ``service`` is in the (normalised) exclude set — case-insensitive."""
+    return str(service or "").strip().lower() in excluded
+
 
 @dataclass
 class ServiceChange:
