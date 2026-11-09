@@ -49,7 +49,9 @@ SOURCE = "iac-orchestrator"
 #: rollouts, "run now" (``force``) — runs at once.
 # "bus" = a trigger whose origin could not vouch for itself (job_payload.UNTRUSTED_TRIGGER):
 # it is governed by the policy and can never claim "run now".
-POLICY_TRIGGERS = frozenset({"gitlab-ci", "webhook", "gitlab_pipeline_success", "bus"})
+#: ``controller-diff`` (1.8): jobs the ``service_reconcile`` rule queues from an iac-controller
+#: change are automatic deploys too — prod services with ``deploy_policy: window`` are parked.
+POLICY_TRIGGERS = frozenset({"gitlab-ci", "webhook", "gitlab_pipeline_success", "bus", "controller-diff"})
 
 #: Stages whose services default to ``deploy_policy: window``.
 WINDOW_DEFAULT_STAGES = frozenset({"prod"})

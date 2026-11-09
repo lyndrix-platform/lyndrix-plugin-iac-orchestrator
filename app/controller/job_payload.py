@@ -50,16 +50,24 @@ _LABEL_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.:-]{0,63}$")
 _PROJECT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,254}$")
 _SHA_RE = re.compile(r"^[0-9a-fA-F]{7,64}$")
 _MAX_TARGET_SERVICES = 500
+_MAX_TARGET_HOSTS = 500
+# A changed key path of a service entry ("config.vars.WAZUH_MANAGER", "+service") — a
+# name, never a value; shown in the UI and in notifications.
+_KEY_PATH_RE = re.compile(r"^[A-Za-z0-9_+\-][A-Za-z0-9_.+\-\[\]:/]{0,199}$")
+_MAX_CHANGED_KEYS = 200
 
-_NAME_KEYS = ("service_name", "service_branch", "host_name", "test_host", "limit")
+_NAME_KEYS = ("service_name", "service_branch", "host_name", "test_host", "limit",
+              # service reconcile (1.8): provenance of a controller-diff job
+              "stage", "site")
 _BOOL_KEYS = ("dry_run", "manual", "adopt_existing", "skip_bootstrap", "skip_service_deploy", "require_prod_branch",
               "skip_rollout", "approve", "force")
 _LABEL_KEYS = ("trigger", "source")
-_INT_KEYS = ("plan_job_id", "source_pipeline_id", "followup_of")
-_SHA_KEYS = ("plan_controller_sha",)
+_INT_KEYS = ("plan_job_id", "source_pipeline_id", "followup_of", "source_job_id")
+_SHA_KEYS = ("plan_controller_sha", "controller_sha", "inventory_commit")
 #: Every field a job payload may carry. Anything else is refused (see the module
 #: docstring) — except ``_``-prefixed transport fields of the bus (``_origin``).
 KNOWN_KEYS = frozenset({"pipeline_type", "target_services", "project_path", "plan_expected",
+                        "target_hosts", "changed_keys", "approved_by",
                         *_NAME_KEYS, *_BOOL_KEYS, *_LABEL_KEYS, *_INT_KEYS, *_SHA_KEYS})
 
 
@@ -145,6 +153,25 @@ def validate_structure(payload: Any) -> dict:
         if not isinstance(services, (list, tuple)) or len(services) > _MAX_TARGET_SERVICES:
             raise InvalidJobPayload("target_services must be a list of service names")
         out["target_services"] = [_name(s, "target_services entry") for s in services]
+    if src.get("target_hosts") not in (None, "", [], ()):
+        # Host limit of a single_service job (service reconcile, 1.8). It becomes the
+        # ansible --limit pattern "h1:h2:&service_<name>", so every entry is a strict
+        # name token — no pattern characters (":", "&", "!", "*", ","). Sorted and
+        # de-duplicated: the same set of hosts is the same work (queue.covers).
+        hosts = src["target_hosts"]
+        if ptype != "single_service":
+            raise InvalidJobPayload("target_hosts is only valid for single_service")
+        if not isinstance(hosts, (list, tuple)) or len(hosts) > _MAX_TARGET_HOSTS:
+            raise InvalidJobPayload("target_hosts must be a list of host names")
+        out["target_hosts"] = sorted({_name(h, "target_hosts entry") for h in hosts})
+    if src.get("changed_keys") not in (None, "", [], ()):
+        keys = src["changed_keys"]
+        if not isinstance(keys, (list, tuple)):
+            raise InvalidJobPayload("changed_keys must be a list of key paths")
+        out["changed_keys"] = [str(k) for k in list(keys)[:_MAX_CHANGED_KEYS] if _KEY_PATH_RE.fullmatch(str(k))]
+    if src.get("approved_by") not in (None, ""):
+        # Who approved a pending service change — a label for the history, nothing reads it.
+        out["approved_by"] = re.sub(r"[^A-Za-z0-9_.@:+ -]", "_", str(src["approved_by"]))[:64]
     for key in _BOOL_KEYS:
         if key in src and src[key] is not None:
             out[key] = _flag(src[key])

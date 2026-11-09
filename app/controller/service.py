@@ -67,10 +67,15 @@ class IaCService:
         self.engine.submit_job_ex = self.submit_job_ex
         # Maintenance windows (1.6): a job the queue closes itself (orphan sweep →
         # mark_failed) still ends its maintenance override exactly once.
-        self.queue.on_terminal = self.engine.end_override_for
+        # (1.8) … and drains deferred service-reconcile records whose blocking job ended.
+        self.queue.on_terminal = self.engine.on_job_terminal
         # A closed job keeps a lock it did not release for as long as the orphan
         # sweep would wait for its container (review C2).
         self.queue.lock_takeover_grace = lambda: self.config.orphan_sweep_container_grace_seconds
+        # Service reconcile (1.8): the rule engine queues single_service jobs through the
+        # service so it sees DuplicateJob (→ deferred record) instead of the bus swallowing
+        # it. The queue validates every payload it stores (job_payload.validate_structure).
+        self.engine.enqueue_pipeline = self.enqueue_pipeline
         self.worker: JobWorker | None = None
         # Jobs adopted from a previous incarnation whose containers are not known
         # yet (Docker did not answer, review C1). They stay RUNNING and are

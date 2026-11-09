@@ -193,6 +193,17 @@ manifest = ModuleManifest(
             internal_persist=True,
             external_default=True,
         ),
+        NotificationEndpoint(
+            name="service_reconcile",
+            description=(
+                "An iac-controller change altered rendered service entries (profile vars, secrets): "
+                "which services/stages/hosts and what was queued, deferred or waits for approval. Key names only."
+            ),
+            default_active=True,
+            internal_toast=True,
+            internal_persist=True,
+            external_default=True,
+        ),
     ],
 )
 
