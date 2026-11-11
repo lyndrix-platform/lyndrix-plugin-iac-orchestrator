@@ -119,7 +119,7 @@ WEBHOOK = {
 }
 
 
-def test_outside_window_parks_job_as_scheduled(env):
+def test_outside_window_parks_job_as_scheduled(env, monkeypatch):
     _controller(env.ctrl, windows=[SUN], policy="window")
     jid = _claimed_job(env.queue, WEBHOOK)
     stage = MaintenancePolicyStage("svc-a", "main", WEBHOOK, clock=lambda: NOW)
@@ -138,7 +138,15 @@ def test_outside_window_parks_job_as_scheduled(env):
     # parked → no override, no window_missing
     assert _emits(env.engine.ctx, mw.TOPIC_OVERRIDE_STARTED) == []
     assert _emits(env.engine.ctx, mw.TOPIC_WINDOW_MISSING) == []
-    # not due yet → the claim leaves it alone
+    # not due yet → the claim leaves it alone. The queue compares against the REAL
+    # process clock; pin it to the test's NOW, otherwise this test turns red once the
+    # calendar passes the fixed 2026-10-25 window (it did on 2026-11-09).
+    class _Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return queue_mod.to_queue_clock(NOW) if tz is None else NOW.astimezone(tz)
+
+    monkeypatch.setattr(queue_mod, "datetime", _Clock)
     assert env.queue.claim_next("runner-2") is None
 
 

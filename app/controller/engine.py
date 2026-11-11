@@ -1752,6 +1752,21 @@ class DeploymentEngine:
         terraform_key = None
         rollout_key = None
 
+        # RUNNING rows for the guards below, read ONCE and off the event loop. The
+        # query is synchronous SQLAlchemy/pymysql; a pooled connection whose peer went
+        # silent (DB VIP move, dropped conntrack) only fails after the kernel's TCP
+        # retransmit timeout (~16 min) — on the loop that also froze the core's
+        # cluster heartbeat, so the runner was reported dead and every instance
+        # showed "No runner instance online" while the job sat at "Claimed by …"
+        # (prod job #1387, 2026-11-11 12:32–12:48).
+        running_jobs: list | None = None
+
+        async def _running():
+            nonlocal running_jobs
+            if running_jobs is None:
+                running_jobs = await asyncio.to_thread(self.db.get_jobs_by_status, "RUNNING")
+            return running_jobs
+
         # Prevent concurrent bulk rollouts and duplicate single_service runs for the same service.
         async with self._pipeline_dispatch_lock:
             if pipeline_type == "rollout":
@@ -1766,7 +1781,7 @@ class DeploymentEngine:
                 # single_service / host / infra guards below use.
                 active_rollout_types = {
                     str(j.pipeline_type or "")
-                    for j in self.db.get_jobs_by_status("RUNNING")
+                    for j in await _running()
                     if str(j.pipeline_type or "").startswith("rollout") and j.id != job_id
                 } | set(self._active_rollout_keys)
                 if active_rollout_types:
@@ -1794,7 +1809,7 @@ class DeploymentEngine:
                         return self._skip_claimed(job_id, f"deployment for {service_name} already starting")
 
                     active_service_jobs = [
-                        j for j in self.db.get_jobs_by_status("RUNNING")
+                        j for j in await _running()
                         if j.pipeline_type == single_key and j.id != job_id
                     ]
                     if active_service_jobs:
@@ -1822,7 +1837,7 @@ class DeploymentEngine:
                     return self._skip_claimed(job_id, f"{pipeline_type} for {host_name} already starting")
 
                 active_tf_jobs = [
-                    j for j in self.db.get_jobs_by_status("RUNNING")
+                    j for j in await _running()
                     if j.pipeline_type == terraform_key and j.id != job_id
                 ]
                 if active_tf_jobs:
@@ -1832,7 +1847,7 @@ class DeploymentEngine:
                 self._active_terraform_host_keys.add(terraform_key)
             if pipeline_type in ("infra_plan", "infra_apply"):
                 active_infra_jobs = [
-                    j for j in self.db.get_jobs_by_status("RUNNING")
+                    j for j in await _running()
                     if str(j.pipeline_type or "").startswith(("infra_plan", "infra_apply")) and j.id != job_id
                 ]
                 if active_infra_jobs:
@@ -2888,7 +2903,7 @@ class DeploymentEngine:
             value = data.get(root_key)
             return value if isinstance(value, dict) else {}
         except (OSError, yaml.YAMLError) as exc:
-            logger.warning("Failed reading YAML config %s: %s", path, exc)
+            log.warning("Failed reading YAML config %s: %s", path, exc)
             return {}
 
     @staticmethod

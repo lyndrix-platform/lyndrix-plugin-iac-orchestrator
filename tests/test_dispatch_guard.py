@@ -140,3 +140,37 @@ def test_skipped_single_service_leaves_no_key():
     asyncio.run(eng.run_pipeline({"pipeline_type": "single_service", "service_name": "aac-x"}, job_id=2))
     assert not eng.executed and _skipped(eng, 2)
     assert _no_keys(eng)
+
+
+@pytest.mark.parametrize("payload", [
+    {"pipeline_type": "rollout", "limit": "docker-sec"},
+    {"pipeline_type": "single_service", "service_name": "aac-x"},
+    {"pipeline_type": "host_provision", "host_name": "docker-sec"},
+    {"pipeline_type": "infra_plan"},
+])
+def test_guard_reads_running_jobs_once_and_off_the_event_loop(payload):
+    """Prod 2026-11-11 (#1387): the guard's sync query sat on the event loop for the
+    whole TCP retransmit timeout and froze the cluster heartbeat with it. The RUNNING
+    snapshot is read exactly once per dispatch, in a worker thread."""
+    import threading
+
+    loop_thread = threading.get_ident()
+    seen: list[int] = []
+    eng = _engine([])
+
+    def _fetch(status):
+        seen.append(threading.get_ident())
+        return []
+
+    eng.db.get_jobs_by_status.side_effect = _fetch
+    asyncio.run(eng.run_pipeline(dict(payload), job_id=9))
+    assert eng.executed and not _skipped(eng, 9)
+    assert len(seen) == 1
+    assert seen[0] != loop_thread
+
+
+def test_guard_skips_the_query_for_unguarded_pipeline_types():
+    eng = _engine([])
+    asyncio.run(eng.run_pipeline({"pipeline_type": "connectivity"}, job_id=9))
+    assert eng.executed
+    eng.db.get_jobs_by_status.assert_not_called()
