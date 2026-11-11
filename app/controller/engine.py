@@ -1752,6 +1752,21 @@ class DeploymentEngine:
         terraform_key = None
         rollout_key = None
 
+        # RUNNING rows for the guards below, read ONCE and off the event loop. The
+        # query is synchronous SQLAlchemy/pymysql; a pooled connection whose peer went
+        # silent (DB VIP move, dropped conntrack) only fails after the kernel's TCP
+        # retransmit timeout (~16 min) — on the loop that also froze the core's
+        # cluster heartbeat, so the runner was reported dead and every instance
+        # showed "No runner instance online" while the job sat at "Claimed by …"
+        # (prod job #1387, 2026-11-11 12:32–12:48).
+        running_jobs: list | None = None
+
+        async def _running():
+            nonlocal running_jobs
+            if running_jobs is None:
+                running_jobs = await asyncio.to_thread(self.db.get_jobs_by_status, "RUNNING")
+            return running_jobs
+
         # Prevent concurrent bulk rollouts and duplicate single_service runs for the same service.
         async with self._pipeline_dispatch_lock:
             if pipeline_type == "rollout":
@@ -1766,7 +1781,7 @@ class DeploymentEngine:
                 # single_service / host / infra guards below use.
                 active_rollout_types = {
                     str(j.pipeline_type or "")
-                    for j in self.db.get_jobs_by_status("RUNNING")
+                    for j in await _running()
                     if str(j.pipeline_type or "").startswith("rollout") and j.id != job_id
                 } | set(self._active_rollout_keys)
                 if active_rollout_types:
@@ -1794,7 +1809,7 @@ class DeploymentEngine:
                         return self._skip_claimed(job_id, f"deployment for {service_name} already starting")
 
                     active_service_jobs = [
-                        j for j in self.db.get_jobs_by_status("RUNNING")
+                        j for j in await _running()
                         if j.pipeline_type == single_key and j.id != job_id
                     ]
                     if active_service_jobs:
@@ -1822,7 +1837,7 @@ class DeploymentEngine:
                     return self._skip_claimed(job_id, f"{pipeline_type} for {host_name} already starting")
 
                 active_tf_jobs = [
-                    j for j in self.db.get_jobs_by_status("RUNNING")
+                    j for j in await _running()
                     if j.pipeline_type == terraform_key and j.id != job_id
                 ]
                 if active_tf_jobs:
@@ -1832,7 +1847,7 @@ class DeploymentEngine:
                 self._active_terraform_host_keys.add(terraform_key)
             if pipeline_type in ("infra_plan", "infra_apply"):
                 active_infra_jobs = [
-                    j for j in self.db.get_jobs_by_status("RUNNING")
+                    j for j in await _running()
                     if str(j.pipeline_type or "").startswith(("infra_plan", "infra_apply")) and j.id != job_id
                 ]
                 if active_infra_jobs:
@@ -2751,9 +2766,23 @@ class DeploymentEngine:
                             or "Could not match supplied host pattern" in decoded):
                         no_hosts_matched = True
 
-            wait_proc = await asyncio.create_subprocess_exec("docker", "wait", container_name, stdout=asyncio.subprocess.PIPE)
-            stdout, _ = await wait_proc.communicate()
-            exit_code = int(stdout.decode().strip())
+            wait_proc = await asyncio.create_subprocess_exec(
+                "docker", "wait", container_name,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await wait_proc.communicate()
+            wait_out = stdout.decode("utf-8", errors="replace").strip()
+            try:
+                exit_code: int | None = int(wait_out)
+            except ValueError:
+                # Container already gone (auto-removed / killed) — the exit code is
+                # lost. Say so in the job log instead of failing silently.
+                exit_code = None
+                wait_err = stderr.decode("utf-8", errors="replace").strip() or wait_out or "no output"
+                msg = (f"[ERROR] could not read the runner exit code ({wait_err}); "
+                       "the output above may be incomplete.")
+                log.error("[Runner] %s: %s", task_name, msg)
+                self._log_line(job_id, f"[{task_name}] {msg}")
             # Override failure if the only Terraform error was "already running" (desired state IS achieved)
             success = exit_code == 0 or tf_already_running
             # An empty --limit intersection exits non-zero with no PLAY RECAP on this
@@ -2762,7 +2791,9 @@ class DeploymentEngine:
             if not success and no_hosts_matched and successful_hosts == 0 and failed_hosts == 0:
                 log.info("[Ansible] '%s' matched no hosts (empty --limit) — skipping (no-op).", task_name)
                 success = True
-            
+            if not success and exit_code is not None:
+                self._log_line(job_id, f"[{task_name}] [ERROR] runner container exited with code {exit_code}.")
+
             if "active_tasks" in self.state and task_name in self.state["active_tasks"]:
                 self.state["active_tasks"][task_name]["status"] = "success" if success else "failed"
                 self._sync_runners(job_id, force=True)
@@ -2775,13 +2806,16 @@ class DeploymentEngine:
                 "hosts_to_create": hosts_to_create,
                 "hosts_to_destroy": hosts_to_destroy,
                 "plan_summary": plan_summary,
+                "exit_code": exit_code,
             }
-            
-        except Exception:
+
+        except Exception as exc:  # noqa: BLE001
+            log.exception("[Runner] watching '%s' (%s) failed", task_name, container_name)
+            self._log_line(job_id, f"[{task_name}] [ERROR] lost track of runner container '{container_name}': {exc!r}")
             if "active_tasks" in self.state and task_name in self.state["active_tasks"]:
                 self.state["active_tasks"][task_name]["status"] = "error"
                 self._sync_runners(job_id, force=True)
-            return False, {"successful_hosts": 0, "failed_hosts": 0}
+            return False, {"successful_hosts": 0, "failed_hosts": 0, "exit_code": None}
 
     def _resolve_host_ip(self, host_name: str) -> str | None:
         """Best-effort lookup of a host's ansible_host (IP) from generated inventory."""
@@ -2869,7 +2903,7 @@ class DeploymentEngine:
             value = data.get(root_key)
             return value if isinstance(value, dict) else {}
         except (OSError, yaml.YAMLError) as exc:
-            logger.warning("Failed reading YAML config %s: %s", path, exc)
+            log.warning("Failed reading YAML config %s: %s", path, exc)
             return {}
 
     @staticmethod
@@ -3149,23 +3183,29 @@ class DeploymentEngine:
                 f"{tf_bin} plan -input=false -no-color -out=tfplan{target_flags}"
             )
             apply_cmd = (
-                f"{tf_bin} apply -input=false -no-color -auto-approve tfplan"
+                f"STEP=apply; {tf_bin} apply -input=false -no-color -auto-approve tfplan"
                 if do_apply
-                else f"{tf_bin} show -no-color tfplan"
+                else f"STEP=show; {tf_bin} show -no-color tfplan"
             )
-            action_cmd = f"{plan_cmd}; {apply_cmd}"
+            action_cmd = f"STEP=plan; {plan_cmd}; {apply_cmd}"
         # Optional adopt-existing step: import a live CT into state before plan/apply
         # so it's reconciled in place, not destroyed/recreated. Guarded (skip if
-        # already tracked) and non-fatal (a not-yet-existing CT falls through to apply).
+        # already tracked), every decision is echoed into the job log, and a
+        # not-yet-existing CT falls through to apply (see _build_import_cmd).
         import_cmd = ""
         if import_specs and (mode == "import" or do_apply):
             import_cmd = self._build_import_cmd(tf_bin, import_specs)
+        # stderr is folded into stdout so tofu's "Error:" blocks reach the job log
+        # in order, and the EXIT trap names the failing step + exit code — before,
+        # a failure right after `init` left nothing in the job log but the FATAL.
         shell_cmd = (
-            "set -euo pipefail; "
+            "exec 2>&1; set -euo pipefail; STEP=init; "
+            "trap 'rc=$?; if [ \"$rc\" -ne 0 ]; then "
+            "echo \"[TF] step <$STEP> failed with exit code $rc\"; fi; exit \"$rc\"' EXIT; "
             f"cd '{run_dir}'; "
             f"{tf_bin} init -input=false -no-color; "
-            f"{import_cmd}"
-            f"{action_cmd}"
+            f"STEP=import; {import_cmd}"
+            f"STEP={mode}; {action_cmd}"
         )
 
         h_git = self.config.host_git_repos_dir
@@ -3196,7 +3236,10 @@ class DeploymentEngine:
             "env_vars": env_vars,
             "mounts": mounts,
             "command": ["/bin/sh", "-lc", shell_cmd],
-            "remove": True,
+            # No auto-remove: a fast-failing tofu run would otherwise vanish before
+            # `docker logs -f` drained it and before `docker wait` read the exit code
+            # (→ empty output, swallowed error). _watch_detached_runner removes it.
+            "remove": False,
             "networks": [],
         }
 
@@ -3237,46 +3280,78 @@ class DeploymentEngine:
             "hosts_to_create": _stats.get("hosts_to_create") or [],
             "hosts_to_destroy": _stats.get("hosts_to_destroy") or [],
             "plan_summary": _stats.get("plan_summary") or "",
+            "exit_code": _stats.get("exit_code"),
         }
 
     @staticmethod
     def _build_import_cmd(tf_bin: str, import_specs: list[dict]) -> str:
         """Shell for the guarded adopt step, one block per spec.
 
-        A CT that moved to another Proxmox node (``node_name`` changed) is still
-        tracked under the OLD per-node module (``module.lxc_<old>…ct["<host>"]``):
-        importing it under the new module would create a second state entry and
-        the old one — now without a for_each key — breaks ``output "info"`` on
-        refresh (``var.containers[name]`` → Invalid index) and would be planned
-        for destruction. So: already at the target address → nothing; tracked
-        under another ``lxc_*`` module → ``state mv``; tracked nowhere → import.
-        The OpenTofu image has sh+grep but no bash/jq — keep it POSIX.
+        Runs inside the runner prelude ``set -euo pipefail`` with stderr folded
+        into stdout, so every decision is echoed and tofu's own errors reach the
+        job log. No ``tofu … | grep -q`` pipelines: under ``pipefail`` grep -q
+        quitting early SIGPIPEs tofu and a ``$(… | grep)`` without a match
+        aborts the whole script (1.4.3–1.5.1: silent "step <import> failed with
+        exit code 1"). The state list is snapshotted to a file once instead.
+
+        Cases, per CT (``ref`` = ``<node>/<vmid>`` of the live CT):
+        - at the target address and its state ``node_name`` matches → nothing;
+        - at the target address but state ``node_name`` names another node, or
+          tracked under another ``lxc_*`` module → ``state rm`` + import from the
+          live node. A ``state mv`` would keep the old ``node_name``: the refresh
+          then reads the CT on the old node, finds nothing, drops it and plans a
+          create (the onp-netp-prv case). A failed re-import here is fatal, so
+          an apply never tries to create a CT that exists;
+        - tracked nowhere → import; failure is non-fatal (not created yet).
+        The OpenTofu image has sh+grep+sed but no bash/jq — keep it POSIX.
         """
-        parts = []
+        sl = ".adopt_state_list"
+        parts = [
+            f"echo '[adopt] reading state'; "
+            f"{tf_bin} state list > {sl}; "
+            f"echo \"[adopt] state tracks $(grep -c . {sl} || true) resource(s)\"; "
+        ]
         for spec in import_specs:
             addr, ref = spec.get("addr", ""), spec.get("ref", "")
             if not addr or not ref:
                 continue
             host = str(spec.get("host") or "").strip()
+            want_node = ref.split("/", 1)[0]
             ct_suffix = f'.proxmox_virtual_environment_container.ct["{host}"]' if host else ""
+            reimport = (
+                f"{tf_bin} import -input=false -no-color '{addr}' '{ref}' || "
+                f"{{ echo '[adopt] ERROR: re-import of {addr} from {ref} failed - "
+                f"the CT is no longer in state; fix by hand before any apply'; exit 1; }}; "
+            )
+            # At the target address: the stored node_name must be the live node.
+            tracked_block = (
+                f"{tf_bin} state show -no-color '{addr}' > .adopt_show || true; "
+                "NODE=$(sed -n '/^ *node_name *= *\"/{s/^[^\"]*\"//;s/\".*$//;p;q;}' .adopt_show); "
+                "rm -f .adopt_show; "
+                f"if [ -n \"$NODE\" ] && [ \"$NODE\" != '{want_node}' ]; then "
+                f"echo '[adopt] {addr}'\" is tracked with node_name=$NODE but the CT lives on {want_node} "
+                f"- state rm + import from {ref}\"; "
+                f"{tf_bin} state rm -no-color '{addr}'; {reimport}"
+                f"else echo '[adopt] {addr}'\" already in state (node_name=${{NODE:-?}})\"; fi; "
+            )
             move_block = (
-                f"OLD=$({tf_bin} state list 2>/dev/null | grep -F '{ct_suffix}' | grep -vxF '{addr}' | head -n 1); "
+                f"OLD=$(grep -F '{ct_suffix}' {sl} | grep -vxF '{addr}' | sed -n 1p || true); "
                 "if [ -n \"$OLD\" ]; then "
-                f"echo \"[adopt] moving $OLD -> \"'{addr}'\" (node changed)\"; "
-                f"{tf_bin} state mv -no-color \"$OLD\" '{addr}' || echo \"[adopt] state mv failed for $OLD\"; "
+                f"echo \"[adopt] $OLD is tracked under another node module - state rm + import as \"'{addr}'\" from {ref}\"; "
+                f"{tf_bin} state rm -no-color \"$OLD\"; {reimport}"
                 "else "
             ) if ct_suffix else ""
             import_block = (
-                f"echo '[adopt] importing {addr}'; "
+                f"echo '[adopt] {addr} not in state - importing {ref}'; "
                 f"{tf_bin} import -input=false -no-color '{addr}' '{ref}' || "
                 f"echo '[adopt] import skipped for {addr} (not present yet)'; "
             )
             close_move = "fi; " if ct_suffix else ""
             parts.append(
-                f"if ! {tf_bin} state list 2>/dev/null | grep -qxF '{addr}'; then "
-                f"{move_block}{import_block}{close_move}"
-                f"else echo '[adopt] {addr} already in state'; fi; "
+                f"if grep -qxF '{addr}' {sl}; then {tracked_block}"
+                f"else {move_block}{import_block}{close_move}fi; "
             )
+        parts.append(f"rm -f {sl}; ")
         return "".join(parts)
 
     def is_known_site(self, name: str) -> bool:
