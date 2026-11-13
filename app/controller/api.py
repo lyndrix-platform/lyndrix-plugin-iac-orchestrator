@@ -33,6 +33,10 @@ from pydantic import BaseModel, Field
 from .settings_schema import OrchestratorSettings
 from .queue import DuplicateJob as _DuplicateJob
 from . import maintenance_resolver as _mres
+from ...stages.service_diff import (
+    DEFAULT_EXCLUDE_SERVICES as _DEFAULT_EXCLUDE_SERVICES,
+    normalize_service_names as _normalize_service_names,
+)
 
 # Internal references to be set by init_api
 _ctx = None
@@ -414,6 +418,12 @@ class TestHostDeployRequest(BaseModel):
     services: list[str] = Field(default_factory=list)
 
 
+class ReconcileApproveRequest(BaseModel):
+    """Options for approving a pending service-reconcile record (plugin 1.7)."""
+    dry_run: bool | None = None   # override the record's dry_run (None = keep)
+    force: bool = False           # run now — skip the maintenance deploy policy
+
+
 # Generic operation trigger. Mirrors the NiceGUI Assignments-tab buttons, which
 # all run ``ctx.emit("iac:webhook_verified", {pipeline_type, limit|host_name, ...})``.
 _PIPELINE_TYPES = {"bootstrap_compliance", "adopt_host", "rollout", "init_host", "compliance"}
@@ -783,6 +793,134 @@ async def do_cancel_schedule(job_id: int):
     if not ok:
         raise HTTPException(status_code=404, detail=f"Job #{job_id} is not a scheduled deployment")
     return {"status": "ok", "job_id": int(job_id), "message": f"Scheduled job #{job_id} cancelled"}
+
+
+# ── Service reconcile (plugin 1.7): pending / deferred controller-diff deploys ──────────
+def _reconcile_store():
+    store = getattr(_engine, "reconcile_store", None) if _engine else None
+    if store is None:
+        raise HTTPException(status_code=503, detail="Orchestrator not initialized")
+    return store
+
+
+def _public_reconcile_record(item: dict) -> dict:
+    """API shape of a record: provenance + key *names*; the raw payload stays internal."""
+    return {
+        "id": item.get("id"),
+        "status": item.get("status"),
+        "reason": item.get("reason"),
+        "service": item.get("service"),
+        "stage": item.get("stage"),
+        "site": item.get("site"),
+        "branch": (item.get("payload") or {}).get("service_branch"),
+        "hosts": list(item.get("hosts") or []),
+        "changed_keys": list(item.get("changed_keys") or []),
+        "dry_run": bool((item.get("payload") or {}).get("dry_run")),
+        "waiting_for_job": item.get("waiting_for_job"),
+        "inventory_commit": item.get("inventory_commit"),
+        "source_job_id": item.get("source_job_id"),
+        "created_at": item.get("created_at"),
+        "updated_at": item.get("updated_at"),
+    }
+
+
+def _reconcile_excluded_services() -> list[str]:
+    """Sorted exclude list for the API (setting ``service_reconcile_exclude_services``;
+    the built-in default when the config does not expose it)."""
+    try:
+        excluded = getattr(_engine.config, "service_reconcile_exclude_services", None) if _engine else None
+        if not isinstance(excluded, (set, frozenset, list, tuple, str)):
+            excluded = _DEFAULT_EXCLUDE_SERVICES
+        return sorted(_normalize_service_names(excluded))
+    except Exception:
+        return []
+
+
+def _reconcile_service_excluded(service_name) -> bool:
+    check = getattr(_engine, "reconcile_service_excluded", None)
+    return bool(check(service_name)) if callable(check) else False
+
+
+async def do_list_reconcile_pending():
+    """Pending (approval) and deferred (waiting for an active job) service changes."""
+    store = _reconcile_store()
+    items = await asyncio.to_thread(store.list)
+    public = [_public_reconcile_record(i) for i in items]
+    return {
+        "items": public,
+        "count": len(public),
+        "pending": sum(1 for i in public if i["status"] == "pending"),
+        "deferred": sum(1 for i in public if i["status"] == "deferred"),
+        "mode": getattr(_engine.config, "service_reconcile_mode", "off") if _engine else "off",
+        "excluded_services": _reconcile_excluded_services(),
+    }
+
+
+async def _approve_record(store, item: dict, options: "ReconcileApproveRequest | None", requested_by: str | None) -> dict:
+    payload = dict(item.get("payload") or {})
+    if not payload.get("service_name"):
+        await asyncio.to_thread(store.remove, item["id"])
+        raise HTTPException(status_code=409, detail=f"Record {item['id']} has no deployable payload (removed)")
+    if _reconcile_service_excluded(payload.get("service_name")):
+        # An approval must not bypass the exclude list: the record stays for /dismiss, the
+        # deploy (if wanted) goes through the explicit single-service rollout.
+        raise HTTPException(
+            status_code=409,
+            detail=f"{item.get('service')} is excluded from automatic deploys (service_reconcile_exclude_services) — "
+                   f"dismiss the record or deploy it explicitly via the single-service rollout",
+        )
+    if options is not None and options.dry_run is not None:
+        payload["dry_run"] = bool(options.dry_run)
+    if options is not None and options.force:
+        payload["force"] = True
+    payload["approved_by"] = requested_by or "operator"
+    try:
+        job_id = await asyncio.to_thread(_service.enqueue_pipeline, payload,
+                                         requested_by=f"approval ({requested_by})" if requested_by else "approval")
+    except _DuplicateJob as exc:
+        await asyncio.to_thread(store.update, item["id"], status="deferred",
+                                reason=f"approved — waiting for job #{exc.existing_id}", waiting_for_job=exc.existing_id)
+        return {"id": item["id"], "status": "deferred", "waiting_for_job": exc.existing_id,
+                "message": f"{item.get('service')} ({item.get('stage')}): job #{exc.existing_id} is active — re-queued when it ends"}
+    await asyncio.to_thread(store.remove, item["id"])
+    return {"id": item["id"], "status": "queued", "job_id": job_id,
+            "message": f"{item.get('service')} ({item.get('stage')}) queued as job #{job_id} on {len(item.get('hosts') or [])} host(s)"}
+
+
+async def do_approve_reconcile(record_id: str, options: "ReconcileApproveRequest | None" = None, *, requested_by: str | None = None):
+    """Approve one pending/deferred record → its single_service job (host-limited)."""
+    if not _service:
+        raise HTTPException(status_code=503, detail="Orchestrator not initialized")
+    store = _reconcile_store()
+    item = await asyncio.to_thread(store.get, record_id)
+    if not item:
+        raise HTTPException(status_code=404, detail=f"No pending service change {record_id}")
+    return await _approve_record(store, item, options, requested_by)
+
+
+async def do_approve_all_reconcile(options: "ReconcileApproveRequest | None" = None, *, requested_by: str | None = None):
+    """Approve every *pending* record (deferred ones are drained automatically)."""
+    if not _service:
+        raise HTTPException(status_code=503, detail="Orchestrator not initialized")
+    store = _reconcile_store()
+    results = []
+    for item in await asyncio.to_thread(store.pending):
+        try:
+            results.append(await _approve_record(store, item, options, requested_by))
+        except HTTPException as exc:
+            results.append({"id": item.get("id"), "status": "error", "message": str(exc.detail)})
+    queued = sum(1 for r in results if r.get("status") == "queued")
+    return {"status": "ok", "results": results, "queued": queued,
+            "message": f"{queued} of {len(results)} pending service change(s) queued"}
+
+
+async def do_dismiss_reconcile(record_id: str):
+    """Drop a pending/deferred record without deploying."""
+    store = _reconcile_store()
+    ok = await asyncio.to_thread(store.remove, record_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail=f"No pending service change {record_id}")
+    return {"status": "ok", "id": record_id, "message": "Service change dismissed"}
 
 
 def _maintenance_snapshot() -> dict:

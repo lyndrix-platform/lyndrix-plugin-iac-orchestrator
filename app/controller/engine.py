@@ -18,7 +18,8 @@ from core.api import maintenance as mw
 
 from ...stages.base import BaseStage
 from .utils import StageResult, JobFileLogBridge, current_job_id as _job_id_ctxvar
-from .queue import JobLogWriter
+from .queue import JobLogWriter, DuplicateJob
+from .reconcile_store import ReconcileStore
 from . import maintenance_resolver as mres
 from ...stages.git import (
     SyncRepoStage,
@@ -33,6 +34,7 @@ from ...stages.ansible import (
     service_rollout_selector
 )
 from ...stages.rules import DynamicRuleExecutionStage
+from ...stages.service_diff import DEFAULT_EXCLUDE_SERVICES, is_excluded, normalize_service_names
 
 log = logging.getLogger("IaC:Engine")
 
@@ -231,6 +233,13 @@ class MaintenancePolicyStage(BaseStage):
         targets = await asyncio.to_thread(mres.find_service_hosts, controller_root, svc, stage=hint)
         if not targets and hint:
             targets = await asyncio.to_thread(mres.find_service_hosts, controller_root, svc)
+        # A host-limited job (service_reconcile ``target_hosts``, 1.7) touches only those
+        # hosts — evaluate the policy and the override for them, not for the whole service.
+        wanted = {str(h).strip().lower() for h in (self.payload.get("target_hosts") or []) if str(h).strip()}
+        if wanted:
+            narrowed = [t for t in targets if str(t[2]).lower() in wanted]
+            if narrowed:
+                targets = narrowed
         if not targets:
             log.info(f"[MAINTENANCE] No controller host lists service '{svc}' — no deploy policy, no override.")
             return StageResult(True, "No target host in the controller — maintenance policy skipped")
@@ -856,14 +865,31 @@ class SingleServiceStrategy(PipelineStrategy):
     def db_tag(self, payload):
         return f"single_service:{payload.get('service_name')}"
 
+    @staticmethod
+    def target_hosts_of(payload: dict) -> list[str]:
+        """Normalised ``target_hosts`` of a job payload (service_reconcile, 1.7): the deploy
+        is limited to these hosts. Empty → the whole service/stage group as before."""
+        seen: list[str] = []
+        for h in (payload or {}).get("target_hosts") or []:
+            name = str(h or "").strip().lower()
+            if name and name not in seen:
+                seen.append(name)
+        return sorted(seen)
+
     def build_stages(self, engine, payload, context):
         svc_name = payload.get("service_name")
         svc_branch = payload.get("service_branch", "main")
+        service_group = f"service_{str(svc_name).replace('-', '_')}"
         target_group = (
             "stage_dev" if svc_branch == "dev" or str(svc_branch).endswith("-dev")
-            else ("stage_test" if svc_branch == "test"
-                  else f"service_{str(svc_name).replace('-', '_')}")
+            else ("stage_test" if svc_branch == "test" else service_group)
         )
+        target_hosts = self.target_hosts_of(payload)
+        if target_hosts:
+            # Host limit: only the hosts whose rendered entry changed, intersected with the
+            # service group (`h1:h2:&service_x`) — the playbooks use target_group as `hosts:`.
+            target_group = ":".join(target_hosts) + f":&{service_group}"
+            log.info("ENGINE: single_service %s limited to %d host(s): %s", svc_name, len(target_hosts), ", ".join(target_hosts))
         # Route the execution playbook by the service's deploy_type: 'ansible'
         # → native execution chain (plus its build roles dir appended to
         # ANSIBLE_ROLES_PATH), anything else → docker_compose chain. Same
@@ -1137,6 +1163,16 @@ class DeploymentEngine:
         self.queue = None
         self._log_writers: dict[int, "JobLogWriter"] = {}
         self._runners_last_push: dict[int, float] = {}
+        # Service reconcile (1.7): the service installs its ``enqueue_pipeline`` here so the
+        # rule engine can queue jobs and SEE a DuplicateJob (the bus path swallows it); the
+        # store keeps pending/deferred detections in the shared DB (every instance).
+        self.enqueue_pipeline = None
+        try:
+            from core.api import db_instance as _db_instance
+            _lock = getattr(_db_instance, "advisory_lock", None)
+        except Exception:  # pragma: no cover - core without db_instance
+            _lock = None
+        self.reconcile_store = ReconcileStore(db, lock_factory=_lock if callable(_lock) else None)
         # Entity-Registry CI ids of the last publish: ("host", name) and
         # ("service", host, service) → UUID. Feeds the monitoring sync, the
         # maintenance publisher and the policy stage (runner instances only).
@@ -1677,6 +1713,75 @@ class DeploymentEngine:
             return False
 
     # ------------------------------------------------------------------
+    # Service reconcile (1.7): deferred detections re-queued when the blocking job ends
+    # ------------------------------------------------------------------
+
+    def reconcile_service_excluded(self, service_name) -> bool:
+        """``True`` when the setting ``service_reconcile_exclude_services`` lists the service.
+        Such a service is never dispatched by service reconcile — not by the rule, not by an
+        operator approval, not by the deferred drain. Without a readable setting (older
+        config, tests) the built-in default (``aac-hermes-agent``) applies."""
+        excluded = getattr(getattr(self, "config", None), "service_reconcile_exclude_services", None)
+        if not isinstance(excluded, (set, frozenset, list, tuple, str)):
+            excluded = DEFAULT_EXCLUDE_SERVICES
+        return is_excluded(service_name, normalize_service_names(excluded))
+
+    def drain_deferred_reconcile(self) -> list[int]:
+        """Re-queue every *deferred* service-reconcile record (its ``single_service`` job was
+        refused as DuplicateJob while the same service was queued/running). Idempotent and
+        cluster-safe: a record that still collides stays deferred (``waiting_for_job`` is
+        refreshed), a queued one is removed. Sync — call from a thread or a terminal hook.
+        Returns the ids of the jobs it queued."""
+        store = getattr(self, "reconcile_store", None)
+        enqueue = getattr(self, "enqueue_pipeline", None)
+        if store is None or not callable(enqueue):
+            return []
+        try:
+            deferred = store.deferred()
+        except Exception as exc:
+            log.debug(f"RECONCILE: reading deferred records failed: {exc}")
+            return []
+        queued: list[int] = []
+        for record in deferred:
+            payload = dict(record.get("payload") or {})
+            if not payload.get("service_name"):
+                store.remove(record["id"])
+                continue
+            if self.reconcile_service_excluded(payload.get("service_name")):
+                # The exclude list may have changed after the record was deferred — an
+                # excluded service never leaves the store as a job.
+                store.remove(record["id"])
+                log.warning(f"RECONCILE: deferred {record.get('service')} ({record.get('stage')}) dropped — service is "
+                            f"excluded from automatic deploys (service_reconcile_exclude_services).")
+                continue
+            try:
+                job_id = enqueue(payload, requested_by="controller-diff")
+            except DuplicateJob as exc:
+                if exc.existing_id != record.get("waiting_for_job"):
+                    store.update(record["id"], waiting_for_job=exc.existing_id,
+                                 reason=f"waiting for job #{exc.existing_id}" if exc.existing_id else "waiting for the active job")
+                continue
+            except Exception as exc:
+                log.warning(f"RECONCILE: re-queue of deferred {record.get('service')} ({record.get('stage')}) failed: {exc}")
+                store.update(record["id"], status="pending", reason=f"re-queue failed: {type(exc).__name__}: {exc}")
+                continue
+            store.remove(record["id"])
+            queued.append(int(job_id) if job_id is not None else -1)
+            log.info(f"RECONCILE: deferred {record.get('service')} ({record.get('stage')}) re-queued as job #{job_id}.")
+        return queued
+
+    def on_job_terminal(self, job_id: int | None) -> None:
+        """Terminal hook for jobs the queue closes on its own (orphan sweep): end the
+        maintenance override and drain deferred service-reconcile records."""
+        try:
+            self.end_override_for(job_id)
+        finally:
+            try:
+                self.drain_deferred_reconcile()
+            except Exception as exc:
+                log.debug(f"RECONCILE: drain after job #{job_id} failed: {exc}")
+
+    # ------------------------------------------------------------------
     # Notification helpers — use messaging:outbound instead of system:notify
     # ------------------------------------------------------------------
 
@@ -2120,6 +2225,13 @@ class DeploymentEngine:
                 # is already SCHEDULED — writing a terminal status would un-park it.
                 self.db.update_job(job_id=current_job_id, status=final_status)
                 self.end_override_for(current_job_id)
+                if pipeline_type == "single_service":
+                    # The service key is free now: re-queue service-reconcile detections
+                    # that were deferred because this job was active (1.7).
+                    try:
+                        await asyncio.to_thread(self.drain_deferred_reconcile)
+                    except Exception as exc:
+                        log.debug(f"RECONCILE: drain after job #{current_job_id} failed: {exc}")
             self._sync_runners(current_job_id, force=True)
             await self._close_log_writer(current_job_id)
             self._cleanup_inventory_snapshot(current_job_id)

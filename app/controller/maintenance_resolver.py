@@ -43,7 +43,9 @@ SOURCE = "iac-orchestrator"
 #: Triggers whose deploys follow the service's ``deploy_policy`` (``window`` → park
 #: until the next window). Everything else — UI catalog button, NiceGUI, host
 #: rollouts, "run now" (``force``) — runs at once.
-POLICY_TRIGGERS = frozenset({"gitlab-ci", "webhook", "gitlab_pipeline_success"})
+#: ``controller-diff`` (1.7): jobs the ``service_reconcile`` rule queues from an iac-controller
+#: change are automatic deploys too — prod services with ``deploy_policy: window`` are parked.
+POLICY_TRIGGERS = frozenset({"gitlab-ci", "webhook", "gitlab_pipeline_success", "controller-diff"})
 
 #: Stages whose services default to ``deploy_policy: window``.
 WINDOW_DEFAULT_STAGES = frozenset({"prod"})

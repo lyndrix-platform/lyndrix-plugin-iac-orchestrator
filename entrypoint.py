@@ -20,7 +20,7 @@ from .app.ui.widget import render_dashboard_widget as modular_widget
 manifest = ModuleManifest(
     id="lyndrix.plugin.iac_orchestrator",
     name="IaC Orchestrator",
-    version="1.6.1",
+    version="1.7.0",
     description="Standalone GitOps controller for executing Terraform and Ansible pipelines.",
     author="Lyndrix",
     icon="rocket_launch",
@@ -147,6 +147,17 @@ manifest = ModuleManifest(
         NotificationEndpoint(
             name="drift_detected",
             description="Drift detection found differences during a rollout.",
+            default_active=True,
+            internal_toast=True,
+            internal_persist=True,
+            external_default=True,
+        ),
+        NotificationEndpoint(
+            name="service_reconcile",
+            description=(
+                "An iac-controller change altered rendered service entries (profile vars, secrets): "
+                "which services/stages/hosts and what was queued, deferred or waits for approval. Key names only."
+            ),
             default_active=True,
             internal_toast=True,
             internal_persist=True,
