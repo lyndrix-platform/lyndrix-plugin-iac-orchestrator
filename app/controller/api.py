@@ -99,7 +99,13 @@ def _emit_webhook_verified(event_payload: dict) -> None:
 
 
 
-async def _submit(payload: dict, *entitlements: str) -> int | None:
+def _actor(identity) -> str | None:
+    """Name recorded as the job's ``requested_by`` for an authenticated caller."""
+    name = getattr(identity, "username", None)
+    return str(name)[:100] if isinstance(name, str) and name else None
+
+
+async def _submit(payload: dict, *entitlements: str, actor: str | None = None) -> int | None:
     """Queue a trigger of this API (validated, with the entitlements of the calling
     route). Returns the job id, ``None`` when the target is already queued/running;
     an invalid payload is a 400. Triggers no longer travel over the bus: the bus
@@ -107,7 +113,9 @@ async def _submit(payload: dict, *entitlements: str) -> int | None:
     if not _service:
         raise HTTPException(status_code=503, detail="Orchestrator not initialized")
     try:
-        return await _service.submit_job(payload, entitlements=entitlements)
+        # ``actor`` = authenticated username (recorded with the job, audit OS-13);
+        # token/CI triggers are recorded under their trigger name.
+        return await _service.submit_job(payload, entitlements=entitlements, requested_by=actor)
     except InvalidJobPayload as exc:
         raise HTTPException(status_code=400, detail=f"Invalid job payload: {exc}")
 
@@ -665,7 +673,8 @@ async def do_get_catalog():
     return _snapshot_items("catalog") or []
 
 
-async def do_trigger_service_deployment(service_name: str, payload: DeployRequest, *, trigger: str = "ui"):
+async def do_trigger_service_deployment(service_name: str, payload: DeployRequest, *, trigger: str = "ui",
+                                        identity=None):
     """Triggers a targeted single-service deployment.
 
     ``trigger`` tells the maintenance policy stage where the deploy comes from:
@@ -702,7 +711,7 @@ async def do_trigger_service_deployment(service_name: str, payload: DeployReques
     }
     if payload.dry_run:
         event_payload["dry_run"] = True
-    job_id = await _submit(event_payload, ENT_TRIGGER)
+    job_id = await _submit(event_payload, ENT_TRIGGER, actor=_actor(identity))
     _emit_webhook_verified(event_payload)
     kind = "Dry-run (--check)" if payload.dry_run else "Deployment"
     return {"status": "accepted", "dry_run": bool(payload.dry_run), "job_id": job_id,
@@ -949,7 +958,7 @@ async def do_trigger_test_host_deployment(host_name: str, payload: TestHostDeplo
         "trigger": "manual_test_host",
         "test_host": host,
     }
-    job_id = await _submit(event_payload, ENT_TRIGGER)
+    job_id = await _submit(event_payload, ENT_TRIGGER, actor=_actor(identity))
     _emit_webhook_verified(event_payload)
     return {
         "status": "accepted",
@@ -960,7 +969,7 @@ async def do_trigger_test_host_deployment(host_name: str, payload: TestHostDeplo
     }
 
 
-async def do_trigger_host_bootstrap(host_name: str, payload: TestHostDeployRequest):
+async def do_trigger_host_bootstrap(host_name: str, payload: TestHostDeployRequest, identity=None):
     """Triggers a guarded compliance/bootstrap run for exactly one allow-listed host."""
     if not _ctx or not _engine:
         raise HTTPException(status_code=500, detail="Orchestrator offline")
@@ -998,7 +1007,7 @@ async def do_trigger_host_bootstrap(host_name: str, payload: TestHostDeployReque
         "manual": True,
         "trigger": "manual_bootstrap",
     }
-    job_id = await _submit(event_payload, ENT_TRIGGER)
+    job_id = await _submit(event_payload, ENT_TRIGGER, actor=_actor(identity))
     _emit_webhook_verified(event_payload)
     return {
         "status": "accepted",
@@ -1008,12 +1017,12 @@ async def do_trigger_host_bootstrap(host_name: str, payload: TestHostDeployReque
     }
 
 
-async def do_trigger_infra_plan():
+async def do_trigger_infra_plan(identity=None):
     """Triggers a read-only whole-infrastructure Terraform plan ("Check Env")."""
     if not _ctx:
         raise HTTPException(status_code=500, detail="Context offline")
     infra_plan_payload = {"pipeline_type": "infra_plan", "manual": True, "trigger": "manual_infra_plan"}
-    job_id = await _submit(infra_plan_payload, ENT_TRIGGER)
+    job_id = await _submit(infra_plan_payload, ENT_TRIGGER, actor=_actor(identity))
     _emit_webhook_verified(infra_plan_payload)
     return {"status": "accepted", "message": "Infrastructure plan (Check Env) queued.", "job_id": job_id}
 
@@ -1038,7 +1047,7 @@ async def do_trigger_infra_apply_by_token(x_gitlab_token: str | None):
     return await do_trigger_infra_apply()
 
 
-async def do_trigger_infra_apply():
+async def do_trigger_infra_apply(identity=None):
     """Triggers a whole-infrastructure Terraform apply ("Deploy Infra")."""
     if not _ctx:
         raise HTTPException(status_code=500, detail="Context offline")
@@ -1049,7 +1058,7 @@ async def do_trigger_infra_apply():
         "trigger": "manual_infra_apply",
     }
     # Only the two apply routes (permission api:infra_apply) may set ``approve``.
-    job_id = await _submit(infra_apply_payload, ENT_TRIGGER, ENT_APPROVE)
+    job_id = await _submit(infra_apply_payload, ENT_TRIGGER, ENT_APPROVE, actor=_actor(identity))
     _emit_webhook_verified(infra_apply_payload)
     return {"status": "accepted", "message": "Infrastructure deploy queued.", "job_id": job_id}
 
@@ -1075,7 +1084,7 @@ async def do_get_pending_plan():
     }
 
 
-async def do_apply_pending_plan():
+async def do_apply_pending_plan(identity=None):
     """Approves the pending plan: triggers the fleet apply (approve=True)."""
     if not _ctx or not _engine:
         raise HTTPException(status_code=503, detail="Orchestrator not initialized")
@@ -1090,7 +1099,7 @@ async def do_apply_pending_plan():
         "trigger": "pending_plan_approval",
         "plan_job_id": data.get("job_id"),
     }
-    job_id = await _submit(payload, ENT_TRIGGER, ENT_APPROVE)
+    job_id = await _submit(payload, ENT_TRIGGER, ENT_APPROVE, actor=_actor(identity))
     _emit_webhook_verified(payload)
     return {
         "status": "accepted",
@@ -1378,7 +1387,7 @@ async def do_run_pipeline(payload: PipelineRequest, identity=None):
     if payload.dry_run:
         event_payload["dry_run"] = True
 
-    job_id = await _submit(event_payload, ENT_TRIGGER)
+    job_id = await _submit(event_payload, ENT_TRIGGER, actor=_actor(identity))
     _emit_webhook_verified(event_payload)
     target = host or limit
     suffix = " (dry-run, --check)" if payload.dry_run else ""
@@ -2008,38 +2017,40 @@ async def do_get_webhook_token():
     }
 
 
-async def do_generate_webhook_token():
+async def do_generate_webhook_token(identity=None):
     """Generate + store a new GitLab webhook token. Returns the raw value once."""
     if not _ctx:
         raise HTTPException(status_code=503, detail="Context offline")
     new_token = secrets.token_urlsafe(32)
     _ctx.set_secret("gitlab_webhook_token", new_token)
-    _ctx.log.info("API: New GitLab webhook token generated and stored in Vault.")
+    _ctx.log.info(f"API: New GitLab webhook token generated by {_actor(identity) or 'internal'} and stored in Vault.")
     return {"status": "ok", "token": new_token}
 
 
-async def do_clear_stats():
+async def do_clear_stats(identity=None):
     """Clear job history records (keeps RUNNING jobs intact) and reset last_deployment state."""
     if not _service or not _engine:
         raise HTTPException(status_code=503, detail="Orchestrator not initialized")
     deleted = await asyncio.to_thread(_engine.db.clear_all_jobs, True)
     if deleted < 0:
         raise HTTPException(status_code=500, detail="Failed to clear statistics (see logs)")
+    _ctx.log.warning(f"API: job history cleared by {_actor(identity) or 'internal'} ({deleted} job record(s) and their logs).")
     _service.state["last_deployment"] = "N/A"
     return {"status": "ok", "deleted": deleted}
 
 
-async def do_clear_failed_jobs():
+async def do_clear_failed_jobs(identity=None):
     """Delete only failed/errored/aborted job records, leaving successful and running jobs intact."""
     if not _service or not _engine:
         raise HTTPException(status_code=503, detail="Orchestrator not initialized")
     deleted = await asyncio.to_thread(_engine.db.clear_failed_jobs)
     if deleted < 0:
         raise HTTPException(status_code=500, detail="Failed to clear failed jobs (see logs)")
+    _ctx.log.warning(f"API: failed job records cleared by {_actor(identity) or 'internal'} ({deleted} record(s) and their logs).")
     return {"status": "ok", "deleted": deleted}
 
 
-async def do_sync_repos():
+async def do_sync_repos(identity=None):
     """Trigger a background sync of all core repositories (iac_controller, inventory_state, …)."""
     if not _ctx or not _service or not _engine:
         raise HTTPException(status_code=503, detail="Orchestrator not initialized")
@@ -2047,7 +2058,7 @@ async def do_sync_repos():
     # every other piece of execution; the job shows up in the history as "repo_sync".
     try:
         job_id = await asyncio.to_thread(_service.enqueue_pipeline, {"pipeline_type": "repo_sync", "manual": True},
-                                         requested_by="ui")
+                                         requested_by=_actor(identity) or "ui")
     except _DuplicateJob as exc:
         raise HTTPException(status_code=409, detail=f"A repository sync is already queued/running (job #{exc.existing_id})")
     return {"status": "accepted", "message": "Repository sync queued", "job_id": job_id}

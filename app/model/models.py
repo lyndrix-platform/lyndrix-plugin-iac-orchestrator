@@ -46,6 +46,9 @@ class IaCJob(Base):
     # every stage start so a restarted runner knows whether a re-attached container
     # belonged to the pipeline's last stage or stages are still missing (audit OC-10).
     exec_state = Column(LONGTEXT, nullable=True)
+    # Who triggered the job (audit OS-13): the authenticated username for API/UI
+    # triggers, the trigger name for token/CI/engine triggers.
+    requested_by = Column(String(100), nullable=True)
 
     # --- MAINTENANCE WINDOWS (plugin 1.6): a deploy parked for its window ---
     # Status SCHEDULED: the runner evaluated the service's deploy_policy and parked the job

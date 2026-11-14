@@ -175,7 +175,8 @@ class JobDatabase:
                 IaCJob.end_time,
                 IaCJob.status,
                 IaCJob.progress,
-                IaCJob.current_step
+                IaCJob.current_step,
+                IaCJob.requested_by,
             ).order_by(IaCJob.id.desc()).limit(limit).all()
 
             return [
@@ -185,6 +186,7 @@ class JobDatabase:
                     "status": job.status,
                     "progress": job.progress or 0,
                     "current_step": job.current_step or "",
+                    "requested_by": job.requested_by,
                     "start_time": job.start_time.strftime("%Y-%m-%d %H:%M:%S") if job.start_time else "N/A",
                     "end_time": job.end_time.strftime("%H:%M:%S") if job.end_time else "Running"
                 }

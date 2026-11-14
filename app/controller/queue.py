@@ -234,6 +234,8 @@ class JobQueue:
                 "heartbeat_utc": "DATETIME NULL",
                 # stage progress for restart recovery
                 "exec_state": "LONGTEXT NULL",
+                # who triggered the job
+                "requested_by": "VARCHAR(100) NULL",
                 # maintenance windows (plugin 1.6)
                 "not_before": "DATETIME NULL",
                 "window_ci_ids": "LONGTEXT NULL",
@@ -341,6 +343,7 @@ class JobQueue:
                 pending_tasks="[]",
                 payload=json.dumps(payload, default=str),
                 dedupe_key=key,
+                requested_by=(str(requested_by)[:100] if requested_by else None),
             )
             session.add(job)
             session.commit()

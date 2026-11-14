@@ -247,7 +247,7 @@ def build_plugin_router(service) -> APIRouter:
         _apply: ApiIdentity = Depends(require_permission(PERM_INFRA_APPLY)),
         _admin: ApiIdentity = Depends(require_permission(PERM_CREDENTIALS_ADMIN)),
     ):
-        return await _api.do_generate_webhook_token()
+        return await _api.do_generate_webhook_token(identity)
 
     # Writes the webhook token into every project hook of the configured group.
     @router.post("/settings/webhooks/sync")
@@ -257,17 +257,25 @@ def build_plugin_router(service) -> APIRouter:
     ):
         return await _api.do_sync_webhooks_authed()
 
+    # Deleting job history removes the record of who ran what (rows + log lines):
+    # admin permission, and the deletion itself is logged with the caller.
     @router.post("/maintenance/clear-stats")
-    async def clear_stats(identity: ApiIdentity = Depends(require_permission(PERM_WRITE))):
-        return await _api.do_clear_stats()
+    async def clear_stats(
+        identity: ApiIdentity = Depends(require_permission(PERM_WRITE)),
+        _admin: ApiIdentity = Depends(require_permission(PERM_SETTINGS_ADMIN)),
+    ):
+        return await _api.do_clear_stats(identity)
 
     @router.post("/maintenance/clear-failed-jobs")
-    async def clear_failed_jobs(identity: ApiIdentity = Depends(require_permission(PERM_WRITE))):
-        return await _api.do_clear_failed_jobs()
+    async def clear_failed_jobs(
+        identity: ApiIdentity = Depends(require_permission(PERM_WRITE)),
+        _admin: ApiIdentity = Depends(require_permission(PERM_SETTINGS_ADMIN)),
+    ):
+        return await _api.do_clear_failed_jobs(identity)
 
     @router.post("/maintenance/sync-repos")
     async def sync_repos(identity: ApiIdentity = Depends(require_permission(PERM_WRITE))):
-        return await _api.do_sync_repos()
+        return await _api.do_sync_repos(identity)
 
     @router.post("/schedules/{job_id}/run-now")
     async def run_schedule_now(
@@ -291,7 +299,7 @@ def build_plugin_router(service) -> APIRouter:
         payload: _api.DeployRequest,
         identity: ApiIdentity = Depends(require_permission(PERM_WRITE)),
     ):
-        return await _api.do_trigger_service_deployment(service_name, payload)
+        return await _api.do_trigger_service_deployment(service_name, payload, identity=identity)
 
     @router.post("/deploy/test-host/{host_name}")
     async def deploy_test_host(
@@ -308,11 +316,11 @@ def build_plugin_router(service) -> APIRouter:
         payload: _api.TestHostDeployRequest,
         identity: ApiIdentity = Depends(require_permission(PERM_WRITE)),
     ):
-        return await _api.do_trigger_host_bootstrap(host_name, payload)
+        return await _api.do_trigger_host_bootstrap(host_name, payload, identity)
 
     @router.post("/infra/plan")
     async def infra_plan(identity: ApiIdentity = Depends(require_permission(PERM_WRITE))):
-        return await _api.do_trigger_infra_plan()
+        return await _api.do_trigger_infra_plan(identity)
 
     # ── Pending plan review-and-approve flow ─────────────────────────────────
     @router.get("/infra/pending-plan")
@@ -328,7 +336,7 @@ def build_plugin_router(service) -> APIRouter:
         identity: ApiIdentity = Depends(require_permission(PERM_WRITE)),
         _apply: ApiIdentity = Depends(require_permission("plugin:lyndrix.plugin.iac_orchestrator:api:infra_apply")),
     ):
-        return await _api.do_apply_pending_plan()
+        return await _api.do_apply_pending_plan(identity)
 
     @router.post("/infra/pending-plan/dismiss")
     async def dismiss_pending_plan(
@@ -345,7 +353,7 @@ def build_plugin_router(service) -> APIRouter:
         identity: ApiIdentity = Depends(require_permission(PERM_WRITE)),
         _apply: ApiIdentity = Depends(require_permission("plugin:lyndrix.plugin.iac_orchestrator:api:infra_apply")),
     ):
-        return await _api.do_trigger_infra_apply()
+        return await _api.do_trigger_infra_apply(identity)
 
     # Mint a short-lived ticket for the SSE/raw-log endpoints. Requires api:read
     # (same scope the stream itself needs), so the long-lived bearer token never
