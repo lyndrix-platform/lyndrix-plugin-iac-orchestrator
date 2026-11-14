@@ -8,6 +8,7 @@ from core.api import ModuleManifest, NotificationEndpoint, PluginHealthStatus, d
 from .app.controller.service import IaCService
 from .app.controller.api import init_api
 from .app.controller.webhook_router import build_webhook_router
+from .app.controller.public_mount import mount_direct_routes, unmount_direct_routes
 from .app.api import build_plugin_router, build_stream_router
 from .app.model.models import Base
 from .app.ui.dashboard import render_dashboard
@@ -294,32 +295,33 @@ def setup(ctx):
 
     # API wiring
     init_api(ctx, _service)
+
+    # Auth'd plugin router — mounted via the registry, which adds require_api_auth
+    # automatically. Routes add require_permission(...) themselves. Registered
+    # FIRST: on a re-enable the registry replaces its router by removing every
+    # route under /api/plugins/<id> — that must not hit the stream routes below.
+    ctx.register_routes(build_plugin_router(_service))
+
     # TODO(agent): these reach into core internals (`main.app`, `core.api.route_order`)
     # to mount the auth-exempt public webhook + SSE routers directly on the app.
     # The stable fix is a sanctioned `core.api` helper for "mount a public
-    # (auth-exempt) router"; it does not exist yet, so this coupling stays for now
-    # (audit findings -010, -011 structural move also deferred — needs core support).
+    # (auth-exempt) router with its own prefix"; it does not exist yet.
     from main import app as fastapi_app
     from core.api.route_order import move_routes_before_catchall
 
-    # Public webhook router (/api/iac) — mounted DIRECTLY on the app. It must NOT
-    # go through ctx.register_routes(): the registry wraps every route with
-    # require_api_auth, which would reject external GitLab/CI callers that carry no
-    # Lyndrix user token. Each handler validates the x_gitlab_token itself.
-    fastapi_app.include_router(build_webhook_router(_service))
-    move_routes_before_catchall(fastapi_app, "/api/iac")
-
-    # Live SSE job stream — also mounted directly, because EventSource cannot send
-    # an Authorization header. The handler validates the ?token= query param. (The
-    # registry's header auth would otherwise break the stream.)
-    fastapi_app.include_router(build_stream_router(_service))
-    move_routes_before_catchall(
-        fastapi_app, "/api/plugins/lyndrix.plugin.iac_orchestrator/stream"
+    # * Public webhook router (/api/iac): external GitLab/CI callers carry no
+    #   Lyndrix user token; each handler validates the x_gitlab_token itself.
+    # * Live SSE job stream + raw log: EventSource/browser downloads cannot send
+    #   an Authorization header; the handlers validate a ?ticket=/?token=.
+    # public_mount removes the copies an earlier incarnation left behind first
+    # and teardown() removes ours again (audit OS-15 / OC-17).
+    stale = mount_direct_routes(
+        fastapi_app, manifest.id,
+        [build_webhook_router(_service), build_stream_router(_service)],
+        reorder=move_routes_before_catchall,
     )
-
-    # Auth'd plugin router — mounted via the registry, which adds require_api_auth
-    # automatically. Routes add require_permission(api:read|api:write) themselves.
-    ctx.register_routes(build_plugin_router(_service))
+    if stale:
+        ctx.log.info(f"IaC Orchestrator: replaced {stale} stale directly mounted route(s).")
 
     # DB bootstrap
     _service.bootstrap_db(Base)
@@ -408,6 +410,16 @@ async def teardown(ctx):
     in flight is DETACHED, never closed — see IaCService.shutdown."""
     global _service
     svc, _service = _service, None
+    # First: stop answering. The registry unmounts its own routes; the directly
+    # mounted ones (/api/iac/*, stream) are ours to remove — a disabled plugin
+    # must not keep accepting webhooks and CI triggers.
+    try:
+        from main import app as fastapi_app
+
+        removed = unmount_direct_routes(fastapi_app, manifest.id)
+        ctx.log.info(f"IaC Orchestrator: removed {removed} directly mounted route(s).")
+    except Exception as exc:
+        ctx.log.warning(f"IaC Orchestrator: could not remove the public routes: {exc}")
     if svc is not None:
         try:
             await svc.shutdown(reason="plugin reload", budget=12)
