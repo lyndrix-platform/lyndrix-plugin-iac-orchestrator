@@ -31,12 +31,18 @@ def api(monkeypatch):
     ctx.notify = MagicMock()
     monkeypatch.setattr(api_mod, "_ctx", ctx)
     monkeypatch.setattr(api_mod, "_engine", SimpleNamespace(config=IaCConfig(ctx)))
-    monkeypatch.setattr(api_mod, "_service", SimpleNamespace(state={}))
+    ctx.submitted = []
+
+    async def submit_job(payload, *, entitlements=(), requested_by=None):
+        ctx.submitted.append((dict(payload), set(entitlements)))
+        return len(ctx.submitted)
+
+    monkeypatch.setattr(api_mod, "_service", SimpleNamespace(state={}, submit_job=submit_job))
     return ctx
 
 
 def _triggers(ctx):
-    return [c.args[1] for c in ctx.emit.call_args_list if c.args[0] == "iac:webhook_verified"]
+    return [payload for payload, _ents in ctx.submitted]
 
 
 def test_minting_the_webhook_token_needs_apply_and_credentials_permission():
@@ -116,3 +122,4 @@ def test_token_apply_route_is_off_by_default(api):
     assert exc.value.status_code == 401 and _triggers(api) == []
     asyncio.run(api_mod.do_trigger_infra_apply_by_token("dummy-webhook-token-not-real"))
     assert _triggers(api)[0]["pipeline_type"] == "infra_apply" and _triggers(api)[0]["approve"] is True
+    assert "approve" in api.submitted[0][1]            # entitled code path

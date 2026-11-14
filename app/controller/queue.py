@@ -249,7 +249,11 @@ class JobQueue:
           (payload replaced, ``start_time = now`` so the CI finds it via ``since_epoch``);
           a trigger that must run now (UI deploy, ``force``) **promotes** it to QUEUED instead.
         """
-        payload = normalize_payload(payload)
+        # The single point where a payload becomes a job row: nothing unvalidated
+        # is ever stored (audit OS-09). Raises InvalidJobPayload.
+        from .job_payload import validate_structure
+
+        payload = validate_structure(payload)
         key = dedupe_key_for(payload)
         session = self._session()
         if not session:

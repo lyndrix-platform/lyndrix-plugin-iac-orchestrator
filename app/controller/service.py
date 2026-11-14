@@ -15,6 +15,7 @@ from .engine import DeploymentEngine
 from .queue import JobQueue, JobWorker, DuplicateJob
 from .socket_client import SocketBusClient
 from .gitlab_webhooks import sync_group_webhooks_from_ctx, WebhookConfigError
+from .job_payload import ALL_ENTITLEMENTS, InvalidJobPayload, strip_unentitled, validate_structure
 
 log = logging.getLogger("IaC:Service")
 
@@ -43,6 +44,9 @@ class IaCService:
         self.queue = JobQueue()
         self.engine = DeploymentEngine(ctx, self.state, self.db, self.config, self.socket_client)
         self.engine.queue = self.queue
+        # The engine's own hand-offs (host rollout after a provision) enter the
+        # queue through the same validated door as every other trigger.
+        self.engine.submit_job = self.submit_job
         # Maintenance windows (1.6): a job the queue closes itself (orphan sweep →
         # mark_failed) still ends its maintenance override exactly once.
         self.queue.on_terminal = self.engine.end_override_for
@@ -129,17 +133,78 @@ class IaCService:
         return await self.engine.finalize_from_containers(job_id, reason=f"restarted (owner '{owner}')")
 
     async def run_claimed(self, payload: dict, job_id: int):
-        """Execute a job this instance's worker claimed."""
+        """Execute a job this instance's worker claimed.
+
+        The row was written by whichever instance enqueued it — the payload is
+        validated again before anything acts on it (audit OS-09)."""
+        try:
+            payload = validate_structure(payload)
+        except InvalidJobPayload as exc:
+            log.error(f"WORKER: job #{job_id} rejected at claim — invalid payload: {exc}")
+            await asyncio.to_thread(self._reject_claimed, job_id, str(exc))
+            return
         await self.ensure_runtime_paths()
         await self.engine.run_pipeline(payload, job_id=job_id)
 
-    async def enqueue_from_event(self, payload: dict) -> int | None:
-        """``iac:webhook_verified`` handler body: queue the pipeline, tell the user
-        when the same target is already queued/running (the old engine guard did
-        this silently with a toast — keep the toast)."""
+    def _reject_claimed(self, job_id: int, reason: str) -> None:
+        step = f"Rejected: invalid job payload ({reason})"[:250]
         try:
-            return await asyncio.to_thread(self.enqueue_pipeline, payload,
-                                           requested_by=payload.get("trigger") or ("ui" if payload.get("manual") else "webhook"))
+            self.queue.append_log(job_id, [f"[SYSTEM] {step} — nothing was executed."], self.queue.last_seq(job_id))
+        except Exception as exc:
+            log.debug(f"reject log line for #{job_id} not written: {exc}")
+        self.db.update_progress(job_id, progress=None, current_step=step)
+        self.db.update_job(job_id, "FAILED")
+
+    async def submit_job(self, payload: dict, *, entitlements=(), requested_by: str | None = None) -> int | None:
+        """The one way a trigger becomes a job.
+
+        ``entitlements`` names the privileged fields the calling code path may
+        set (``job_payload.ENT_*``); everything else is stripped, then the
+        payload is validated. Returns the job id, ``None`` when the same target
+        is already queued/running. Raises :class:`InvalidJobPayload`.
+        """
+        clean, dropped = strip_unentitled(payload or {}, entitlements)
+        if dropped:
+            log.warning(f"ENQUEUE: dropped privileged field(s) {dropped} from a "
+                        f"'{clean.get('pipeline_type')}' trigger without entitlement.")
+        clean = validate_structure(clean)
+        who = requested_by or clean.get("trigger") or ("ui" if clean.get("manual") else "webhook")
+        try:
+            return await asyncio.to_thread(self.enqueue_pipeline, clean, requested_by=who)
+        except DuplicateJob as exc:
+            target = clean.get("service_name") or clean.get("host_name") or clean.get("limit") or clean.get("pipeline_type")
+            log.warning(f"ENQUEUE: duplicate pipeline ignored for '{target}' (job #{exc.existing_id} active).")
+            try:
+                self.engine._notify("Pipeline Ignored",
+                                    f"A run for {target} is already queued or running (job #{exc.existing_id}).",
+                                    "warning")
+            except Exception:
+                pass
+            return None
+
+    def submit_from_ui(self, payload: dict) -> None:
+        """Trigger from the plugin's own in-process (NiceGUI) pages: sync wrapper
+        around :meth:`submit_job` with the page's entitlements."""
+        async def _go():
+            try:
+                await self.submit_job(payload, entitlements=ALL_ENTITLEMENTS)
+            except InvalidJobPayload as exc:
+                log.warning(f"ENQUEUE: UI trigger rejected: {exc}")
+            except Exception as exc:
+                log.error(f"ENQUEUE: UI trigger failed: {exc}")
+
+        self.ctx.create_task(_go(), name="iac:ui_submit")
+
+    async def enqueue_from_event(self, payload: dict) -> int | None:
+        """``iac:webhook_verified`` handler body. The bus has no sender identity —
+        any plugin can emit this topic — so the payload is UNTRUSTED: no
+        ``approve``, no ``force``, no self-declared trigger, strict validation.
+        The plugin's own triggers do not come this way (they call submit_job)."""
+        try:
+            return await self.submit_job(payload or {}, entitlements=())
+        except InvalidJobPayload as exc:
+            log.warning(f"ENQUEUE: bus trigger rejected — {exc}")
+            return None
         except DuplicateJob as exc:
             target = payload.get("service_name") or payload.get("host_name") or payload.get("limit") or payload.get("pipeline_type")
             log.warning(f"ENQUEUE: duplicate pipeline ignored for '{target}' (job #{exc.existing_id} active).")

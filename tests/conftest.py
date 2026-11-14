@@ -51,3 +51,23 @@ def sqlite_queue(monkeypatch):
     jq = queue_mod.JobQueue()
     jq.ensure_schema()
     return jq
+
+
+@pytest.fixture
+def iac_service(sqlite_queue):
+    """An :class:`IaCService` on the SQLite queue with a mock context whose
+    ``create_task`` schedules on the running loop. ``svc.ctx`` is the mock."""
+    import asyncio
+    from unittest.mock import MagicMock
+
+    from iac_plugin.app.controller.service import IaCService
+
+    ctx = MagicMock()
+    ctx.subscribe = MagicMock(return_value=lambda fn: fn)
+    ctx.get_secret = MagicMock(return_value=None)
+    ctx.instance_id = "docker-auto-runner"
+    ctx.roles = ["api", "runner"]
+    ctx.create_task = lambda coro, name=None: asyncio.get_running_loop().create_task(coro)
+    svc = IaCService(ctx)
+    svc._runtime_paths_resolved = True
+    return svc

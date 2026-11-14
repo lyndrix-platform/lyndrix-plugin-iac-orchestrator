@@ -43,7 +43,9 @@ SOURCE = "iac-orchestrator"
 #: Triggers whose deploys follow the service's ``deploy_policy`` (``window`` → park
 #: until the next window). Everything else — UI catalog button, NiceGUI, host
 #: rollouts, "run now" (``force``) — runs at once.
-POLICY_TRIGGERS = frozenset({"gitlab-ci", "webhook", "gitlab_pipeline_success"})
+# "bus" = a trigger whose origin could not vouch for itself (job_payload.UNTRUSTED_TRIGGER):
+# it is governed by the policy and can never claim "run now".
+POLICY_TRIGGERS = frozenset({"gitlab-ci", "webhook", "gitlab_pipeline_success", "bus"})
 
 #: Stages whose services default to ``deploy_policy: window``.
 WINDOW_DEFAULT_STAGES = frozenset({"prod"})

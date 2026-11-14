@@ -653,13 +653,28 @@ class TriggerHostRolloutStage(BaseStage):
         # Emit exactly what the Assignments 'Deploy Host' button emits: a host-scoped
         # rollout that runs the per-host drift check and deploys only this host's
         # services on this host. Reuses the proven flow rather than duplicating it.
-        engine.ctx.emit("iac:webhook_verified", {
+        payload = {
             "pipeline_type": "rollout",
             "limit": self.host_name,
             "manual": True,
             "source": "host_provision_chain",
-        })
-        return StageResult(True, f"Host rollout queued for '{self.host_name}' (existing Deploy Host flow).")
+            "trigger": "engine",
+        }
+        submit = getattr(engine, "submit_job", None)
+        if submit is None:
+            # Engine used without the service (tests, legacy): the bus path — an
+            # untrusted trigger there, which is fine for a plain host rollout.
+            engine.ctx.emit("iac:webhook_verified", payload)
+            return StageResult(True, f"Host rollout queued for '{self.host_name}' (existing Deploy Host flow).")
+        try:
+            job_id = await submit(payload, entitlements=("trigger",))
+        except Exception as exc:
+            return StageResult(False, f"Host rollout for '{self.host_name}' could not be queued: {exc}")
+        if job_id:
+            return StageResult(True, f"Host rollout queued for '{self.host_name}' as job #{job_id}.")
+        log.warning(f"Host rollout for '{self.host_name}' NOT queued: a rollout for this target is already queued or running.")
+        return StageResult(True, f"Host rollout for '{self.host_name}' not queued — a rollout for this target "
+                                 "is already queued or running.")
 
 class DetectDriftStage(BaseStage):
     def __init__(self):

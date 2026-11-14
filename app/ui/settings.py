@@ -139,7 +139,7 @@ def render_settings_ui(ctx, service):
                             def _run_test_deploy():
                                 hosts = _allowlisted_hosts()
                                 for hn in hosts:
-                                    ctx.emit('iac:webhook_verified', {
+                                    service.submit_from_ui({
                                         'pipeline_type': 'host_provision',
                                         'host_name': hn,
                                         'approve': True,

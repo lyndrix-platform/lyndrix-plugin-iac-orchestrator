@@ -36,6 +36,7 @@ from .settings_schema import (
     is_valid_credential_alias,
 )
 from .queue import DuplicateJob as _DuplicateJob
+from .job_payload import ENT_APPROVE, ENT_TRIGGER, InvalidJobPayload
 from . import maintenance_resolver as _mres
 from .public_projection import public_catalog_entry, public_scalar
 
@@ -96,6 +97,19 @@ def _emit_webhook_verified(event_payload: dict) -> None:
     except Exception as exc:
         _ctx.log.debug(f"NOTIFY: webhook_verified notify failed: {exc}")
 
+
+
+async def _submit(payload: dict, *entitlements: str) -> int | None:
+    """Queue a trigger of this API (validated, with the entitlements of the calling
+    route). Returns the job id, ``None`` when the target is already queued/running;
+    an invalid payload is a 400. Triggers no longer travel over the bus: the bus
+    topic ``iac:webhook_verified`` has no sender identity (audit OS-09)."""
+    if not _service:
+        raise HTTPException(status_code=503, detail="Orchestrator not initialized")
+    try:
+        return await _service.submit_job(payload, entitlements=entitlements)
+    except InvalidJobPayload as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid job payload: {exc}")
 
 def _require_gitlab_token(x_gitlab_token: str | None):
     if not _ctx:
@@ -589,10 +603,10 @@ async def do_gitlab_webhook(request: Request, x_gitlab_token: str | None):
             )
             return {"status": "accepted", "triggered": False, "reason": event_reason}
 
-        _ctx.emit("iac:webhook_verified", event_payload)
+        job_id = await _submit(event_payload, ENT_TRIGGER)
         _emit_webhook_verified(event_payload)
 
-        return {"status": "accepted", "triggered": True, "reason": f"{reason}; {event_reason}"}
+        return {"status": "accepted", "triggered": True, "reason": f"{reason}; {event_reason}", "job_id": job_id}
     except HTTPException:
         raise
     except Exception as e:
@@ -678,10 +692,10 @@ async def do_trigger_service_deployment(service_name: str, payload: DeployReques
     }
     if payload.dry_run:
         event_payload["dry_run"] = True
-    _ctx.emit("iac:webhook_verified", event_payload)
+    job_id = await _submit(event_payload, ENT_TRIGGER)
     _emit_webhook_verified(event_payload)
     kind = "Dry-run (--check)" if payload.dry_run else "Deployment"
-    return {"status": "accepted", "dry_run": bool(payload.dry_run),
+    return {"status": "accepted", "dry_run": bool(payload.dry_run), "job_id": job_id,
             "message": f"{kind} queued for {normalized_service}"}
 
 
@@ -925,10 +939,11 @@ async def do_trigger_test_host_deployment(host_name: str, payload: TestHostDeplo
         "trigger": "manual_test_host",
         "test_host": host,
     }
-    _ctx.emit("iac:webhook_verified", event_payload)
+    job_id = await _submit(event_payload, ENT_TRIGGER)
     _emit_webhook_verified(event_payload)
     return {
         "status": "accepted",
+        "job_id": job_id,
         "message": f"Host provisioning queued for host '{host}'.",
         "host_name": host,
         "services": [str(s).strip() for s in (payload.services or []) if str(s).strip()],
@@ -973,10 +988,11 @@ async def do_trigger_host_bootstrap(host_name: str, payload: TestHostDeployReque
         "manual": True,
         "trigger": "manual_bootstrap",
     }
-    _ctx.emit("iac:webhook_verified", event_payload)
+    job_id = await _submit(event_payload, ENT_TRIGGER)
     _emit_webhook_verified(event_payload)
     return {
         "status": "accepted",
+        "job_id": job_id,
         "message": f"Compliance bootstrap queued for host '{host}'.",
         "host_name": host,
     }
@@ -987,9 +1003,9 @@ async def do_trigger_infra_plan():
     if not _ctx:
         raise HTTPException(status_code=500, detail="Context offline")
     infra_plan_payload = {"pipeline_type": "infra_plan", "manual": True, "trigger": "manual_infra_plan"}
-    _ctx.emit("iac:webhook_verified", infra_plan_payload)
+    job_id = await _submit(infra_plan_payload, ENT_TRIGGER)
     _emit_webhook_verified(infra_plan_payload)
-    return {"status": "accepted", "message": "Infrastructure plan (Check Env) queued."}
+    return {"status": "accepted", "message": "Infrastructure plan (Check Env) queued.", "job_id": job_id}
 
 
 async def do_trigger_infra_apply_by_token(x_gitlab_token: str | None):
@@ -1022,9 +1038,10 @@ async def do_trigger_infra_apply():
         "manual": True,
         "trigger": "manual_infra_apply",
     }
-    _ctx.emit("iac:webhook_verified", infra_apply_payload)
+    # Only the two apply routes (permission api:infra_apply) may set ``approve``.
+    job_id = await _submit(infra_apply_payload, ENT_TRIGGER, ENT_APPROVE)
     _emit_webhook_verified(infra_apply_payload)
-    return {"status": "accepted", "message": "Infrastructure deploy queued."}
+    return {"status": "accepted", "message": "Infrastructure deploy queued.", "job_id": job_id}
 
 
 # ── Pending infra plan (review-and-approve flow) ────────────────────────────
@@ -1063,10 +1080,11 @@ async def do_apply_pending_plan():
         "trigger": "pending_plan_approval",
         "plan_job_id": data.get("job_id"),
     }
-    _ctx.emit("iac:webhook_verified", payload)
+    job_id = await _submit(payload, ENT_TRIGGER, ENT_APPROVE)
     _emit_webhook_verified(payload)
     return {
         "status": "accepted",
+        "job_id": job_id,
         "message": "Approved — infrastructure deploy queued.",
         "plan_job_id": data.get("job_id"),
     }
@@ -1331,13 +1349,14 @@ async def do_run_pipeline(payload: PipelineRequest, identity=None):
     if payload.dry_run:
         event_payload["dry_run"] = True
 
-    _ctx.emit("iac:webhook_verified", event_payload)
+    job_id = await _submit(event_payload, ENT_TRIGGER)
     _emit_webhook_verified(event_payload)
     target = host or limit
     suffix = " (dry-run, --check)" if payload.dry_run else ""
     return {
         "status": "accepted",
         "message": f"Pipeline '{pipeline_type}' queued for '{target}'{suffix}.",
+        "job_id": job_id,
         "dry_run": bool(payload.dry_run),
         "pipeline_type": pipeline_type,
         "limit": limit or None,

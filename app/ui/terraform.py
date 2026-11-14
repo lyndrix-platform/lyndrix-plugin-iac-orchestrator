@@ -172,7 +172,7 @@ def render_terraform_panel(ctx, service):
     state = service.state
 
     def _emit(payload: dict):
-        ctx.emit("iac:webhook_verified", payload)
+        service.submit_from_ui(payload)
 
     @ui.refreshable
     def _panel():

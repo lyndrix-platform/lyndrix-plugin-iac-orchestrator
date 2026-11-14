@@ -75,9 +75,18 @@ class CloneServiceRepoStage(BaseStage):
         self.payload = payload
 
     async def run(self, engine, context: dict) -> StageResult:
+        from ..app.controller.job_payload import is_safe_name
+
         services_dir = engine.config.services_dir
         services_dir.mkdir(parents=True, exist_ok=True)
+        # Last line of defence before `git clone -b` and rmtree (audit OS-09):
+        # the name and branch are plain tokens and the checkout is a direct child
+        # of services_dir — whatever put them into the job.
+        if not is_safe_name(self.service_name) or not is_safe_name(self.branch):
+            return StageResult(False, f"Refusing to sync: invalid service name or branch ({self.service_name!r}, {self.branch!r}).")
         target_dir = services_dir / self.service_name
+        if target_dir.resolve().parent != services_dir.resolve():
+            return StageResult(False, f"Refusing to sync '{self.service_name}': path escapes the services directory.")
         repo_url = None
         if not repo_url:
             catalog_file = engine.base_git_dir / "iac_controller" / "environments" / "global" / "02_service_catalog.yml"
