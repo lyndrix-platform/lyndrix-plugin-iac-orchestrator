@@ -97,7 +97,7 @@ def test_providers_exclude_secrets():
     providers = build_providers(_config(hardware=hw))
     assert set(providers) == {"hydra"}
     p = providers["hydra"]
-    assert p["provider"] == "proxmox" and p["endpoint"] == "10.1.120.5"
+    assert p["provider"] == "proxmox" and p["endpoint"] == "https://10.1.120.5:8006"
     assert "password" not in p and "token" not in p and "ssh_key" not in p
 
 
