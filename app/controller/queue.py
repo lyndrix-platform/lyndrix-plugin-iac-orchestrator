@@ -26,7 +26,7 @@ from sqlalchemy import inspect as sa_inspect, select, text, update
 
 from core.api import db_instance
 
-from ..model.models import IaCJob, IaCJobLog, Base
+from ..model.models import IaCJob, IaCJobLog, IaCLock, Base
 
 log = logging.getLogger("IaC:Queue")
 
@@ -774,6 +774,90 @@ class JobQueue:
                 out.append({"id": int(job_id), "override_id": override_id, "window_ci_ids": ci_ids,
                             "claimed_at": from_queue_clock(claimed_at)})
             return out
+        finally:
+            session.close()
+
+    # ------------------------------------------------------- named locks (OC-01)
+    def acquire_lock(self, key: str, job_id: int, owner: str | None = None) -> tuple[bool, int | None]:
+        """Try to take lock ``key`` for ``job_id``. Returns ``(acquired, holder)``.
+
+        Atomic by the primary key: the INSERT wins or fails. A lock whose holder
+        job is no longer RUNNING is stale and taken over with a conditional
+        UPDATE (only one of several waiters succeeds). Re-entrant for the job
+        that already holds it.
+        """
+        from sqlalchemy.exc import IntegrityError
+
+        session = self._session()
+        if not session:
+            return False, None
+        try:
+            try:
+                session.add(IaCLock(lock_key=key, job_id=int(job_id), token=uuid.uuid4().hex, owner_instance=owner))
+                session.commit()
+                return True, int(job_id)
+            except IntegrityError:
+                session.rollback()
+            row = session.execute(
+                select(IaCLock.job_id, IaCLock.token).where(IaCLock.lock_key == key)
+            ).first()
+            if row is None:
+                return False, None            # released in between — the caller polls again
+            holder, holder_token = int(row[0]), row[1]
+            if holder == int(job_id):
+                return True, holder
+            status = session.execute(select(IaCJob.status).where(IaCJob.id == holder)).scalar()
+            if status == STATUS_RUNNING:
+                return False, holder
+            res = session.execute(
+                update(IaCLock).where(IaCLock.lock_key == key, IaCLock.job_id == holder, IaCLock.token == holder_token)
+                .values(job_id=int(job_id), token=uuid.uuid4().hex, owner_instance=owner, acquired_at=datetime.now())
+            )
+            session.commit()
+            if res.rowcount == 1:
+                log.info("QUEUE: lock '%s' taken over from finished job #%s by job #%s", key, holder, job_id)
+                return True, int(job_id)
+            return False, holder
+        except Exception as exc:
+            session.rollback()
+            log.error("QUEUE: acquire_lock('%s') failed: %s", key, exc)
+            raise
+        finally:
+            session.close()
+
+    def release_lock(self, key: str, job_id: int) -> bool:
+        """Give lock ``key`` back (only when ``job_id`` holds it)."""
+        session = self._session()
+        if not session:
+            return False
+        try:
+            n = session.query(IaCLock).filter(IaCLock.lock_key == key, IaCLock.job_id == int(job_id)).delete(
+                synchronize_session=False)
+            session.commit()
+            return bool(n)
+        except Exception as exc:
+            session.rollback()
+            log.debug("QUEUE: release_lock('%s') failed: %s", key, exc)
+            return False
+        finally:
+            session.close()
+
+    def lock_holder(self, key: str) -> int | None:
+        session = self._session()
+        if not session:
+            return None
+        try:
+            val = session.execute(select(IaCLock.job_id).where(IaCLock.lock_key == key)).scalar()
+            return int(val) if val is not None else None
+        finally:
+            session.close()
+
+    def job_status(self, job_id: int) -> str | None:
+        session = self._session()
+        if not session:
+            return None
+        try:
+            return session.execute(select(IaCJob.status).where(IaCJob.id == job_id)).scalar()
         finally:
             session.close()
 

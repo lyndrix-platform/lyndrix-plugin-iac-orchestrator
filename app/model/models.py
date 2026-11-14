@@ -51,6 +51,25 @@ class IaCJob(Base):
     schedule_reason = Column(String(255), nullable=True) # why the job was parked (operator-facing)
 
 
+class IaCLock(Base):
+    """Named mutex held by a JOB (audit OC-01).
+
+    ``tf:<site>_<stage>`` serialises every OpenTofu run on one environment state:
+    the S3 backend has no state locking, and the per-process semaphore neither
+    survives a plugin reload nor knows about a second runner. A lock is valid
+    while its job row is RUNNING — a holder that crashed keeps it until its job
+    is closed (its tofu container may still be running), after that it can be
+    taken over.
+    """
+    __tablename__ = "iac_orchestrator_locks"
+
+    lock_key = Column(String(190), primary_key=True)
+    job_id = Column(Integer, nullable=False)
+    token = Column(String(64), nullable=False)
+    owner_instance = Column(String(100), nullable=True)
+    acquired_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
 class IaCJobLog(Base):
     """One log line per row — written by the executing runner, read by every instance.
 

@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import json
 import sys
 import os
@@ -2433,31 +2434,71 @@ class DeploymentEngine:
             if isinstance(data, dict) and data.get("job_id") and data.get("status") in self._LIVE_TASK_STATUSES
         }
 
-    async def stop_job_containers(self, job_id: int) -> int:
-        """Remove this host's runner containers of ``job_id`` (by label). No status
-        write — callers decide what the job's row becomes. Returns the count."""
-        killed = 0
-        if shutil.which("docker"):
+    #: Seconds a Terraform container gets to finish its current state write on abort.
+    _TF_STOP_GRACE_SECONDS = 30
+
+    async def _list_job_containers(self, job_id: int | None = None) -> list[dict]:
+        """Runner containers on this host by label (all states): ``[{id, name,
+        state, job_id, task_name, kind}]``. Both kinds — Ansible and Terraform —
+        carry ``iac_job_id``; ``kind`` falls back to the name prefix for
+        containers started by an older plugin version."""
+        if not shutil.which("docker"):
+            return []
+        label = f"label=iac_job_id={job_id}" if job_id is not None else "label=iac_job_id"
+        fmt = ('{{.ID}}\t{{.Names}}\t{{.State}}\t{{.Label "iac_job_id"}}\t'
+               '{{.Label "iac_task_name"}}\t{{.Label "iac_kind"}}')
+        ps = await asyncio.create_subprocess_exec(
+            "docker", "ps", "-a", "--filter", label, "--format", fmt,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+        )
+        out, _ = await ps.communicate()
+        containers = []
+        for line in (out or b"").decode(errors="replace").splitlines():
+            parts = line.split("\t")
+            if len(parts) < 4 or not parts[0].strip():
+                continue
+            name = parts[1]
+            kind = (parts[5].strip() if len(parts) > 5 else "") or ("terraform" if name.startswith("iac-tf-") else "ansible")
+            task = (parts[4].strip() if len(parts) > 4 else "") or name.replace("aac-runner-", "")
             try:
-                ps = await asyncio.create_subprocess_exec(
-                    "docker", "ps", "-q", "--filter", f"label=iac_job_id={job_id}",
-                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+                cid_job = int(parts[3])
+            except ValueError:
+                continue
+            containers.append({"id": parts[0].strip(), "name": name, "state": parts[2].strip(),
+                               "job_id": cid_job, "task_name": task, "kind": kind})
+        return containers
+
+    async def stop_job_containers(self, job_id: int) -> int:
+        """Stop and remove this host's runner containers of ``job_id`` (found by
+        label — Terraform containers too, audit OC-02). A running Terraform
+        container is stopped with a grace period first so tofu can finish writing
+        its state; everything is removed afterwards. No status write — callers
+        decide what the job's row becomes. Returns the number of containers."""
+        count = 0
+        try:
+            containers = await self._list_job_containers(job_id)
+            tf_running = [c["id"] for c in containers if c["kind"] == "terraform" and c["state"] == "running"]
+            if tf_running:
+                stop = await asyncio.create_subprocess_exec(
+                    "docker", "stop", "-t", str(self._TF_STOP_GRACE_SECONDS), *tf_running,
+                    stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
                 )
-                out, _ = await ps.communicate()
-                ids = out.decode().split()
-                if ids:
-                    rm = await asyncio.create_subprocess_exec(
-                        "docker", "rm", "-f", *ids,
-                        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
-                    )
-                    await rm.wait()
-                    killed = len(ids)
-            except Exception as exc:
-                log.debug(f"stop_job_containers: container cleanup failed: {exc}")
+                await stop.wait()
+            ids = [c["id"] for c in containers]
+            if ids:
+                rm = await asyncio.create_subprocess_exec(
+                    "docker", "rm", "-f", *ids,
+                    stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+                )
+                if await rm.wait() != 0:
+                    log.warning(f"stop_job_containers: could not remove every container of job #{job_id}.")
+                count = len(ids)
+        except Exception as exc:
+            log.warning(f"stop_job_containers: container cleanup for job #{job_id} failed: {exc}")
         for data in list((self.state.get("active_tasks") or {}).values()):
             if isinstance(data, dict) and data.get("job_id") == job_id:
                 data["status"] = "aborted"
-        return killed
+        return count
 
     async def abort_job(self, job_id: int, *, reason: str = "Aborted by User") -> int:
         """Kill this host's runner containers of ``job_id`` and close its row as ABORTED
@@ -2669,33 +2710,22 @@ class DeploymentEngine:
             pass
 
     async def reconcile_orphaned_runners(self, job_id=None):
+        """Re-attach to the runner containers a previous incarnation left on this
+        host — Ansible and Terraform, found by their ``iac_job_id`` label."""
         try:
-            if self.socket_client is None:
-                raise RuntimeError("Socket manager client is not configured.")
-            payload = await self.socket_client.request("docker:runners", args={"prefix": "aac-runner-"})
-            containers = []
-            if isinstance(payload, dict):
-                containers = payload.get("containers") or []
+            containers = await self._list_job_containers(job_id)
             if not containers:
                 return
 
             log.info(f"Reconciliation: Found {len(containers)} orphaned runners. Reattaching...")
             self.state["is_running"] = True
-            
+
             for container in containers:
-                c_name = container.get("name") or ""
-                labels = container.get("labels") or {}
-                try:
-                    recovered_job_id = int(labels.get("iac_job_id")) if labels.get("iac_job_id") else (job_id or 0)
-                except ValueError:
-                    recovered_job_id = job_id or 0
-                    
-                task_name = labels.get("iac_task_name") or c_name.replace("aac-runner-", "")
-                
+                c_name, task_name, recovered_job_id = container["name"], container["task_name"], container["job_id"]
                 if "active_tasks" not in self.state: self.state["active_tasks"] = {}
                 if task_name not in self.state["active_tasks"]:
                     self.state["active_tasks"][task_name] = {
-                        "status": "running_ansible",
+                        "status": "running_terraform" if container["kind"] == "terraform" else "running_ansible",
                         "logs": [],
                         "job_id": recovered_job_id
                     }
@@ -3145,6 +3175,8 @@ class DeploymentEngine:
         host_name: str = "",
         import_specs: list[dict] | None = None,
         dry_run: bool = False,
+        state_key: str | None = None,
+        stable_rel_dir: str | None = None,
     ) -> tuple[bool, dict]:
         """Run OpenTofu/Terraform in an ephemeral Docker container against a
         rendered run dir.
@@ -3169,14 +3201,15 @@ class DeploymentEngine:
             "job_id": job_id,
         }
         self._sync_runners(job_id, force=True)
+        # ``state_key`` ("tf:<site>_<stage>") names the environment state this run
+        # reads/writes; ``stable_rel_dir`` is where a per-job run dir is promoted to.
 
         safe_task_name = "".join(c if c.isalnum() or c in ".-_" else "-" for c in task_name).strip("-")
-        c_name = f"iac-tf-{safe_task_name}"[:62]
-        await asyncio.create_subprocess_exec(
-            "docker", "rm", "-f", c_name,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
+        # One container per JOB and task (audit OC-01): the shared name
+        # "iac-tf-Terraform-Provision--<host>" let a second job's `docker rm -f`
+        # kill the first job's running apply. Nothing is removed before the state
+        # lock is held, and then only a leftover of this very job and task.
+        c_name = f"iac-tf-j{job_id}-{safe_task_name}"[:120]
 
         tf_bin = str(self.config.terraform_binary or "tofu").strip()
         target_flags = "".join(f" -target='{t}'" for t in (targets or []))
@@ -3222,39 +3255,23 @@ class DeploymentEngine:
         )
 
         h_git = self.config.host_git_repos_dir
-        mounts = [
-            {
-                "source": h_git,
-                "target": "/data/storage/git_repos",
-                "mode": "rw",
-            }
+        # Spawned with the docker CLI like the Ansible runner (not via the core's
+        # docker:spawn, which cannot set labels): the labels are what abort and
+        # restart recovery find the container by (audit OC-02).
+        cmd = [
+            "docker", "run", "-d", "--name", c_name, "--pull", "always",
+            "--label", f"iac_job_id={job_id}", "--label", f"iac_task_name={task_name}",
+            "--label", "iac_kind=terraform", "--label", f"iac_tf_mode={mode}",
+            "-e", f"IAC_JOB_ID={job_id}", "-e", "TF_IN_AUTOMATION=1", "-e", "CHECKPOINT_DISABLE=1",
+            "-e", "TF_PLUGIN_CACHE_DIR=/data/storage/terraform-providers",
+            "-v", f"{h_git}:/data/storage/git_repos:rw",
         ]
         if getattr(self.config, "host_terraform_providers_dir", None):
-            mounts.append(
-                {
-                    "source": self.config.host_terraform_providers_dir,
-                    "target": "/data/storage/terraform-providers",
-                    "mode": "rw",
-                }
-            )
-        env_vars = [
-            {"key": "IAC_JOB_ID", "value": str(job_id)},
-            {"key": "TF_IN_AUTOMATION", "value": "1"},
-            {"key": "CHECKPOINT_DISABLE", "value": "1"},
-            {"key": "TF_PLUGIN_CACHE_DIR", "value": "/data/storage/terraform-providers"},
-        ]
-        spawn_request = {
-            "image": self._runner_image("terraform"),
-            "name": c_name,
-            "env_vars": env_vars,
-            "mounts": mounts,
-            "command": ["/bin/sh", "-lc", shell_cmd],
-            # No auto-remove: a fast-failing tofu run would otherwise vanish before
-            # `docker logs -f` drained it and before `docker wait` read the exit code
-            # (→ empty output, swallowed error). _watch_detached_runner removes it.
-            "remove": False,
-            "networks": [],
-        }
+            cmd += ["-v", f"{self.config.host_terraform_providers_dir}:/data/storage/terraform-providers:rw"]
+        # No --rm: a fast-failing tofu run would otherwise vanish before
+        # `docker logs -f` drained it and before `docker wait` read the exit code
+        # (→ empty output, swallowed error). _watch_detached_runner removes it.
+        cmd += ["--entrypoint", "", self._runner_image("terraform"), "/bin/sh", "-lc", shell_cmd]
 
         log.info(
             "Executing Terraform in Docker: scope=%s mode=%s apply=%s host=%s",
@@ -3263,33 +3280,24 @@ class DeploymentEngine:
             do_apply,
             host_name or "(env)",
         )
-        self.state["active_tasks"][task_name]["status"] = "running_terraform"
-        self._sync_runners(job_id, force=True)
 
-        async with self._terraform_run_semaphore:
-            log.info("[TF] Acquired terraform run slot for '%s'.", host_name or "(env)")
-            if self.socket_client is None:
-                raise RuntimeError("Socket manager client is not configured.")
-            try:
-                spawn_result = await self.socket_client.spawn_runner(**spawn_request, timeout=120.0)
-            except TimeoutError as te:
-                raise RuntimeError(f"[TF] Terraform spawn request timed out: {te}")
-            except Exception as se:
-                raise RuntimeError(f"[TF] Failed to send terraform spawn request: {se}")
-            
-            if not isinstance(spawn_result, dict) or spawn_result.get("status") != "running":
-                error_msg = "unknown error"
-                if isinstance(spawn_result, dict):
-                    error_msg = spawn_result.get("error") or error_msg
-                raise RuntimeError(f"Failed to spawn Terraform runner container: {error_msg}")
-
-            success, _stats = await self._watch_detached_runner(
-                c_name, task_name, job_id, kind="terraform",
-                # Only a run that really applies may meet (and tolerate) Proxmox'
-                # "CT already running"; scoped to the targeted host when there is one.
-                tolerate_already_running=do_apply,
-                tf_host=(host_name if targets else None),
-            )
+        # Order: state lock (cluster-wide, per environment state) → run slot (this
+        # process) → container. The lock is given back when the container ended.
+        async with self._terraform_state(state_key, job_id, task_name):
+            async with self._terraform_run_semaphore:
+                log.info("[TF] Acquired terraform run slot for '%s'.", host_name or "(env)")
+                self.state["active_tasks"][task_name]["status"] = "running_terraform"
+                self._sync_runners(job_id, force=True)
+                await self._spawn_terraform_container(c_name, cmd)
+                success, _stats = await self._watch_detached_runner(
+                    c_name, task_name, job_id, kind="terraform",
+                    # Only a run that really applies may meet (and tolerate) Proxmox'
+                    # "CT already running"; scoped to the targeted host when there is one.
+                    tolerate_already_running=do_apply,
+                    tf_host=(host_name if targets else None),
+                )
+            if stable_rel_dir and stable_rel_dir != run_rel_dir:
+                await asyncio.to_thread(self._promote_run_dir, run_rel_dir, stable_rel_dir, job_id)
 
         return success, {
             "successful_hosts": 1 if success else 0,
@@ -3301,6 +3309,104 @@ class DeploymentEngine:
             "plan_summary": _stats.get("plan_summary") or "",
             "exit_code": _stats.get("exit_code"),
         }
+
+    _TF_LOCK_POLL_SECONDS = 5.0
+    _TF_SPAWN_TIMEOUT_SECONDS = 600.0
+
+    @contextlib.asynccontextmanager
+    async def _terraform_state(self, key: str | None, job_id: int, task_name: str):
+        """Hold the cluster-wide lock of one Terraform state for a container run.
+
+        The S3 backend has no state locking and the run slot above is per process
+        (it does not survive a plugin reload and knows nothing of a second
+        runner), so two jobs could run tofu on one environment at once (audit
+        OC-01). The lock row belongs to the JOB: it is released when the container
+        ended; when the watcher is cancelled (abort, reload) it is deliberately
+        NOT released — the container may still be running — and stays with the
+        job until that job is closed, after which the next waiter takes it over.
+        Waiting is bounded: after ``tf_lock_timeout_seconds`` the job fails with
+        a clear message instead of starting a second tofu.
+        """
+        queue = getattr(self, "queue", None)
+        if not key or queue is None or not job_id or job_id == -1:
+            yield
+            return
+        timeout = int(getattr(self.config, "tf_lock_timeout_seconds", 1800))
+        deadline = time.monotonic() + timeout
+        announced = object()
+        owner = getattr(self.ctx, "instance_id", None)
+        while True:
+            acquired, holder = await asyncio.to_thread(queue.acquire_lock, key, job_id, owner if isinstance(owner, str) else None)
+            if acquired:
+                break
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f"[TF] Terraform state '{key}' is in use by job #{holder} — '{task_name}' was NOT started "
+                    f"(waited {timeout}s). Re-trigger once that job has finished."
+                )
+            if holder != announced:
+                announced = holder
+                log.info(f"[TF] Waiting for Terraform state '{key}' (in use by job #{holder})…")
+                self.db.update_progress(job_id, progress=None,
+                                        current_step=f"Waiting for Terraform state {key} (job #{holder})")
+            await asyncio.sleep(self._TF_LOCK_POLL_SECONDS)
+        keep = False
+        try:
+            yield
+        except asyncio.CancelledError:
+            keep = True
+            raise
+        finally:
+            if not keep:
+                await asyncio.to_thread(queue.release_lock, key, job_id)
+
+    async def _spawn_terraform_container(self, c_name: str, cmd: list[str]) -> None:
+        """``docker run -d`` for a Terraform runner. Called with the state lock and
+        the run slot held; removes only a leftover container of the same job+task."""
+        if not shutil.which("docker"):
+            raise RuntimeError("[TF] docker CLI is not available on this instance.")
+        rm = await asyncio.create_subprocess_exec(
+            "docker", "rm", "-f", c_name, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        await rm.communicate()
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+        try:
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=self._TF_SPAWN_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            with contextlib.suppress(Exception):
+                proc.kill()
+            raise RuntimeError(f"[TF] Terraform spawn timed out after {int(self._TF_SPAWN_TIMEOUT_SECONDS)}s (image pull?).")
+        if proc.returncode != 0:
+            detail = (out or b"").decode("utf-8", errors="replace").strip()[-500:]
+            raise RuntimeError(f"Failed to spawn Terraform runner container: {detail or 'docker run failed'}")
+
+    _RUN_DIR_JOB_RE = re.compile(r"^(?P<stable>.+)__j(?P<job>\d+)$")
+
+    def _promote_run_dir(self, run_rel_dir: str, stable_rel_dir: str, job_id: int) -> None:
+        """Finished per-job run dir → its stable name (the one that is versioned in
+        inventory_state), and drop leftover run dirs of jobs that are no longer
+        running. Called while the state lock is held — never touches the dir of a
+        job that may still be using it."""
+        src, dst = self.base_git_dir / run_rel_dir, self.base_git_dir / stable_rel_dir
+        try:
+            if src.is_dir():
+                if dst.exists():
+                    shutil.rmtree(dst)
+                os.replace(src, dst)
+        except OSError as exc:
+            log.warning("[TF] could not promote run dir %s: %s", src.name, exc)
+        queue = getattr(self, "queue", None)
+        for sibling in dst.parent.glob(f"{dst.name}__j*"):
+            m = self._RUN_DIR_JOB_RE.match(sibling.name)
+            if not m or not sibling.is_dir() or int(m.group("job")) == int(job_id or 0):
+                continue
+            try:
+                status = queue.job_status(int(m.group("job"))) if queue is not None else None
+            except Exception:
+                status = "RUNNING"   # unknown → hands off
+            if status == "RUNNING":
+                continue
+            shutil.rmtree(sibling, ignore_errors=True)
 
     @staticmethod
     def _build_import_cmd(tf_bin: str, import_specs: list[dict]) -> str:
@@ -3411,7 +3517,11 @@ class DeploymentEngine:
                 "Missing Terraform secret(s): " + ", ".join(sorted(set(missing)))
             )
 
-        run_rel_dir = f"inventory_state/.terraform_runs/{ctx['env_name']}__{host_name}"
+        # Per-job run dir (audit OC-01): two jobs for one host used to rmtree and
+        # re-render the same directory under each other's running tofu. Only this
+        # job ever touches <stable>__j<job>; it becomes <stable> when the run ended.
+        stable_rel_dir = f"inventory_state/.terraform_runs/{ctx['env_name']}__{host_name}"
+        run_rel_dir = f"{stable_rel_dir}__j{job_id}" if job_id and job_id > 0 else stable_rel_dir
         run_dir = self.base_git_dir / run_rel_dir
         if run_dir.exists():
             shutil.rmtree(run_dir)
@@ -3489,6 +3599,8 @@ class DeploymentEngine:
             job_id=job_id,
             import_specs=import_specs,
             dry_run=dry_run,
+            state_key=f"tf:{ctx['env_name']}",
+            stable_rel_dir=stable_rel_dir,
         )
 
     def _iter_terraform_environments(self) -> list[dict]:
@@ -3558,7 +3670,8 @@ class DeploymentEngine:
                 "Missing Terraform secret(s): " + ", ".join(sorted(set(missing)))
             )
 
-        run_rel_dir = f"inventory_state/.terraform_runs/{env_name}__{mode}"
+        stable_rel_dir = f"inventory_state/.terraform_runs/{env_name}__{mode}"
+        run_rel_dir = f"{stable_rel_dir}__j{job_id}" if job_id and job_id > 0 else stable_rel_dir
         run_dir = self.base_git_dir / run_rel_dir
         if run_dir.exists():
             shutil.rmtree(run_dir)
@@ -3606,6 +3719,8 @@ class DeploymentEngine:
             force_apply=force_apply,
             task_name=f"Terraform {verb}: {env_name}",
             job_id=job_id,
+            state_key=f"tf:{env_name}",
+            stable_rel_dir=stable_rel_dir,
         )
 
     async def execute_terraform_infra(
@@ -3800,6 +3915,7 @@ class DeploymentEngine:
             cmd = [
                 "docker", "run", "-d", "--name", c_name, "--pull", "always",
                 "--label", f"iac_job_id={job_id}", "--label", f"iac_task_name={task_name}",
+                "--label", "iac_kind=ansible",
                 "-e", f"IAC_JOB_ID={job_id}",
                 "-v", f"{h_git}:/data/storage/git_repos", "-v", f"{h_svc}:/data/storage/services",
                 "-e", "ANSIBLE_HOST_KEY_CHECKING=False", "-e", "PYTHONUNBUFFERED=1", "-e", "ANSIBLE_NOCOLOR=1", "-e", "ANSIBLE_DEPRECATION_WARNINGS=0", "-e", "ANSIBLE_INTERPRETER_PYTHON=auto_silent",

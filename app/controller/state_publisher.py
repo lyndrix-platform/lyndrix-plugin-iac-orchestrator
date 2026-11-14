@@ -36,7 +36,9 @@ from pathlib import Path
 log = logging.getLogger("IaC:Engine")
 
 #: Local ignore rules (``.git/info/exclude``): terraform provider cache only.
-LOCAL_EXCLUDES = (".terraform/",)
+# and the per-job run directories of Terraform runs in flight (<env>__<target>__j<job>,
+# promoted to their stable name once the run finished — only that one is versioned).
+LOCAL_EXCLUDES = (".terraform/", ".terraform_runs/*__j[0-9]*/")
 #: Rules 1.5.3 wrote into ``.git/info/exclude`` that must go again: run
 #: directories (incl. rendered secrets) are versioned in the on-prem GitLab.
 OBSOLETE_EXCLUDES = (".terraform_runs/",)

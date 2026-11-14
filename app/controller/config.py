@@ -185,6 +185,13 @@ class IaCConfig:
     def auto_apply(self) -> bool: return str(self._get("PLUGIN_IAC_ORCHESTRATOR_AUTO_APPLY", "iac_auto_apply", "false")).lower() == "true"
 
     @property
+    def tf_lock_timeout_seconds(self) -> int:
+        """How long a Terraform run waits for the state lock of its environment
+        before the job fails (another job is running tofu on that state)."""
+        return self._get_int("PLUGIN_IAC_ORCHESTRATOR_TF_LOCK_TIMEOUT_SECONDS", "iac_tf_lock_timeout_seconds",
+                             1800, minimum=0)
+
+    @property
     def token_infra_apply_enabled(self) -> bool:
         """May the GitLab-token route trigger a fleet apply? Off unless explicitly enabled."""
         return self._get_bool("PLUGIN_IAC_ORCHESTRATOR_TOKEN_INFRA_APPLY", "iac_token_infra_apply_enabled", False)
