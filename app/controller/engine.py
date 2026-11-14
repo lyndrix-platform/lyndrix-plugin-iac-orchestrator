@@ -2683,10 +2683,20 @@ class DeploymentEngine:
             # another secret of the plugin (settings_schema.resolve_credential).
             "secret_value": resolve_credential(self.ctx, config.get("token_key")) or ""
         })
-        try: return (await asyncio.wait_for(future, timeout=240.0)).get("status") == "synced"
-        except asyncio.TimeoutError: return False
+        try:
+            result = await asyncio.wait_for(future, timeout=240.0)
+        except asyncio.TimeoutError:
+            log.error(f"Git sync of '{role_slug}' timed out after 240s (no answer from the core git service).")
+            return False
         finally:
             self.pending_syncs.pop(request_id, None)
+        if result.get("status") == "synced":
+            return True
+        # The core's reason (DNS failure, 401 after a token rotation, …) belongs in
+        # the job log — "Failed to sync iac_controller" alone sent operators to the
+        # runner's container log during the 2026-10-28 outage (audit OC-16).
+        log.error(f"Git sync of '{role_slug}' failed: {result.get('error') or result.get('status') or 'unknown error'}")
+        return False
 
     def repo_token(self, role_slug: str) -> str | None:
         """Access token for a configured core repo (``repo_<slug>_config.token_key``)."""
