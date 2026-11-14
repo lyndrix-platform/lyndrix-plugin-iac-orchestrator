@@ -116,7 +116,12 @@ def normalize_payload(payload: dict) -> dict:
     if ptype == "single_service" and payload.get("service_name"):
         payload["service_name"] = str(payload["service_name"]).strip().lower()
     if ptype in _HOST_SCOPED:
-        host = str(payload.get("host_name") or payload.get("test_host") or payload.get("limit") or "").strip().lower()
+        host = str(payload.get("host_name") or payload.get("test_host") or "").strip().lower()
+        if not host and ptype != "adopt_host":
+            host = str(payload.get("limit") or "").strip().lower()
+        # adopt_host with only a ``limit`` is a SCOPE adopt ("all" or a site): the
+        # limit must not become a host name — "Global Adopt" ended in "No
+        # terraform.tfvars.json contains host 'all'" since the 1.4 queue (OC-15).
         if host:
             payload["host_name"] = host
     return payload
@@ -133,6 +138,9 @@ def dedupe_key_for(payload: dict) -> str | None:
         return f"single_service:{svc}" if svc else None
     if ptype in _HOST_SCOPED:
         host = str(payload.get("host_name") or "").strip().lower()
+        if not host and ptype == "adopt_host":
+            scope = str(payload.get("limit") or "all").strip().lower() or "all"
+            return f"adopt_host:scope:{scope}"
         return f"{ptype}:{host}" if host else None
     if ptype in ("infra_plan", "infra_apply"):
         return "infra"

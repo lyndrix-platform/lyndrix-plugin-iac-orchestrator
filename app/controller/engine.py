@@ -986,6 +986,9 @@ class AdoptHostStrategy(PipelineStrategy):
         # Import existing CT(s) into Terraform state (then plan to verify) so
         # manually-created containers come under management without recreation.
         host_name = str(payload.get("host_name") or "").strip()
+        if host_name.lower() == "all":
+            # A row queued before the scope fix: "all" was never a host.
+            return [TerraformAdoptScopeStage(limit="all")]
         if host_name and not engine.is_known_host(host_name) and engine.is_known_site(host_name):
             # A caller handed the SITE as host_name ("Adopt Host onprem" failed with
             # "No terraform.tfvars.json contains host 'onprem'"): adopt the scope.
