@@ -119,16 +119,68 @@ async def _submit(payload: dict, *entitlements: str, actor: str | None = None) -
     except InvalidJobPayload as exc:
         raise HTTPException(status_code=400, detail=f"Invalid job payload: {exc}")
 
-def _require_gitlab_token(x_gitlab_token: str | None):
+# ── Webhook token check (public routes) ──────────────────────────────────────
+# Runs BEFORE authentication succeeded, for anyone who reaches the port. It used
+# to do a synchronous, uncached Vault round trip on the event loop per request
+# (audit OS-11): a loop of bogus calls stalled every other request and — on the
+# runner — the cluster heartbeat. Now the expected token is cached for a short
+# time and read off the loop; a mismatch may trigger ONE fresh read every few
+# seconds (so a token rotated on another instance is picked up quickly), never
+# one per request.
+_TOKEN_TTL_SECONDS = 30.0
+_TOKEN_REFRESH_MIN_SECONDS = 5.0
+_token_cache: dict = {"value": None, "at": 0.0, "forced_at": 0.0, "loaded": False}
+#: Rejected token-route calls on this instance (health/diagnostics, audit OC-16:
+#: a rotated token that CI still uses otherwise fails without a trace).
+webhook_auth_failures: dict = {"count": 0, "last_at": None}
+
+
+def _reset_token_cache(value: str | None = None) -> None:
+    _token_cache.update(value=value, at=time.monotonic() if value else 0.0, loaded=bool(value))
+
+
+async def _expected_webhook_token(*, force: bool = False) -> str | None:
+    now = time.monotonic()
+    if not force and _token_cache["loaded"] and now - _token_cache["at"] < _TOKEN_TTL_SECONDS:
+        return _token_cache["value"]
+    reader = getattr(_ctx, "aget_secret", None)      # core API >= 1.14
+    if callable(reader) and asyncio.iscoroutinefunction(reader):
+        value = await reader("gitlab_webhook_token")
+    else:
+        value = await asyncio.to_thread(_ctx.get_secret, "gitlab_webhook_token")
+    value = value if isinstance(value, str) and value else None
+    _token_cache.update(value=value, at=time.monotonic(), loaded=True)
+    return value
+
+
+def _token_matches(presented: str | None, expected: str) -> bool:
+    if not presented:
+        return False
+    # Bytes, so a non-ASCII header is a plain mismatch (compare_digest raises on
+    # non-ASCII str — that used to be a 500).
+    return hmac.compare_digest(str(presented).encode("utf-8", "replace"), expected.encode("utf-8", "replace"))
+
+
+async def _require_gitlab_token(x_gitlab_token: str | None):
     if not _ctx:
         raise HTTPException(status_code=500, detail="API Context not initialized")
-    expected_token = _ctx.get_secret("gitlab_webhook_token")
-    if not expected_token:
+    expected = await _expected_webhook_token()
+    if expected and _token_matches(x_gitlab_token, expected):
+        return
+    # Unknown or changed? One fresh read at most every few seconds.
+    now = time.monotonic()
+    if now - _token_cache["forced_at"] >= _TOKEN_REFRESH_MIN_SECONDS:
+        _token_cache["forced_at"] = now
+        expected = await _expected_webhook_token(force=True)
+        if expected and _token_matches(x_gitlab_token, expected):
+            return
+    if not expected:
         _ctx.log.error("SECURITY HALT: Webhook token missing in Vault.")
         raise HTTPException(status_code=500, detail="Configuration Error")
-    if not x_gitlab_token or not hmac.compare_digest(x_gitlab_token, expected_token):
-        _ctx.log.warning("SECURITY REJECTION: Unauthorized webhook attempt.")
-        raise HTTPException(status_code=401, detail="Unauthorized")
+    webhook_auth_failures["count"] += 1
+    webhook_auth_failures["last_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    _ctx.log.warning("SECURITY REJECTION: Unauthorized webhook attempt.")
+    raise HTTPException(status_code=401, detail="Unauthorized")
 
 
 def _resolve_stream_identity(token: str | None):
@@ -568,23 +620,39 @@ def publish_repo_snapshots() -> dict:
 
 # ── Handler logic (router-agnostic) ─────────────────────────────────────────
 
+_HEALTH_TTL_SECONDS = 5.0
+_health_cache: dict = {"at": 0.0, "value": None}
+
+
 async def do_health():
-    """Returns a lightweight health snapshot for the orchestrator plugin."""
+    """Public liveness snapshot (``GET /api/iac/health``, no authentication).
+
+    Minimal on purpose and cheap for the instance (audit OS-11): no version, no
+    instance id, no queue depth for anonymous callers; built off the event loop
+    and cached for a few seconds, so hammering it costs nothing. The detailed
+    health is the authenticated plugin health of the core.
+    """
     if not _ctx or not _engine:
         raise HTTPException(status_code=503, detail="Orchestrator not initialized")
-    live = _live_summary()
-    return {
-        "status": "healthy",
-        "version": getattr(_ctx.manifest, "version", "unknown"),
-        "db_connected": bool(getattr(_engine.db, "engine", None)),
-        "vault_ready": _ctx.get_secret("iac_auto_apply") is not None,
-        "active_workers": len(live.get("active_tasks") or {}),
-        "queued_jobs": live.get("queued", 0),
-        "scheduled_jobs": live.get("scheduled", 0),
-        "runner_online": bool(_service.runner_online()) if _service else True,
-        "is_runner": bool(_service.is_runner) if _service else True,
-        "instance_id": getattr(_ctx, "instance_id", None),
-    }
+    now = time.monotonic()
+    if _health_cache["value"] is not None and now - _health_cache["at"] < _HEALTH_TTL_SECONDS:
+        return _health_cache["value"]
+
+    def _probe() -> dict:
+        db_ok = True
+        try:
+            _engine.db.get_recent_jobs(1)
+        except Exception:
+            db_ok = False
+        return {
+            "status": "healthy" if db_ok else "degraded",
+            "db_connected": db_ok,
+            "runner_online": bool(_service.runner_online()) if _service else True,
+        }
+
+    value = await asyncio.to_thread(_probe)
+    _health_cache.update(at=time.monotonic(), value=value)
+    return value
 
 
 async def do_gitlab_webhook(request: Request, x_gitlab_token: str | None):
@@ -592,7 +660,7 @@ async def do_gitlab_webhook(request: Request, x_gitlab_token: str | None):
     if not _ctx:
         raise HTTPException(status_code=500, detail="API Context not initialized")
 
-    _require_gitlab_token(x_gitlab_token)
+    await _require_gitlab_token(x_gitlab_token)
 
     try:
         payload = await request.json()
@@ -636,7 +704,7 @@ async def do_sync_webhooks(x_gitlab_token: str | None):
     """Token-protected, idempotent re-registration of the group webhooks."""
     if not _ctx:
         raise HTTPException(status_code=500, detail="API Context not initialized")
-    _require_gitlab_token(x_gitlab_token)
+    await _require_gitlab_token(x_gitlab_token)
     from .gitlab_webhooks import sync_group_webhooks_from_ctx, WebhookConfigError
     try:
         result = await asyncio.to_thread(sync_group_webhooks_from_ctx, _ctx)
@@ -759,7 +827,8 @@ async def do_get_service_status(service_name: str, since_epoch: int = 0, accept:
         raise HTTPException(status_code=500, detail="Engine offline")
     normalized_service = str(service_name or "").strip().lower()
     pipeline_type = f"single_service:{normalized_service}"
-    job = _engine.db.get_latest_job_for_pipeline_type(pipeline_type, since_epoch=since_epoch)
+    # Polled every 10 s by each running CI job — never on the event loop.
+    job = await asyncio.to_thread(_engine.db.get_latest_job_for_pipeline_type, pipeline_type, since_epoch)
     if not job:
         return {
             "status": "pending",
@@ -1043,7 +1112,7 @@ async def do_trigger_infra_apply_by_token(x_gitlab_token: str | None):
             status_code=404,
             detail="Token-triggered infrastructure apply is disabled (setting token_infra_apply_enabled).",
         )
-    _require_gitlab_token(x_gitlab_token)
+    await _require_gitlab_token(x_gitlab_token)
     return await do_trigger_infra_apply()
 
 
@@ -1117,6 +1186,12 @@ async def do_dismiss_pending_plan():
     return {"status": "ok"}
 
 
+#: Upper bounds of the list/tail parameters (a reader must not be able to make the
+#: instance load an arbitrary amount of rows).
+_JOBS_LIMIT_MAX = 500
+_LOG_TAIL_MAX = 5000
+
+
 def _with_wait_hints(jobs: list, runner_state: str) -> list:
     """QUEUED jobs say what they are waiting for while no runner executes them —
     instead of looking like a job that hangs at 0 % ("Queued by gitlab-ci")."""
@@ -1136,7 +1211,8 @@ async def do_list_jobs(limit: int = 20):
     """Returns a list of recent and active jobs."""
     if not _engine:
         raise HTTPException(status_code=500, detail="Engine offline")
-    jobs = _engine.db.get_recent_jobs(limit)
+    limit = max(1, min(int(limit or 20), _JOBS_LIMIT_MAX))
+    jobs = await asyncio.to_thread(_engine.db.get_recent_jobs, limit)
     return _with_wait_hints(jobs, _service.runner_state()) if _service else jobs
 
 
@@ -1173,6 +1249,7 @@ async def do_job_logs(
     """
     if not _engine:
         raise HTTPException(status_code=500, detail="Engine offline")
+    tail = max(1, min(int(tail or 200), _LOG_TAIL_MAX))
 
     # Cluster: the executing runner streams every line into the shared database;
     # serve from there first so any instance can answer, regardless of which host
@@ -2023,6 +2100,7 @@ async def do_generate_webhook_token(identity=None):
         raise HTTPException(status_code=503, detail="Context offline")
     new_token = secrets.token_urlsafe(32)
     _ctx.set_secret("gitlab_webhook_token", new_token)
+    _reset_token_cache(new_token)
     _ctx.log.info(f"API: New GitLab webhook token generated by {_actor(identity) or 'internal'} and stored in Vault.")
     return {"status": "ok", "token": new_token}
 
@@ -2103,6 +2181,28 @@ def _job_stream_snapshot() -> dict:
     }
 
 
+_SNAPSHOT_MAX_AGE_SECONDS = 0.9
+_snapshot_cache: dict = {"at": 0.0, "value": None, "task": None}
+
+
+async def _shared_job_stream_snapshot() -> dict:
+    """The live snapshot for the SSE streams: built at most about once per second
+    per process, in a worker thread, and shared by every open stream (audit
+    OC-08 B1). Before, each dashboard tab ran its own five synchronous queries
+    on the event loop every second — a slow database froze the instance, a dead
+    pooled socket stopped its cluster heartbeat. Treat the result as read-only."""
+    now = time.monotonic()
+    if _snapshot_cache["value"] is not None and now - _snapshot_cache["at"] < _SNAPSHOT_MAX_AGE_SECONDS:
+        return _snapshot_cache["value"]
+    task = _snapshot_cache["task"]
+    if task is None or task.done():
+        task = asyncio.ensure_future(asyncio.to_thread(_job_stream_snapshot))
+        _snapshot_cache["task"] = task
+    value = await asyncio.shield(task)
+    _snapshot_cache.update(at=time.monotonic(), value=value)
+    return value
+
+
 async def stream_jobs(request: Request, token: str | None, ticket: str | None = None):
     """SSE generator factory for ``GET /stream/jobs?ticket=...``.
 
@@ -2126,7 +2226,7 @@ async def stream_jobs(request: Request, token: str | None, ticket: str | None = 
             while True:
                 if await request.is_disconnected():
                     break
-                snapshot = _job_stream_snapshot()
+                snapshot = dict(await _shared_job_stream_snapshot())   # shared: copy before changing
                 if not may_see_logs:
                     snapshot["active_tasks"] = _without_logs(snapshot.get("active_tasks") or {})
                     snapshot["logs_included"] = False

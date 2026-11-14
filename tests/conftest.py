@@ -78,3 +78,20 @@ def iac_service(sqlite_queue):
     svc = IaCService(ctx)
     svc._runtime_paths_resolved = True
     return svc
+
+
+@pytest.fixture(autouse=True)
+def _reset_api_caches():
+    """The API module keeps short-lived process caches (webhook token, public
+    health, shared SSE snapshot) — never let one test's values reach the next."""
+    from iac_plugin.app.controller import api as api_mod
+
+    def _reset():
+        api_mod._token_cache.update(value=None, at=0.0, forced_at=0.0, loaded=False)
+        api_mod._health_cache.update(at=0.0, value=None)
+        api_mod._snapshot_cache.update(at=0.0, value=None, task=None)
+        api_mod.webhook_auth_failures.update(count=0, last_at=None)
+
+    _reset()
+    yield
+    _reset()

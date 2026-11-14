@@ -7,6 +7,7 @@ from core.api import ModuleManifest, NotificationEndpoint, PluginHealthStatus, d
 
 from .app.controller.service import IaCService
 from .app.controller.api import init_api
+from .app.controller import api as _api_module
 from .app.controller.webhook_router import build_webhook_router
 from .app.controller.public_mount import mount_direct_routes, unmount_direct_routes
 from .app.api import build_plugin_router, build_stream_router
@@ -271,6 +272,9 @@ async def health(ctx) -> PluginHealthStatus:
             "is_runner": _service.is_runner,
             "runner_online": runner_online,
             "runner_state": runner_state,
+            # Rejected calls on the token routes of this instance — a rotated
+            # webhook token that CI still uses shows up here, not only in CI.
+            "webhook_auth_failures": dict(_api_module.webhook_auth_failures),
             # Orphan sweep (lease-held by one instance): visible on every instance.
             "orphan_sweep": {
                 "enabled": bool(await asyncio.to_thread(lambda: _service.config.orphan_sweep_enabled)),

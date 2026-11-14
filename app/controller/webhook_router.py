@@ -48,7 +48,7 @@ def build_webhook_router(service) -> APIRouter:
         payload: _api.DeployRequest,
         x_gitlab_token: str = Header(None),
     ):
-        _api._require_gitlab_token(x_gitlab_token)
+        await _api._require_gitlab_token(x_gitlab_token)
         # CI-originated: the service's deploy_policy applies (may be parked as SCHEDULED).
         return await _api.do_trigger_service_deployment(service_name, payload, trigger="gitlab-ci")
 
@@ -59,7 +59,7 @@ def build_webhook_router(service) -> APIRouter:
         accept: str | None = None,
         x_gitlab_token: str = Header(None),
     ):
-        _api._require_gitlab_token(x_gitlab_token)
+        await _api._require_gitlab_token(x_gitlab_token)
         # ``accept=scheduled``: the caller understands a parked deploy and gets
         # ``status: "scheduled"``; older CI templates get the compatibility mapping.
         return await _api.do_get_service_status(service_name, since_epoch=since_epoch, accept=accept)
@@ -70,12 +70,12 @@ def build_webhook_router(service) -> APIRouter:
         payload: _api.TestHostDeployRequest,
         x_gitlab_token: str = Header(None),
     ):
-        _api._require_gitlab_token(x_gitlab_token)
+        await _api._require_gitlab_token(x_gitlab_token)
         return await _api.do_trigger_test_host_deployment(host_name, payload)
 
     @router.post("/infra/plan/gitlab")
     async def trigger_infra_plan_gitlab(x_gitlab_token: str = Header(None)):
-        _api._require_gitlab_token(x_gitlab_token)
+        await _api._require_gitlab_token(x_gitlab_token)
         return await _api.do_trigger_infra_plan()
 
     @router.post("/infra/apply/gitlab")
