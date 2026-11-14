@@ -21,6 +21,8 @@ from .utils import StageResult, JobFileLogBridge, current_job_id as _job_id_ctxv
 from .queue import JobLogWriter
 from . import maintenance_resolver as mres
 from .public_projection import public_names, public_scalar, public_terraform, public_url, scrub
+from .config import allowed_registry_hosts, registry_host
+from .settings_schema import resolve_credential
 from ...stages.git import (
     SyncRepoStage,
     PublishInventoryStateStage,
@@ -1142,6 +1144,15 @@ class DeploymentEngine:
         # ("service", host, service) → UUID. Feeds the monitoring sync, the
         # maintenance publisher and the policy stage (runner instances only).
         self._ci_map: dict[tuple, str] = {}
+
+    def _runner_image(self, kind: str) -> str:
+        """Runner image for ``kind`` (ansible|terraform), verified against the
+        allowlist right before use — raises instead of starting a container from
+        an image somebody pointed elsewhere (audit OS-02)."""
+        checked = getattr(self.config, "checked_runner_image", None)
+        if callable(checked):
+            return checked(kind)
+        return self.config.ansible_docker_image if kind == "ansible" else self.config.terraform_docker_image
 
     def get_default_ansible_stages(self, pipeline_type: str = "connectivity"):
         if pipeline_type == "rollout":
@@ -2451,7 +2462,9 @@ class DeploymentEngine:
             "repo_id": role_slug,
             "url": config.get("url"),
             "auth_type": "ssh" if "git@" in config.get("url") else "token",
-            "secret_value": self.ctx.get_secret(config.get("token_key", "")) if config.get("token_key") else ""
+            # A reference can only resolve to a credential alias — never to
+            # another secret of the plugin (settings_schema.resolve_credential).
+            "secret_value": resolve_credential(self.ctx, config.get("token_key")) or ""
         })
         try: return (await asyncio.wait_for(future, timeout=240.0)).get("status") == "synced"
         except asyncio.TimeoutError: return False
@@ -2467,7 +2480,7 @@ class DeploymentEngine:
             key = (json.loads(raw) or {}).get("token_key")
         except Exception:
             return None
-        return self.ctx.get_secret(key) if key else None
+        return resolve_credential(self.ctx, key)
 
     async def repo_head_sha(self, role_slug: str) -> str:
         """HEAD commit of a synced core repo working tree ('' when unknown)."""
@@ -2489,7 +2502,7 @@ class DeploymentEngine:
                 url = cfg.get("url", "")
                 token_key = cfg.get("token_key", "")
                 if token_key:
-                    secret_value = self.ctx.get_secret(token_key)
+                    secret_value = resolve_credential(self.ctx, token_key)
                     auth_type = "ssh" if url.startswith("git@") else "token"
             except Exception:
                 pass
@@ -3225,7 +3238,7 @@ class DeploymentEngine:
             {"key": "TF_PLUGIN_CACHE_DIR", "value": "/data/storage/terraform-providers"},
         ]
         spawn_request = {
-            "image": self.config.terraform_docker_image,
+            "image": self._runner_image("terraform"),
             "name": c_name,
             "env_vars": env_vars,
             "mounts": mounts,
@@ -3705,6 +3718,11 @@ class DeploymentEngine:
         self._sync_runners(job_id, force=True)
 
         reg_url, reg_user, reg_token = self.ctx.get_secret("ansible_registry_url"), self.ctx.get_secret("ansible_registry_user"), self.ctx.get_secret("ansible_registry_token")
+        if reg_url and reg_user and reg_token and registry_host(reg_url) not in allowed_registry_hosts():
+            # The registry token is only ever sent to a registry of the runner
+            # image allowlist, whatever the stored URL says.
+            log.error(f"Registry login skipped: '{registry_host(reg_url)}' is not part of the runner image allowlist.")
+            reg_token = None
         if reg_url and reg_user and reg_token:
             proc = await asyncio.create_subprocess_exec("docker", "login", reg_url, "-u", reg_user, "--password-stdin", stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
             await proc.communicate(input=reg_token.encode('utf-8'))
@@ -3765,7 +3783,7 @@ class DeploymentEngine:
                 "-e", "ANSIBLE_HOST_KEY_CHECKING=False", "-e", "PYTHONUNBUFFERED=1", "-e", "ANSIBLE_NOCOLOR=1", "-e", "ANSIBLE_DEPRECATION_WARNINGS=0", "-e", "ANSIBLE_INTERPRETER_PYTHON=auto_silent",
                 "-e", f"ANSIBLE_ROLES_PATH={ansible_roles_path}", "-e", "PYTHONPATH=/data/storage/git_repos/aac_factory/scripts",
                 "--entrypoint", "",
-                self.config.ansible_docker_image,
+                self._runner_image("ansible"),
                 "/bin/sh", "-c", 
                 "mkdir -p /root/.ssh && cp \"$1\" /root/.ssh/id_rsa && chmod 600 /root/.ssh/id_rsa && shift && exec \"$@\"", 
                 "--", f"/data/storage/services/.iac_keys/{key_filename}",

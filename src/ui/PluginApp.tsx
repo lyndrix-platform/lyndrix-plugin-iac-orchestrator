@@ -1265,16 +1265,19 @@ function AdvancedSettings({ toast, confirm }: { toast: ToastFn; confirm: Confirm
   function saveCategory(category: string) {
     if (!schema) return
     const updates: Record<string, unknown> = {}
+    const secrets: Array<[string, string]> = []
     for (const f of schema.filter((x) => x.category === category)) {
       const v = values[f.key]
       if (f.sensitive) {
-        // Only transmit non-empty secrets; a blank field keeps the stored value.
-        if (typeof v === 'string' && v.trim() !== '') updates[f.key] = v
+        // Secret slots go through their own route (credentials permission);
+        // a blank field keeps the stored value.
+        if (typeof v === 'string' && v.trim() !== '') secrets.push([f.key, v])
       } else {
         updates[f.key] = v
       }
     }
-    iacApi.saveSettingsValues(updates)
+    Promise.all(secrets.map(([k, v]) => iacApi.setSecretSlot(k, v)))
+      .then(() => iacApi.saveSettingsValues(updates))
       .then((r) => { setValues(r.values); toast(t('settings.savedCategory', { defaultValue: '{{category}} gespeichert ({{count}} Feld(er)).', category, count: r.saved.length })) })
       .catch((e) => toast(e instanceof Error ? e.message : t('settings.saveError', { defaultValue: 'Speichern fehlgeschlagen' }), 'err'))
   }

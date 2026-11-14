@@ -105,7 +105,8 @@ class CloneServiceRepoStage(BaseStage):
                 svc_config = json.loads(raw_svc_config)
                 token_key = svc_config.get("token_key")
                 if token_key:
-                    svc_token = engine.ctx.get_secret(token_key)
+                    from ..app.controller.settings_schema import resolve_credential
+                    svc_token = resolve_credential(engine.ctx, token_key)
             except Exception: pass
         auth_env = os.environ.copy()
         # Supply the HTTPS token per-invocation via an HTTP auth header instead of

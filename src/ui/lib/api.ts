@@ -364,8 +364,13 @@ export const iacApi = {
   settingsSchema: () => pluginApi.get<SettingsSchemaResponse>('settings/schema'),
   settingsValues: () => pluginApi.get<SettingsValuesResponse>('settings/values'),
   saveSettingsValues: (values: Record<string, unknown>) =>
-    pluginApi.post<{ status: string; saved: string[]; values: Record<string, unknown> }>(
+    pluginApi.post<{ status: string; saved: string[]; locked?: string[]; unchanged?: string[]; values: Record<string, unknown> }>(
       'settings/values', { values },
+    ),
+  // Secret material (SSH keys, passwords, tokens) has its own route + permission.
+  setSecretSlot: (key: string, value: string) =>
+    pluginApi.post<{ status: string; key: string; configured: boolean }>(
+      `settings/secrets/${encodeURIComponent(key)}`, { value },
     ),
   listCredentials: () => pluginApi.get<{ credentials: string[] }>('settings/credentials'),
   addCredential: (alias: string, secret: string) =>

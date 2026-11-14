@@ -156,7 +156,17 @@ def sync_group_webhooks_from_ctx(ctx) -> dict:
         raise WebhookConfigError("Lyndrix Base URL is not set.")
     if not token_key:
         raise WebhookConfigError("No GitLab API credential (Vault key) selected.")
-    gitlab_token = ctx.get_secret(token_key)
+    # Checked at use time, whoever stored the values: the API token goes to this
+    # URL, and the reference may only resolve to a credential alias — never to
+    # another secret of the plugin (audit OS-02: token/secret exfiltration).
+    from .settings_schema import gitlab_url_error, is_valid_credential_alias, resolve_credential
+
+    url_error = gitlab_url_error(gitlab_url)
+    if url_error:
+        raise WebhookConfigError(f"GitLab Base URL {url_error}.")
+    if not is_valid_credential_alias(token_key):
+        raise WebhookConfigError(f"GitLab API credential '{token_key}' is not a credential alias of this plugin.")
+    gitlab_token = resolve_credential(ctx, token_key)
     if not gitlab_token:
         raise WebhookConfigError(f"Vault key '{token_key}' has no secret value.")
     if not webhook_token:

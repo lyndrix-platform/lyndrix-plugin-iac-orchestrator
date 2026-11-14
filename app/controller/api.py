@@ -30,7 +30,11 @@ from pathlib import Path
 from fastapi import Request, Header, HTTPException
 from pydantic import BaseModel, Field
 
-from .settings_schema import OrchestratorSettings
+from .settings_schema import (
+    OrchestratorSettings, SettingsPermissionError, SettingsValidationError,
+    TIER_CREDENTIALS, TIER_INFRA_APPLY, TIER_OPERATOR, TIER_SETTINGS,
+    is_valid_credential_alias,
+)
 from .queue import DuplicateJob as _DuplicateJob
 from . import maintenance_resolver as _mres
 from .public_projection import public_catalog_entry, public_scalar
@@ -1693,36 +1697,13 @@ async def do_get_settings():
     }
 
 
-async def do_save_settings(payload: SettingsRequest):
-    """Persist the orchestrator settings to Vault. Ports settings.py writes."""
+async def do_save_settings(payload: SettingsRequest, identity=None):
+    """Persist the general settings. Same validation, tiers and "only what changed"
+    rule as :func:`do_save_settings_values` (the keys are schema keys)."""
     if not _ctx or not _service:
         raise HTTPException(status_code=503, detail="Orchestrator not initialized")
-
-    if payload.auto_apply is not None:
-        _service.state["auto_apply_enabled"] = bool(payload.auto_apply)
-        _ctx.set_secret("iac_auto_apply", str(bool(payload.auto_apply)))
-    if payload.test_deploy_allowed_hosts is not None:
-        _ctx.set_secret(
-            "iac_test_deploy_allowed_hosts",
-            str(payload.test_deploy_allowed_hosts or "").strip(),
-        )
-    if payload.gitlab_url is not None:
-        _ctx.set_secret("iac_gitlab_url", str(payload.gitlab_url or "").strip())
-    if payload.group_id is not None:
-        _ctx.set_secret("iac_gitlab_group_id", str(payload.group_id or "").strip())
-    if payload.lyndrix_base_url is not None:
-        _ctx.set_secret("iac_lyndrix_base_url", str(payload.lyndrix_base_url or "").strip())
-    if payload.gitlab_token_key is not None:
-        _ctx.set_secret("iac_gitlab_api_token_key", str(payload.gitlab_token_key or "").strip())
-    if payload.autosync_enabled is not None:
-        _ctx.set_secret(
-            "iac_webhook_autosync_enabled",
-            "true" if payload.autosync_enabled else "false",
-        )
-    if payload.sync_interval is not None:
-        interval = max(300, _safe_int(payload.sync_interval, 1800))
-        _ctx.set_secret("iac_webhook_sync_interval_seconds", str(interval))
-
+    values = {k: v for k, v in payload.model_dump().items() if v is not None}
+    await _save_settings(values, identity)
     return await do_get_settings()
 
 
@@ -1743,21 +1724,64 @@ class CredentialRequest(BaseModel):
     secret: str
 
 
+class SecretSlotRequest(BaseModel):
+    value: str
+
+
 # Git credential aliases double as Vault keys, so they are constrained to a safe
-# character set and may not collide with the plugin's own security-critical
-# secrets. Any ``iac_*`` key (engine configuration) is additionally reserved.
-# Aliases become Vault KV data-dict keys, which safely allow letters, digits,
-# underscores and hyphens. Hyphens matter here because the operator's whole
-# GitLab namespace is hyphenated (e.g. "gitlab-int", "aac-template-engine"), so
-# forbidding them made natural credential names impossible to save.
+# character set (letters, digits, underscore, hyphen — the operator's GitLab
+# namespace is hyphenated) and may not be the name of anything else the plugin
+# stores: every setting/secret slot and any ``iac_*`` key is reserved
+# (settings_schema.is_valid_credential_alias — one helper for every surface).
 _CREDENTIAL_ALIAS_RE = re.compile(r"^[A-Za-z0-9_-]+$")
-_RESERVED_CREDENTIAL_KEYS = frozenset({
-    "gitlab_webhook_token",
-    "ansible_ssh_key",
-    "iac_tf_ssh_private_key",
-    "iac_token_registry",
-    "system_api_key",
-})
+
+# Permission ids behind the settings tiers. They are custom permissions on
+# purpose: the core grants ``plugin:<id>:api:write`` to every INT_USER and lets
+# the global ``api:write`` satisfy it, so "write" cannot protect anything that
+# decides which image runs with the fleet key or where tokens are sent.
+_PLUGIN_PERM = "plugin:lyndrix.plugin.iac_orchestrator:"
+PERM_SETTINGS_ADMIN = _PLUGIN_PERM + "iac:settings_admin"
+PERM_CREDENTIALS_ADMIN = _PLUGIN_PERM + "iac:credentials_admin"
+PERM_INFRA_APPLY = _PLUGIN_PERM + "api:infra_apply"
+_TIER_PERMISSIONS = {
+    TIER_SETTINGS: PERM_SETTINGS_ADMIN,
+    TIER_CREDENTIALS: PERM_CREDENTIALS_ADMIN,
+    TIER_INFRA_APPLY: PERM_INFRA_APPLY,
+}
+
+
+def _allowed_tiers(identity) -> set[str] | None:
+    """Settings tiers ``identity`` may change (``None`` = trusted in-process caller)."""
+    if identity is None:
+        return None
+    tiers = {TIER_OPERATOR}
+    for tier, permission in _TIER_PERMISSIONS.items():
+        try:
+            if identity.allows(permission):
+                tiers.add(tier)
+        except Exception:
+            pass
+    return tiers
+
+
+async def _save_settings(values: dict, identity) -> dict:
+    """Validated, authorised, all-or-nothing settings write (off the event loop)."""
+    mgr = _settings_mgr()
+    try:
+        result = await asyncio.to_thread(mgr.save_values, values, allowed_tiers=_allowed_tiers(identity))
+    except SettingsValidationError as exc:
+        raise HTTPException(status_code=422, detail=f"Invalid setting — {exc}")
+    except SettingsPermissionError as exc:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Missing required permission: {_TIER_PERMISSIONS.get(exc.tier, exc.tier)} — {exc}",
+        )
+    if result["saved"]:
+        _ctx.log.info(
+            f"SETTINGS: {getattr(identity, 'username', None) or 'internal'} changed "
+            f"{', '.join(result['saved'])}"
+        )
+    return result
 
 
 def _settings_mgr() -> OrchestratorSettings:
@@ -1778,15 +1802,17 @@ async def do_get_settings_values():
     return {"values": mgr.get_values()}
 
 
-async def do_save_settings_values(payload: SettingsValuesRequest):
-    """Persist provided settings. Unknown keys ignored; blank secrets keep existing.
+async def do_save_settings_values(payload: SettingsValuesRequest, identity=None):
+    """Persist provided settings (validated per key, all or nothing). Unknown keys
+    and unchanged values are ignored; secret slots are refused here (422 — they
+    have their own route); a change outside the caller's tiers is a 403.
 
     Settings shadowed by an OS env var are NOT written (env always wins) and are
     reported in ``locked`` with a ``warning`` status so the UI never claims a
     no-op succeeded.
     """
     mgr = _settings_mgr()
-    result = mgr.save_values(payload.values or {})
+    result = await _save_settings(payload.values or {}, identity)
     saved = result["saved"]
     locked = result["locked"]
     return {
@@ -1798,6 +1824,18 @@ async def do_save_settings_values(payload: SettingsValuesRequest):
         ),
         "values": mgr.get_values(),
     }
+
+
+async def do_set_secret_slot(key: str, payload: SecretSlotRequest, identity=None):
+    """Store secret material (SSH key, password, token) in its slot. The value is
+    never echoed; the route requires the credentials permission."""
+    mgr = _settings_mgr()
+    try:
+        await asyncio.to_thread(mgr.set_secret_slot, key, payload.value)
+    except SettingsValidationError as exc:
+        raise HTTPException(status_code=422, detail=f"Invalid setting — {exc}")
+    _ctx.log.info(f"SETTINGS: {getattr(identity, 'username', None) or 'internal'} replaced secret slot '{key}'")
+    return {"status": "ok", "key": key, "configured": True}
 
 
 async def do_list_credentials():
@@ -1823,10 +1861,9 @@ async def do_add_credential(payload: CredentialRequest):
             status_code=422,
             detail="Alias must match ^[A-Za-z0-9_-]+$ (letters, digits, underscore, hyphen).",
         )
-    # Compare case-insensitively so an alias like "Iac_foo" or "Gitlab_Webhook_Token"
-    # cannot slip past the reserved-key / "iac_" guard by varying letter case.
-    alias_lc = alias.lower()
-    if alias_lc in _RESERVED_CREDENTIAL_KEYS or alias_lc.startswith("iac_"):
+    # Reserved = every Vault key the plugin uses for a setting or secret slot plus
+    # the "iac_" prefix, compared case-insensitively ("Iac_foo" must not slip past).
+    if not is_valid_credential_alias(alias):
         raise HTTPException(
             status_code=409,
             detail=f"Alias '{alias}' is reserved for engine configuration and cannot be used.",

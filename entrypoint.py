@@ -51,6 +51,16 @@ manifest = ModuleManifest(
         {"id": "api:infra_apply", "label": "Infrastruktur anwenden",
          "description": "Trigger IaC infrastructure apply (terraform/ansible apply)",
          "icon": "bolt"},
+        # Deliberately NOT ending in api:read/api:write: the core grants those to
+        # every INT_USER and lets the global api:write satisfy them (audit OS-02).
+        {"id": "iac:settings_admin", "label": "IaC-Einstellungen verwalten",
+         "description": "Change security-relevant settings: runner images, registry, GitLab/webhook URLs, "
+                        "host allowlists, webhook sync",
+         "icon": "admin_panel_settings"},
+        {"id": "iac:credentials_admin", "label": "IaC-Zugangsdaten verwalten",
+         "description": "Store or remove Git credentials, SSH keys and passwords and choose which "
+                        "credential a setting uses",
+         "icon": "key"},
     ],
     # NB: the core's role qualifier (`_qualify` in role_registry.py) passes any
     # permission already starting with "api:"/"feature:"/"route:"/"plugin:" through
@@ -64,6 +74,8 @@ manifest = ModuleManifest(
              "plugin:lyndrix.plugin.iac_orchestrator:api:read",
              "plugin:lyndrix.plugin.iac_orchestrator:api:write",
              "plugin:lyndrix.plugin.iac_orchestrator:api:infra_apply",
+             "plugin:lyndrix.plugin.iac_orchestrator:iac:settings_admin",
+             "plugin:lyndrix.plugin.iac_orchestrator:iac:credentials_admin",
          ],
          "auto_map_groups": ["INT_ADMIN"],
          "description": "Full IaC control including infrastructure apply."},

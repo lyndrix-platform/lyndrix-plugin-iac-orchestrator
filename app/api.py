@@ -35,6 +35,12 @@ PLUGIN_ID = "lyndrix.plugin.iac_orchestrator"
 PLUGIN_VERSION = "1.6.1"   # mirrors entrypoint.manifest.version
 PERM_READ = f"plugin:{PLUGIN_ID}:api:read"
 PERM_WRITE = f"plugin:{PLUGIN_ID}:api:write"
+# Custom permissions (manifest ``custom_permissions``). Unlike the two ids above
+# they have NO global fallback and are not part of the core's baseline grants:
+# only a group that holds the plugin's admin role (or the exact id) passes.
+PERM_INFRA_APPLY = _api.PERM_INFRA_APPLY
+PERM_SETTINGS_ADMIN = _api.PERM_SETTINGS_ADMIN
+PERM_CREDENTIALS_ADMIN = _api.PERM_CREDENTIALS_ADMIN
 
 
 def build_plugin_router(service) -> APIRouter:
@@ -184,24 +190,38 @@ def build_plugin_router(service) -> APIRouter:
     async def abort(identity: ApiIdentity = Depends(require_permission(PERM_WRITE))):
         return await _api.do_abort()
 
+    # Both settings writers accept any plugin writer, then authorise per key:
+    # each changed field needs the permission of its tier (settings_schema) —
+    # a 403 names the missing permission and the fields.
     @router.post("/settings/general")
     async def save_settings(
         payload: _api.SettingsRequest,
         identity: ApiIdentity = Depends(require_permission(PERM_WRITE)),
     ):
-        return await _api.do_save_settings(payload)
+        return await _api.do_save_settings(payload, identity)
 
     @router.post("/settings/values")
     async def save_settings_values(
         payload: _api.SettingsValuesRequest,
         identity: ApiIdentity = Depends(require_permission(PERM_WRITE)),
     ):
-        return await _api.do_save_settings_values(payload)
+        return await _api.do_save_settings_values(payload, identity)
+
+    # Secret material (SSH keys, passwords, tokens) and Git credentials.
+    @router.post("/settings/secrets/{key}")
+    async def set_secret_slot(
+        key: str,
+        payload: _api.SecretSlotRequest,
+        identity: ApiIdentity = Depends(require_permission(PERM_WRITE)),
+        _admin: ApiIdentity = Depends(require_permission(PERM_CREDENTIALS_ADMIN)),
+    ):
+        return await _api.do_set_secret_slot(key, payload, identity)
 
     @router.post("/settings/credentials")
     async def add_credential(
         payload: _api.CredentialRequest,
         identity: ApiIdentity = Depends(require_permission(PERM_WRITE)),
+        _admin: ApiIdentity = Depends(require_permission(PERM_CREDENTIALS_ADMIN)),
     ):
         return await _api.do_add_credential(payload)
 
@@ -209,6 +229,7 @@ def build_plugin_router(service) -> APIRouter:
     async def delete_credential(
         alias: str,
         identity: ApiIdentity = Depends(require_permission(PERM_WRITE)),
+        _admin: ApiIdentity = Depends(require_permission(PERM_CREDENTIALS_ADMIN)),
     ):
         return await _api.do_delete_credential(alias)
 
@@ -218,9 +239,11 @@ def build_plugin_router(service) -> APIRouter:
     ):
         return await _api.do_generate_webhook_token()
 
+    # Writes the webhook token into every project hook of the configured group.
     @router.post("/settings/webhooks/sync")
     async def sync_webhooks(
         identity: ApiIdentity = Depends(require_permission(PERM_WRITE)),
+        _admin: ApiIdentity = Depends(require_permission(PERM_SETTINGS_ADMIN)),
     ):
         return await _api.do_sync_webhooks_authed()
 

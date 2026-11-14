@@ -1,5 +1,71 @@
 import os
+import re
 from pathlib import Path
+
+# --- Runner images (audit OS-02) ---------------------------------------------------
+# The runner containers get the fleet SSH key and read-write repo mounts, so the image
+# they are started from decides who owns the fleet. Images configured through the
+# settings API/UI must come from this allowlist (registry or repository prefixes).
+# The list is deployment-level on purpose (env only): whoever may change the image
+# setting must not be able to widen the list through the same API.
+RUNNER_IMAGE_ALLOWLIST_ENV = "PLUGIN_IAC_ORCHESTRATOR_RUNNER_IMAGE_ALLOWLIST"
+DEFAULT_RUNNER_IMAGE_ALLOWLIST = (
+    "registry.gitlab.int.fam-feser.de/",
+    "ghcr.io/opentofu/opentofu",
+)
+ANSIBLE_IMAGE_ENV = "PLUGIN_IAC_ORCHESTRATOR_ANSIBLE_IMAGE"
+TERRAFORM_IMAGE_ENV = "PLUGIN_IAC_ORCHESTRATOR_TERRAFORM_IMAGE"
+
+# registry[:port]/repo[/repo...][:tag][@sha256:digest] — an explicit registry is
+# required, and the reference can never start with '-' (docker would read an option).
+_IMAGE_REF_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9.-]*(:\d{1,5})?(/[a-z0-9][a-z0-9._-]*)+"
+    r"(:[A-Za-z0-9_][A-Za-z0-9._-]{0,127})?(@sha256:[a-f0-9]{64})?$"
+)
+
+
+class RunnerImageNotAllowed(RuntimeError):
+    """The configured runner image is malformed or outside the allowlist."""
+
+
+def runner_image_allowlist() -> tuple[str, ...]:
+    raw = os.getenv(RUNNER_IMAGE_ALLOWLIST_ENV)
+    if raw is None:
+        return DEFAULT_RUNNER_IMAGE_ALLOWLIST
+    return tuple(p.strip() for p in raw.split(",") if p.strip())
+
+
+def allowed_registry_hosts() -> set[str]:
+    """Registry hosts (``host[:port]``) of the runner image allowlist."""
+    return {p.split("/", 1)[0].lower() for p in runner_image_allowlist() if p}
+
+
+def registry_host(url: str | None) -> str:
+    """``host[:port]`` of a registry URL as given to ``docker login``."""
+    text = str(url or "").strip().lower()
+    for scheme in ("https://", "http://"):
+        if text.startswith(scheme):
+            text = text[len(scheme):]
+    return text.split("/", 1)[0]
+
+
+def runner_image_error(ref: str | None, *, check_allowlist: bool = True) -> str | None:
+    """Why ``ref`` must not be used as a runner image (``None`` = fine)."""
+    text = str(ref or "")
+    if not _IMAGE_REF_RE.fullmatch(text):
+        return (f"'{text}' is not a valid image reference "
+                "(expected registry/repository[:tag][@sha256:digest])")
+    if not check_allowlist:
+        return None
+    for prefix in runner_image_allowlist():
+        if prefix.endswith("/"):
+            if text.startswith(prefix):
+                return None
+        elif text == prefix or text.startswith((prefix + ":", prefix + "@", prefix + "/")):
+            return None
+    return (f"image '{text}' is not in the runner image allowlist "
+            f"({', '.join(runner_image_allowlist()) or 'empty'}; {RUNNER_IMAGE_ALLOWLIST_ENV})")
+
 
 class IaCConfig:
     def __init__(self, ctx):
@@ -89,6 +155,23 @@ class IaCConfig:
             "iac_terraform_docker_image",
             "ghcr.io/opentofu/opentofu:latest",
         )
+
+    def checked_runner_image(self, kind: str) -> str:
+        """The ``ansible``/``terraform`` runner image, verified right before use.
+
+        Raises :class:`RunnerImageNotAllowed` instead of starting a container from
+        an image outside the allowlist — whatever wrote the setting (API, legacy
+        UI, a value stored before the allowlist existed). An image pinned through
+        the environment is deployment configuration: only its syntax is checked.
+        """
+        if kind == "ansible":
+            image, env_var = self.ansible_docker_image, ANSIBLE_IMAGE_ENV
+        else:
+            image, env_var = self.terraform_docker_image, TERRAFORM_IMAGE_ENV
+        error = runner_image_error(image, check_allowlist=os.getenv(env_var) is None)
+        if error:
+            raise RunnerImageNotAllowed(f"Refusing to start the {kind} runner: {error}")
+        return image
 
     @property
     def terraform_binary(self) -> str:
