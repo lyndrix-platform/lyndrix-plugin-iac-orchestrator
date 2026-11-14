@@ -150,20 +150,6 @@ def _resolve_stream_identity(token: str | None):
         return None
 
 
-def _validate_stream_token(token: str | None, permission: str = "api:read") -> bool:
-    """Validate a stream/raw-log ``?token=`` and enforce a permission scope.
-
-    Mirrors the authorization the rest of the API enforces via
-    ``require_permission`` — a syntactically valid key is not enough; the resolved
-    identity must also be *granted* ``permission`` (``api:read`` by default). This
-    closes the gap where any low-privilege key could stream live state or download
-    raw logs that the equivalent ``require_permission("api:read")`` REST route
-    would deny.
-    """
-    identity = _resolve_stream_identity(token)
-    return identity is not None and identity.allows(permission)
-
-
 # ── Short-lived stream tickets ───────────────────────────────────────────────
 # Signing key for stream tickets. Derived from STORAGE_SECRET so a ticket minted
 # on one cluster instance validates on every other one (the load balancer may
@@ -181,56 +167,80 @@ def _stream_ticket_key() -> bytes:
 
 _STREAM_TICKET_KEY = _stream_ticket_key()
 _STREAM_TICKET_TTL = 60  # seconds
+#: Ticket scopes: ``api:read`` = the job stream (status, progress); ``logs`` = job
+#: output (log lines in the stream, raw log download) — needs PERM_LOGS.
+SCOPE_READ = "api:read"
+SCOPE_LOGS = "logs"
 
 
-def issue_stream_ticket(permission: str = "api:read") -> str:
+def issue_stream_ticket(permission: str = "api:read", *, logs: bool = False) -> str:
     """Mint a short-lived, signed ticket authorizing a stream/raw-log read.
 
     Minted only after the caller has already passed ``require_permission`` on the
-    authed endpoint, so the granted scope is baked into the ticket. EventSource
-    and browser tab/download requests then present this opaque ticket as
-    ``?ticket=`` instead of the long-lived bearer token, keeping the real
-    credential out of URLs, reverse-proxy access logs and browser history.
+    authed endpoint, so the granted scopes are baked into the ticket (``logs``
+    only for a caller holding the log permission). EventSource and browser
+    tab/download requests then present this opaque ticket as ``?ticket=`` instead
+    of the long-lived bearer token, keeping the real credential out of URLs,
+    reverse-proxy access logs and browser history.
     """
     import base64
     exp = int(time.time()) + _STREAM_TICKET_TTL
-    body = f"{exp}:{permission}"
+    scopes = permission + (f"+{SCOPE_LOGS}" if logs else "")
+    body = f"{exp}:{scopes}"
     sig = hmac.new(_STREAM_TICKET_KEY, body.encode(), "sha256").hexdigest()
     return base64.urlsafe_b64encode(f"{body}:{sig}".encode()).decode()
 
 
-def _validate_stream_ticket(ticket: str | None, permission: str = "api:read") -> bool:
-    """Constant-time verify a stream ticket and check it is unexpired and in-scope."""
+def _ticket_scopes(ticket: str | None) -> set[str]:
+    """Scopes of a valid, unexpired ticket (constant-time signature check); empty
+    for anything else."""
     if not ticket:
-        return False
+        return set()
     try:
         import base64
         raw = base64.urlsafe_b64decode(ticket.encode()).decode()
         # Split from the right once to isolate the sig, then split from the left
-        # once for exp — the permission may itself contain colons (e.g. "api:read").
+        # once for exp — the scope string itself contains colons ("api:read").
         body, sig = raw.rsplit(":", 1)
-        exp_s, perm = body.split(":", 1)
+        exp_s, scopes = body.split(":", 1)
         expected = hmac.new(_STREAM_TICKET_KEY, body.encode(), "sha256").hexdigest()
         if not hmac.compare_digest(sig, expected):
-            return False
+            return set()
         if int(exp_s) < int(time.time()):
-            return False
-        return perm == permission
+            return set()
+        return {part for part in scopes.split("+") if part}
     except Exception:
-        return False
+        return set()
+
+
+def _validate_stream_ticket(ticket: str | None, permission: str = "api:read") -> bool:
+    """Is ``ticket`` valid and does it carry scope ``permission``?"""
+    return permission in _ticket_scopes(ticket)
+
+
+def _stream_access(token: str | None, ticket: str | None) -> tuple[bool, bool]:
+    """``(may_read, may_see_logs)`` for a stream/raw-log request.
+
+    A short-lived ticket (preferred — the React client mints one via
+    ``POST /stream/ticket``) carries its scopes; the bearer-token path is kept for
+    non-browser callers and resolves both permissions from the identity.
+    """
+    scopes = _ticket_scopes(ticket)
+    if SCOPE_READ in scopes:
+        return True, SCOPE_LOGS in scopes
+    identity = _resolve_stream_identity(token)
+    if identity is None:
+        return False, False
+    try:
+        return bool(identity.allows("api:read")), bool(identity.allows(PERM_LOGS))
+    except Exception:
+        return False, False
 
 
 def _authorize_stream_request(token: str | None, ticket: str | None,
                               permission: str = "api:read") -> bool:
-    """Accept either a short-lived stream ticket (preferred) or a bearer token.
-
-    The React client now mints a ticket via ``POST /stream/ticket`` and passes it
-    as ``?ticket=``; the bearer-token path is retained for non-browser/API callers
-    that cannot pre-mint a ticket. Both paths enforce ``permission``.
-    """
-    if _validate_stream_ticket(ticket, permission):
-        return True
-    return _validate_stream_token(token, permission)
+    """Compatibility wrapper: may the caller read the job stream?"""
+    return _stream_access(token, ticket)[0]
 
 
 def _prune_recent_events(now: float):
@@ -1307,8 +1317,9 @@ def _live_summary() -> dict:
     return summary
 
 
-async def do_job_runners(job_id: int):
-    """Return the runner tasks attributed to a job (shared DB snapshot, local state on the runner)."""
+async def do_job_runners(job_id: int, include_logs: bool = True):
+    """Return the runner tasks attributed to a job (shared DB snapshot, local state on the runner).
+    ``include_logs=False`` (caller without the log permission) strips the log tails."""
     if not _engine:
         raise HTTPException(status_code=500, detail="Engine offline")
     runners: dict = {}
@@ -1322,7 +1333,9 @@ async def do_job_runners(job_id: int):
     for name, data in active.items():
         if isinstance(data, dict) and data.get("job_id") == job_id:
             runners[name] = data
-    return {"job_id": job_id, "runners": runners}
+    if not include_logs:
+        runners = _without_logs(runners)
+    return {"job_id": job_id, "runners": runners, "logs_included": bool(include_logs)}
 
 
 # ── Generic operation trigger / abort ───────────────────────────────────────
@@ -1803,6 +1816,9 @@ _PLUGIN_PERM = "plugin:lyndrix.plugin.iac_orchestrator:"
 PERM_SETTINGS_ADMIN = _PLUGIN_PERM + "iac:settings_admin"
 PERM_CREDENTIALS_ADMIN = _PLUGIN_PERM + "iac:credentials_admin"
 PERM_INFRA_APPLY = _PLUGIN_PERM + "api:infra_apply"
+# Job output (log lines) — its own permission: logs can contain what the tools
+# print about the managed systems, and plain api:read is every viewer (OS-07).
+PERM_LOGS = _PLUGIN_PERM + "iac:logs_read"
 _TIER_PERMISSIONS = {
     TIER_SETTINGS: PERM_SETTINGS_ADMIN,
     TIER_CREDENTIALS: PERM_CREDENTIALS_ADMIN,
@@ -2052,6 +2068,11 @@ async def do_sync_webhooks_authed():
     return {"status": "ok", **result}
 
 
+def _without_logs(tasks: dict) -> dict:
+    """Runner tasks without their log tails (status only)."""
+    return {name: ({**info, "logs": []} if isinstance(info, dict) else info) for name, info in (tasks or {}).items()}
+
+
 def _job_stream_snapshot() -> dict:
     """Build a single live snapshot of orchestrator state for the SSE stream."""
     if not _engine:
@@ -2078,11 +2099,13 @@ async def stream_jobs(request: Request, token: str | None, ticket: str | None = 
     state changes, plus a ~1s keep-alive tick. Authorization is validated
     in-handler because EventSource cannot send an Authorization header — it
     accepts a short-lived ``ticket`` (preferred) or a bearer ``token``, and both
-    must carry the ``api:read`` permission.
+    must carry the ``api:read`` permission. The log tails of running tasks are
+    only included for a caller with the log permission (ticket scope ``logs``).
     """
     from fastapi.responses import StreamingResponse
 
-    if not _authorize_stream_request(token, ticket, "api:read"):
+    may_read, may_see_logs = _stream_access(token, ticket)
+    if not may_read:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     async def generator():
@@ -2093,6 +2116,9 @@ async def stream_jobs(request: Request, token: str | None, ticket: str | None = 
                 if await request.is_disconnected():
                     break
                 snapshot = _job_stream_snapshot()
+                if not may_see_logs:
+                    snapshot["active_tasks"] = _without_logs(snapshot.get("active_tasks") or {})
+                    snapshot["logs_included"] = False
                 # Hash on everything except the wall-clock timestamp so we only
                 # push a new frame when the orchestrator state actually changes.
                 change_key = json.dumps(

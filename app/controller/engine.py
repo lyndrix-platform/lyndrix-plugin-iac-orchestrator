@@ -25,6 +25,7 @@ from .public_projection import public_names, public_scalar, public_terraform, pu
 from .config import allowed_registry_hosts, registry_host
 from .settings_schema import resolve_credential
 from .runner_output import RunnerOutputParser
+from .redaction import SecretRedactor, secret_values_of
 from ...stages.git import (
     SyncRepoStage,
     PublishInventoryStateStage,
@@ -1174,6 +1175,8 @@ class DeploymentEngine:
         self._job_stage: dict[int, tuple] = {}
         # Why the runner is stopping (set by IaCService.shutdown) — for the log.
         self.detaching: str | None = None
+        # job id -> redactor holding the secret values that job was given.
+        self._redactors: dict[int, SecretRedactor] = {}
 
     def _runner_image(self, kind: str) -> str:
         """Runner image for ``kind`` (ansible|terraform), verified against the
@@ -1932,8 +1935,11 @@ class DeploymentEngine:
         # also go to the database (JobLogWriter) so every instance can serve them.
         _job_ctx_token = _job_id_ctxvar.set(current_job_id)
         _writer = self._log_writer(current_job_id)
+        # Known secrets first, then the bridge: no line of this job is stored unmasked.
+        await self._prime_redactor(current_job_id)
         bridge = JobFileLogBridge(self.config.get_log_path(current_job_id), job_id=current_job_id,
-                                  sink=_writer.append if _writer else None)
+                                  sink=_writer.append if _writer else None,
+                                  redact=lambda line, _jid=current_job_id: self._redact(_jid, line))
         logging.getLogger("IaC:Engine").addHandler(bridge)
         final_status = "FAILED"
         parked = False  # set by the JobParked handler (maintenance windows, 1.6)
@@ -2125,6 +2131,8 @@ class DeploymentEngine:
         except Exception as e:
             import traceback
             error_detail = str(e) if str(e) else f"{type(e).__name__}: (no message)"
+            # Leaves the plugin (bell, Discord, …): masked and capped like the log.
+            error_detail = self._redact(current_job_id, error_detail)[:500]
             log.error(f"!!! [FATAL] {error_detail}")
             log.debug(f"Exception traceback:\n{traceback.format_exc()}")
             final_status = "FAILED"
@@ -2189,6 +2197,7 @@ class DeploymentEngine:
             self.__dict__.setdefault("_job_modes", {}).pop(current_job_id, None)
             self.__dict__.setdefault("_job_stage", {}).pop(current_job_id, None)
             self.__dict__.setdefault("_abort_requested", set()).discard(current_job_id)
+            self.__dict__.setdefault("_redactors", {}).pop(current_job_id, None)
             await self._publish_snapshots()
 
     # NB: there is deliberately no "resume" of an interrupted bulk rollout any more
@@ -2289,8 +2298,65 @@ class DeploymentEngine:
             except Exception as exc:
                 log.debug("Job log writer close failed: %s", exc)
 
+    # -- redaction (audit OS-07) -----------------------------------------------------------
+    def _redactor(self, job_id) -> SecretRedactor:
+        return self.__dict__.setdefault("_redactors", {}).setdefault(job_id, SecretRedactor())
+
+    def _redact(self, job_id, text: str) -> str:
+        """Mask the job's secret values and credential-shaped text in ``text``."""
+        try:
+            return self._redactor(job_id).redact(text)
+        except Exception:
+            return "[log line withheld: redaction failed]"
+
+    async def _prime_redactor(self, job_id) -> None:
+        """Register the secret values this job can be given, read once and off the
+        event loop: the plugin's secret slots, the webhook token and every stored
+        git credential. Terraform secrets and the inventory's credential values
+        are added where they are built/generated."""
+        def _collect() -> list:
+            from .settings_schema import SETTINGS_FIELDS, OrchestratorSettings
+
+            # The root PUBLIC key is not a secret (and its text is all over tofu output).
+            keys = [f.storage_key() for f in SETTINGS_FIELDS if f.sensitive and f.key != "iac_tf_ssh_key"]
+            keys.append("gitlab_webhook_token")
+            try:
+                keys += [a for a in OrchestratorSettings(self.ctx, None).credential_aliases() if isinstance(a, str)]
+            except Exception:
+                pass
+            values = []
+            for key in keys:
+                try:
+                    values.append(self.ctx.get_secret(key))
+                except Exception:
+                    continue
+            return values
+
+        try:
+            self._redactor(job_id).add_many(await asyncio.to_thread(_collect))
+        except Exception as exc:
+            log.debug(f"redactor for job #{job_id} not primed from Vault: {exc}")
+
+    def _register_inventory_secrets(self, job_id) -> int:
+        """Add the credential-like values of the job's generated inventory (service
+        ``config.secrets``, host vars such as ansible_password / vault_vars) — what
+        ends up in rendered env files and therefore in a ``--diff``. Sync (YAML
+        parse): call through ``asyncio.to_thread``."""
+        try:
+            snapshot = self._job_inventory_snapshot_dir(job_id) / "global" / "ansible" / "inventory.yml"
+            shared = self.base_git_dir / "inventory_state" / "global" / "ansible" / "inventory.yml"
+            with open(snapshot if snapshot.exists() else shared, "r", encoding="utf-8") as handle:
+                data = yaml.safe_load(handle) or {}
+        except Exception:
+            return 0
+        redactor = self._redactor(job_id)
+        redactor.add_many(secret_values_of(data))
+        return len(redactor)
+
     def _log_line(self, job_id, text: str) -> None:
-        """Append one line to the job log: the host file (as before) and the database."""
+        """Append one line to the job log: the host file (as before) and the database.
+        Secret values are masked first — nothing unredacted is stored or streamed."""
+        text = self._redact(job_id, text)
         try:
             with open(self.config.get_log_path(job_id), "a", encoding="utf-8") as f:
                 f.write(text + "\n")
@@ -2340,8 +2406,10 @@ class DeploymentEngine:
         writer = self._log_writer(job_id)
         # Same per-job log capture as run_pipeline, so the git sync output lands in the job log.
         _job_ctx_token = _job_id_ctxvar.set(job_id)
+        await self._prime_redactor(job_id)
         bridge = JobFileLogBridge(self.config.get_log_path(job_id), job_id=job_id,
-                                  sink=writer.append if writer else None)
+                                  sink=writer.append if writer else None,
+                                  redact=lambda line, _jid=job_id: self._redact(_jid, line))
         logging.getLogger("IaC:Engine").addHandler(bridge)
         try:
             self.db.update_progress(job_id, progress=10, current_step="Syncing core repositories")
@@ -2418,6 +2486,9 @@ class DeploymentEngine:
         self.state["running_jobs"] = self.state.get("running_jobs", 0) + 1
         self.state["is_running"] = True
         try:
+            # The rest of the containers' output is masked like the first part was.
+            await self._prime_redactor(job_id)
+            await asyncio.to_thread(self._register_inventory_secrets, job_id)
             watchers = []
             for container in containers:
                 stored = 0
@@ -2445,12 +2516,20 @@ class DeploymentEngine:
             else:
                 final, step = "SUCCESS", "Recovered after runner restart"
             self._log_line(job_id, f"[SYSTEM] {step}.")
-            await asyncio.to_thread(self.db.update_progress, job_id, 100 if final == "SUCCESS" else None, step[:250])
-            closed = await asyncio.to_thread(self.db.update_job, job_id, final)
-            getattr(self.db, "claims", {}).pop(job_id, None)
-            self.end_override_for(job_id)
+
+            def _close() -> bool:
+                # One thread call: a cancellation of this task (another reload)
+                # cannot land between "job closed" and "override ended".
+                self.db.update_progress(job_id, 100 if final == "SUCCESS" else None, step[:250])
+                done = self.db.update_job(job_id, final)
+                getattr(self.db, "claims", {}).pop(job_id, None)
+                self.end_override_for(job_id)
+                return done
+
+            closed = await asyncio.to_thread(_close)
             await self._close_log_writer(job_id)
             self._cleanup_inventory_snapshot(job_id)
+            self.__dict__.setdefault("_redactors", {}).pop(job_id, None)
             if not closed:
                 log.warning(f"RECOVERY: job #{job_id} was closed elsewhere meanwhile — its state stands "
                             f"(containers: {'ok' if all_ok else 'failed'}).")
@@ -2716,6 +2795,9 @@ class DeploymentEngine:
             await self._execute_native_generation()
             if job_id:
                 self._snapshot_inventory(job_id)
+        if job_id:
+            # What this job will render into env files must never show up in its log.
+            await asyncio.to_thread(self._register_inventory_secrets, job_id)
 
     def _snapshot_inventory(self, job_id: int):
         src = self.base_git_dir / "inventory_state"
@@ -2804,7 +2886,7 @@ class DeploymentEngine:
 
                     # 3. LIGHTWEIGHT UI MEMORY (Keep only the last 50 lines for the active popup)
                     if "active_tasks" in self.state and task_name in self.state["active_tasks"]:
-                        self.state["active_tasks"][task_name]["logs"].append(decoded)
+                        self.state["active_tasks"][task_name]["logs"].append(self._redact(job_id, decoded))
                         if len(self.state["active_tasks"][task_name]["logs"]) > 50:
                             self.state["active_tasks"][task_name]["logs"].pop(0)
                         self._sync_runners(job_id)  # throttled DB snapshot for the other instances
@@ -3063,6 +3145,14 @@ class DeploymentEngine:
                 ),
             },
         }
+
+    def _register_terraform_secrets(self, job_id, payload: dict) -> None:
+        """The credentials of a Terraform run (they come from Vault or from the
+        controller repo) are masked in that job's log."""
+        backend = payload.get("backend") if isinstance(payload.get("backend"), dict) else {}
+        self._redactor(job_id).add_many([
+            payload.get("proxmox_password"), payload.get("root_password"), backend.get("secret_key"),
+        ])
 
     @staticmethod
     def _write_secrets_file(secrets_file: Path, payload: dict) -> None:
@@ -3511,6 +3601,7 @@ class DeploymentEngine:
             raise RuntimeError(
                 "Missing Terraform secret(s): " + ", ".join(sorted(set(missing)))
             )
+        self._register_terraform_secrets(job_id, secrets_payload)
 
         # Per-job run dir (audit OC-01): two jobs for one host used to rmtree and
         # re-render the same directory under each other's running tofu. Only this
@@ -3664,6 +3755,7 @@ class DeploymentEngine:
             raise RuntimeError(
                 "Missing Terraform secret(s): " + ", ".join(sorted(set(missing)))
             )
+        self._register_terraform_secrets(job_id, secrets_payload)
 
         stable_rel_dir = f"inventory_state/.terraform_runs/{env_name}__{mode}"
         run_rel_dir = f"{stable_rel_dir}__j{job_id}" if job_id and job_id > 0 else stable_rel_dir
@@ -3921,8 +4013,14 @@ class DeploymentEngine:
                 "mkdir -p /root/.ssh && cp \"$1\" /root/.ssh/id_rsa && chmod 600 /root/.ssh/id_rsa && shift && exec \"$@\"", 
                 "--", f"/data/storage/services/.iac_keys/{key_filename}",
                 "ansible-playbook", "-i", f"/data/storage/git_repos/{inv_root}/{inventory_subpath}", f"/data/storage/git_repos/config_engine/{playbook_subpath}",
-                "-u", remote_user, "--diff" 
+                "-u", remote_user,
             ]
+            # --diff prints the rendered content of every templated file — the
+            # service's stack.env with its secrets included — into the job log
+            # (audit OS-07). Default: only for dry-runs; never for real deploys.
+            diff_mode = getattr(self.config, "ansible_diff_mode", "dry_run")
+            if diff_mode == "always" or (diff_mode == "dry_run" and check_mode):
+                cmd.append("--diff")
             if limit: cmd.extend(["--limit", limit])
             if extra_vars:
                 for k, v in extra_vars.items(): cmd.extend(["-e", f"{k}={v}"])

@@ -41,6 +41,7 @@ PERM_WRITE = f"plugin:{PLUGIN_ID}:api:write"
 PERM_INFRA_APPLY = _api.PERM_INFRA_APPLY
 PERM_SETTINGS_ADMIN = _api.PERM_SETTINGS_ADMIN
 PERM_CREDENTIALS_ADMIN = _api.PERM_CREDENTIALS_ADMIN
+PERM_LOGS = _api.PERM_LOGS
 
 
 def build_plugin_router(service) -> APIRouter:
@@ -77,7 +78,9 @@ def build_plugin_router(service) -> APIRouter:
         grep: str | None = None,
         offset: int = 0,
         identity: ApiIdentity = Depends(require_permission(PERM_READ)),
+        _logs: ApiIdentity = Depends(require_permission(PERM_LOGS)),
     ):
+        # Job output needs the log permission (iac:logs_read), not just read.
         return await _api.do_job_logs(job_id, tail=tail, grep=grep, offset=offset)
 
     @router.get("/jobs/{job_id}/runners")
@@ -85,7 +88,8 @@ def build_plugin_router(service) -> APIRouter:
         job_id: int,
         identity: ApiIdentity = Depends(require_permission(PERM_READ)),
     ):
-        return await _api.do_job_runners(job_id)
+        # Task status for every reader; the log tails only with the log permission.
+        return await _api.do_job_runners(job_id, include_logs=identity.allows(PERM_LOGS))
 
     @router.get("/deploy/service/{service_name}/status")
     async def service_status(
@@ -345,10 +349,13 @@ def build_plugin_router(service) -> APIRouter:
 
     # Mint a short-lived ticket for the SSE/raw-log endpoints. Requires api:read
     # (same scope the stream itself needs), so the long-lived bearer token never
-    # has to travel in a query string. See build_stream_router below.
+    # has to travel in a query string. The ticket also carries the "logs" scope
+    # when the caller holds the log permission — without it the stream delivers
+    # job status only and the raw log is refused. See build_stream_router below.
     @router.post("/stream/ticket")
     async def stream_ticket(identity: ApiIdentity = Depends(require_permission(PERM_READ))):
-        return {"ticket": _api.issue_stream_ticket("api:read"), "expires_in": 60}
+        logs = bool(identity.allows(PERM_LOGS))
+        return {"ticket": _api.issue_stream_ticket("api:read", logs=logs), "expires_in": 60, "logs": logs}
 
     return router
 
@@ -379,8 +386,11 @@ def build_stream_router(service) -> APIRouter:
         download: bool = False,
     ):
         from fastapi import HTTPException
-        if not _api._authorize_stream_request(token, ticket, "api:read"):
+        may_read, may_see_logs = _api._stream_access(token, ticket)
+        if not may_read:
             raise HTTPException(status_code=401, detail="Unauthorized")
+        if not may_see_logs:
+            raise HTTPException(status_code=403, detail=f"Missing required permission: {PERM_LOGS}")
         return await _api.do_job_log_raw(job_id, download=download)
 
     return router

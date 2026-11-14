@@ -57,6 +57,9 @@ manifest = ModuleManifest(
          "description": "Change security-relevant settings: runner images, registry, GitLab/webhook URLs, "
                         "host allowlists, webhook sync",
          "icon": "admin_panel_settings"},
+        {"id": "iac:logs_read", "label": "IaC-Job-Logs lesen",
+         "description": "Read job output: log viewer, raw log download and the log lines of the live stream",
+         "icon": "article"},
         {"id": "iac:credentials_admin", "label": "IaC-Zugangsdaten verwalten",
          "description": "Store or remove Git credentials, SSH keys and passwords and choose which "
                         "credential a setting uses",
@@ -76,6 +79,7 @@ manifest = ModuleManifest(
              "plugin:lyndrix.plugin.iac_orchestrator:api:infra_apply",
              "plugin:lyndrix.plugin.iac_orchestrator:iac:settings_admin",
              "plugin:lyndrix.plugin.iac_orchestrator:iac:credentials_admin",
+             "plugin:lyndrix.plugin.iac_orchestrator:iac:logs_read",
          ],
          "auto_map_groups": ["INT_ADMIN"],
          "description": "Full IaC control including infrastructure apply."},
@@ -83,9 +87,10 @@ manifest = ModuleManifest(
          "permissions": [
              "plugin:lyndrix.plugin.iac_orchestrator:api:read",
              "plugin:lyndrix.plugin.iac_orchestrator:api:write",
+             "plugin:lyndrix.plugin.iac_orchestrator:iac:logs_read",
          ],
          "auto_map_groups": [],
-         "description": "Trigger pipelines and edit configs, no infra apply."},
+         "description": "Trigger pipelines and read their logs, no infra apply, no admin settings."},
         {"id": "viewer", "label": "IaC Viewer",
          "permissions": ["plugin:lyndrix.plugin.iac_orchestrator:api:read"],
          "auto_map_groups": [],

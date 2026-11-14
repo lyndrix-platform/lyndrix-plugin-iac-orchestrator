@@ -235,6 +235,14 @@ def _build_fields() -> list[SettingField]:
             description="Container image used to execute Ansible playbooks (must be in the runner image allowlist).",
         ),
         SettingField(
+            "ansible_diff_mode", "Show file diffs (--diff)", kind="select", category="Ansible",
+            options=["never", "dry_run", "always"], default="dry_run", rule="choice",
+            vault_key="iac_ansible_diff_mode", env_var="PLUGIN_IAC_ORCHESTRATOR_ANSIBLE_DIFF",
+            description="ansible-playbook --diff prints the rendered content of templated files (stack.env "
+                        "with its secrets) into the job log. Default: only for dry-runs; known secret "
+                        "values are masked in every job log either way.",
+        ),
+        SettingField(
             "ansible_ssh_key", "Ansible SSH Private Key", kind="textarea",
             category="Ansible", sensitive=True, vault_key="ansible_ssh_key",
             tier=TIER_CREDENTIALS,
@@ -551,6 +559,9 @@ class OrchestratorSettings:
             bad = [h for h in (p.strip() for p in value.split(",")) if h and not _HOST_TOKEN_RE.fullmatch(h)]
             if bad:
                 error = f"invalid host token(s): {', '.join(bad)}"
+        elif rule == "choice":
+            if value not in f.options:
+                error = f"must be one of {', '.join(f.options)}"
         elif rule == "digits":
             if not value.isdigit():
                 error = "must be numeric"

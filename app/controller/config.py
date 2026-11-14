@@ -184,6 +184,14 @@ class IaCConfig:
     @property
     def auto_apply(self) -> bool: return str(self._get("PLUGIN_IAC_ORCHESTRATOR_AUTO_APPLY", "iac_auto_apply", "false")).lower() == "true"
 
+    @property
+    def ansible_diff_mode(self) -> str:
+        """When ansible-playbook gets ``--diff``: ``never`` | ``dry_run`` (default,
+        only with --check) | ``always``. A diff prints the rendered content of
+        every templated file — stack.env with its secrets included."""
+        mode = str(self._get("PLUGIN_IAC_ORCHESTRATOR_ANSIBLE_DIFF", "iac_ansible_diff_mode", "dry_run")).strip().lower()
+        return mode if mode in ("never", "dry_run", "always") else "dry_run"
+
     # --- orphan sweep (rD §3) — env > Vault (settings UI) > default ---
     @property
     def orphan_sweep_enabled(self) -> bool:
