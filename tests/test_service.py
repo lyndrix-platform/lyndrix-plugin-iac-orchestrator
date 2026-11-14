@@ -72,3 +72,32 @@ def test_iac_service_initial_state():
     assert "last_deployment" in service.state
     assert "is_running" in service.state
     assert "active_tasks" in service.state
+
+
+def test_runtime_mount_resolution_is_retried_after_a_failure(monkeypatch):
+    """OC-21: a socket timeout at boot used to pin the fallback paths until restart."""
+    import asyncio
+
+    from iac_plugin.app.controller import service as service_mod
+    from iac_plugin.app.controller.service import IaCService
+
+    svc = IaCService(_make_stub_ctx())
+    clock = {"t": 100.0}
+    monkeypatch.setattr(service_mod.time, "monotonic", lambda: clock["t"])
+    calls = []
+
+    async def resolve(targets):
+        calls.append(len(targets))
+        if len(calls) == 1:
+            raise TimeoutError("socket docker:resolve_mounts timed out")
+        return {"/data/storage/git_repos": "/host/git"}
+
+    svc.socket_client.resolve_runtime_mounts = resolve
+    asyncio.run(svc.ensure_runtime_paths())                 # fails
+    asyncio.run(svc.ensure_runtime_paths())                 # within the pause: no second socket round trip
+    assert len(calls) == 1 and not getattr(svc, "_runtime_paths_resolved", False)
+    clock["t"] += IaCService.RUNTIME_PATH_RETRY_SECONDS + 1
+    asyncio.run(svc.ensure_runtime_paths())                 # retried and resolved
+    asyncio.run(svc.ensure_runtime_paths())
+    assert len(calls) == 2 and svc._runtime_paths_resolved is True
+    assert svc.config.host_git_repos_dir == "/host/git"

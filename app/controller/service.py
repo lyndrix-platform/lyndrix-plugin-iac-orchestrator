@@ -660,9 +660,18 @@ class IaCService:
                 self.ctx.log.warning(f"IaC Orchestrator: webhook auto-sync failed — {exc}")
             await asyncio.sleep(interval)
 
+    #: After a failed mount resolution the next attempt waits this long (a job
+    #: must not pay the socket timeout every time while the socket manager is down).
+    RUNTIME_PATH_RETRY_SECONDS = 300.0
+
     async def ensure_runtime_paths(self):
-        """Resolve host bind mounts from the core socket manager once per boot."""
+        """Resolve host bind mounts from the core socket manager — once per boot
+        when it worked. A failure (socket manager not up yet, timeout) is no
+        longer final: it used to pin the configured fallback paths until the
+        next restart (audit OC-21); now it is retried after a pause."""
         if getattr(self, "_runtime_paths_resolved", False):
+            return
+        if time.monotonic() < getattr(self, "_runtime_paths_retry_at", 0.0):
             return
         try:
             mounts = await self.socket_client.resolve_runtime_mounts(
@@ -675,8 +684,14 @@ class IaCService:
             )
             if mounts:
                 self.config.apply_runtime_mount_paths(mounts)
+                self._runtime_paths_resolved = True
                 self.ctx.log.info("IaC Orchestrator: Resolved runtime host mounts via socket manager.")
+                return
+            reason = "no mounts reported"
         except Exception as exc:
-            self.ctx.log.warning(f"IaC Orchestrator: Runtime mount resolution failed, using configured paths: {exc}")
-        finally:
-            self._runtime_paths_resolved = True
+            reason = str(exc)
+        self._runtime_paths_retry_at = time.monotonic() + self.RUNTIME_PATH_RETRY_SECONDS
+        self.ctx.log.warning(
+            f"IaC Orchestrator: Runtime mount resolution failed ({reason}) — using the configured paths, "
+            f"retrying in {int(self.RUNTIME_PATH_RETRY_SECONDS)}s."
+        )
