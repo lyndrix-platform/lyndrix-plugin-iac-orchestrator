@@ -245,6 +245,7 @@ class DynamicRuleExecutionStage(BaseStage):
                     mode=mode,            # 'plan' is a hard gate; 'apply' still needs auto_apply/approve
                     force_apply=False,    # never bypass the auto_apply guard from a rule
                     adopt_existing=adopt,
+                    dry_run=bool(context.get("dry_run")),
                 )
             except Exception as e:
                 return StageResult(False, f"Terraform {verb} failed for '{host}': {e}")

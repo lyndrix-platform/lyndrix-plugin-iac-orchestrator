@@ -282,6 +282,22 @@ class JobDatabase:
             if session:
                 session.close()
 
+    def get_job_payload(self, job_id: int) -> dict | None:
+        """The trigger payload persisted with the job (``None`` for a row without
+        one, e.g. a legacy direct run). Raises when the row cannot be read — the
+        caller must not guess a job's mode."""
+        session = self._get_session()
+        if not session:
+            raise RuntimeError("job store unavailable")
+        try:
+            raw = session.query(IaCJob.payload).filter(IaCJob.id == job_id).scalar()
+        finally:
+            session.close()
+        if not raw:
+            return None
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else None
+
     def get_jobs_by_status(self, status: str) -> list:
         """Finds all jobs currently in a specific state (e.g., RUNNING)."""
         session = self._get_session()

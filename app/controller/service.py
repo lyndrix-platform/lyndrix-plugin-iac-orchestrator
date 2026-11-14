@@ -360,13 +360,9 @@ class IaCService:
             if getattr(j, "owner_instance", None) in (None, "", me)
         ]
         for job in interrupted_jobs:
-            remaining_services = self.db.get_pending_tasks(job.id)
-            if remaining_services:
-                self.ctx.create_task(
-                    self.engine.resume_bulk_rollout(job.id, remaining_services),
-                    name=f"iac:resume:{job.id}",
-                )
-            elif not any(
+            # Nothing is resumed (audit OC-07): a job whose containers are still
+            # running is closed by the re-attached watchers, everything else here.
+            if not any(
                 t.get("job_id") == job.id
                 for t in self.engine.state.get("active_tasks", {}).values()
             ):
@@ -381,8 +377,11 @@ class IaCService:
                 log.warning(
                     f"IaC Orchestrator: Job #{job.id} is RUNNING but has no active runners. Marking as FAILED."
                 )
+                reason = await self.engine.interrupted_reason(job.id) or "System Restart (Aborted)"
+                self.engine._log_line(job.id, f"[SYSTEM] {reason}.")
+                await self.engine._close_log_writer(job.id)
                 self.db.update_job(job.id, "FAILED")
-                self.db.update_progress(job.id, progress=None, current_step="System Restart (Aborted)")
+                self.db.update_progress(job.id, progress=None, current_step=reason[:250])
                 self.engine.end_override_for(job.id)
                 self.state["last_deployment"] = "FAILED"
 

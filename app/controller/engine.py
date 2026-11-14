@@ -354,6 +354,7 @@ class TerraformProvisionStage(BaseStage):
             job_id=context.get("job_id", 0),
             force_apply=force_apply,
             adopt_existing=bool(payload.get("adopt_existing")),
+            dry_run=bool(context.get("dry_run")),
         )
         # Tell downstream stages whether a fresh container was actually (re)created,
         # so a complete reinstall can invalidate stale per-host state before rollout.
@@ -381,6 +382,7 @@ class TerraformAdoptStage(BaseStage):
             job_id=context.get("job_id", 0),
             mode="import",
             adopt_existing=True,
+            dry_run=bool(context.get("dry_run")),
         )
         msg = (
             f"Adopted '{self.host_name}' into Terraform state (imported + planned)."
@@ -466,6 +468,7 @@ class TerraformAdoptScopeStage(BaseStage):
                 success, _ = await engine.execute_terraform_provision(
                     host_name=h, job_id=context.get("job_id", 0),
                     mode="import", adopt_existing=True,
+                    dry_run=bool(context.get("dry_run")),
                 )
             except Exception as exc:  # noqa: BLE001
                 success = False
@@ -1144,6 +1147,8 @@ class DeploymentEngine:
         # ("service", host, service) → UUID. Feeds the monitoring sync, the
         # maintenance publisher and the policy stage (runner instances only).
         self._ci_map: dict[tuple, str] = {}
+        # job id -> dry-run flag of the persisted payload (see _job_is_dry_run).
+        self._job_modes: dict[int, bool] = {}
 
     def _runner_image(self, kind: str) -> str:
         """Runner image for ``kind`` (ansible|terraform), verified against the
@@ -1920,11 +1925,12 @@ class DeploymentEngine:
         # with --check and no deploy state is persisted. Independent of auto_apply,
         # which only gates infrastructure applies (Terraform, rule-engine actions).
         dry_run = _payload_dry_run(payload)
+        self._set_job_mode(current_job_id, dry_run)
         if dry_run:
             pipeline_label = f"{pipeline_label} (Dry-Run)"
             log.warning(
-                "[SYSTEM] DRY-RUN job: Ansible runs with --check, nothing is changed "
-                "and no deploy state is persisted."
+                "[SYSTEM] DRY-RUN job: Ansible runs with --check, Terraform only plans "
+                "(no apply, no state import); nothing is changed and no deploy state is persisted."
             )
 
         # Sticky "started" notification routed through the central router.
@@ -2128,68 +2134,58 @@ class DeploymentEngine:
             self._sync_runners(current_job_id, force=True)
             await self._close_log_writer(current_job_id)
             self._cleanup_inventory_snapshot(current_job_id)
+            self.__dict__.setdefault("_job_modes", {}).pop(current_job_id, None)
             await self._publish_snapshots()
 
-    async def resume_bulk_rollout(self, job_id: int, pending_services: list[str]):
-        if not pending_services: return
-        
-        self.state["running_jobs"] = self.state.get("running_jobs", 0) + 1
-        self.state["is_running"] = self.state["running_jobs"] > 0
-        
-        self.db.update_progress(job_id, progress=50, current_step="Resuming Bulk Rollout...")
-        _job_ctx_token = _job_id_ctxvar.set(job_id)
-        _writer = self._log_writer(job_id)
-        bridge = JobFileLogBridge(self.config.get_log_path(job_id), job_id=job_id,
-                                  sink=_writer.append if _writer else None)
-        logging.getLogger("IaC:Engine").addHandler(bridge)
-        final_status = "FAILED"
-        log.info(f"[SYSTEM] Resuming {len(pending_services)} pending services from job #{job_id}")
-        
-        self.ctx.emit(
-            "system:notify",
-            {
-                "id": f"job_{job_id}",
-                "title": f"Pipeline #{job_id}",
-                "message": "Resuming Bulk Rollout...",
-                "type": "ongoing",
-                "toast": False,
-                "emit_outbound": False,
-            },
-        )
-        
-        # TODO(agent): the original job payload (incl. dry_run) is not available here,
-        # so a resumed rollout always deploys for real.
-        context = {"payload": {}, "job_id": job_id}
-        stage = AsyncBulkRolloutStage(inventory_path="global/ansible/inventory.yml", limit="all", target_services=pending_services)
+    # NB: there is deliberately no "resume" of an interrupted bulk rollout any more
+    # (audit OC-07 / OS-08). The old resume_bulk_rollout() rebuilt the stage from an
+    # empty payload: a dry-run or --check-gated rollout was continued FOR REAL and a
+    # host-scoped one was widened to every host. A job row does not record enough to
+    # continue safely (which stage owned the pending list, the effective check mode
+    # of a rule action, the remaining stages), so an interrupted rollout is closed
+    # as FAILED "interrupted — re-trigger" (see interrupted_reason).
 
+    async def interrupted_reason(self, job_id: int) -> str | None:
+        """Why ``job_id`` cannot be reported as completed after a runner restart:
+        its bulk rollout still lists services that were never deployed."""
         try:
-            res = await stage.run(self, context)
-            log.info("[SYSTEM] Resumed Pipeline completed.")
-            final_status = "SUCCESS" if res.success else "FAILED"
-            self.state["last_deployment"] = final_status
-            if res.success:
-                self.db.update_progress(job_id, progress=100, current_step="Resume Completed")
-                self._notify_clear(f"job_{job_id}")
-                self._notify(f"Pipeline #{job_id}", "Resume completed successfully.", "positive", persist=False)
-            else:
-                self._notify(
-                    f"Pipeline #{job_id} Resume Failed", "Stage failed.", "negative",
-                    notification_id=f"job_{job_id}",
-                )
-        except Exception as e:
-            log.error(f"!!! [FATAL] {str(e)}")
-            final_status = "FAILED"
-            self.state["last_deployment"] = final_status
-            self.db.update_progress(job_id, progress=None, current_step="Resume Failed")
-            self._notify(f"Pipeline #{job_id} Resume Failed", str(e), "negative", notification_id=f"job_{job_id}")
-        finally:
-            logging.getLogger("IaC:Engine").removeHandler(bridge)
-            _job_id_ctxvar.reset(_job_ctx_token)
-            self.state["running_jobs"] = max(0, self.state.get("running_jobs", 0) - 1)
-            self.state["is_running"] = self.state["running_jobs"] > 0
-            self.db.update_job(job_id=job_id, status=final_status)
-            self._sync_runners(job_id, force=True)
-            await self._close_log_writer(job_id)
+            pending = await asyncio.to_thread(self.db.get_pending_tasks, job_id)
+        except Exception as exc:
+            # Unknown is not "complete": never turn an unreadable row into SUCCESS.
+            return f"Interrupted by a runner restart (pending services unreadable: {exc}) — re-trigger the pipeline"
+        if not isinstance(pending, list) or not pending:
+            return None
+        return (f"Interrupted by a runner restart — {len(pending)} service(s) were not deployed; "
+                "nothing is resumed automatically, re-trigger the rollout")
+
+    # -- job mode (dry-run) -----------------------------------------------------------
+    def _set_job_mode(self, job_id, dry_run: bool) -> None:
+        self.__dict__.setdefault("_job_modes", {})[job_id] = bool(dry_run)
+
+    async def _job_is_dry_run(self, job_id) -> bool:
+        """Is ``job_id`` a dry-run job? The answer belongs to the JOB, not to the
+        caller: it is registered from the persisted payload when the job starts
+        and re-read from the job row on any path that did not go through there.
+        Both executors ask this, so no stage can run a dry-run job for real by
+        forgetting to pass a flag (audit OS-08). A row that cannot be read raises
+        — an unknown mode never defaults to "real"."""
+        modes = self.__dict__.setdefault("_job_modes", {})
+        if job_id in modes:
+            return modes[job_id]
+        if not job_id or job_id == -1:
+            return False        # no job row (legacy direct call): the caller's flags decide
+        loader = getattr(getattr(self, "db", None), "get_job_payload", None)
+        if loader is None:
+            return False
+        try:
+            payload = await asyncio.to_thread(loader, job_id)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Cannot determine the mode (dry-run or real) of job #{job_id}: {exc} — refusing to execute."
+            ) from exc
+        dry = _payload_dry_run(payload) if isinstance(payload, dict) else False
+        modes[job_id] = dry
+        return dry
 
     async def sync_core_repos(self):
         """Periodic/Startup task to keep core repositories up to date."""
@@ -2386,9 +2382,14 @@ class DeploymentEngine:
             except Exception:
                 pass
 
+        interrupted = await self.interrupted_reason(job_id)
+        if interrupted:
+            success = False
+            self._log_line(job_id, f"[SYSTEM] {interrupted}.")
         final = "SUCCESS" if success else "FAILED"
         self.db.update_progress(job_id, progress=100 if success else None,
-                                current_step="Recovered after runner restart" + ("" if success else " (failed)"))
+                                current_step=(interrupted[:250] if interrupted else
+                                              "Recovered after runner restart" + ("" if success else " (failed)")))
         self.db.update_job(job_id, final)
         self.end_override_for(job_id)
         await self._close_log_writer(job_id)
@@ -2676,9 +2677,15 @@ class DeploymentEngine:
             if job is None and success:
                 job = next((j for j in self.db.get_jobs_by_status("FAILED") if j.id == job_id), None)
             if job:
+                interrupted = await self.interrupted_reason(job_id)
+                if interrupted:
+                    success = False
+                    self._log_line(job_id, f"[SYSTEM] {interrupted}.")
                 final_status = "SUCCESS" if success else "FAILED"
                 self.state["last_deployment"] = final_status
-                self.db.update_progress(job_id, progress=100 if success else None, current_step="Reconciled & Completed" if success else "Reconciled & Failed")
+                self.db.update_progress(job_id, progress=100 if success else None,
+                                        current_step=(interrupted[:250] if interrupted else
+                                                      ("Reconciled & Completed" if success else "Reconciled & Failed")))
                 self.db.update_job(job_id, final_status)
                 self._notify_clear(f"job_{job_id}")
                 self._notify(f"Pipeline #{job_id}", "Recovered job finished.", "positive" if success else "negative")
@@ -3145,6 +3152,7 @@ class DeploymentEngine:
         force_apply: bool = False,
         host_name: str = "",
         import_specs: list[dict] | None = None,
+        dry_run: bool = False,
     ) -> tuple[bool, dict]:
         """Run OpenTofu/Terraform in an ephemeral Docker container against a
         rendered run dir.
@@ -3156,7 +3164,11 @@ class DeploymentEngine:
         - Apply happens only when ``force_apply`` (explicit operator approval) or
           the ``auto_apply`` config is set; otherwise the plan is shown but not
           applied — preserving the safe default for the webhook/auto path.
+        - A dry-run job (``dry_run`` or the job's persisted payload) never applies
+          and never imports/removes state, whatever ``force_apply``/``auto_apply``
+          say: it plans and shows.
         """
+        dry = bool(dry_run) or await self._job_is_dry_run(job_id)
         if "active_tasks" not in self.state:
             self.state["active_tasks"] = {}
         self.state["active_tasks"][task_name] = {
@@ -3177,7 +3189,9 @@ class DeploymentEngine:
         tf_bin = str(self.config.terraform_binary or "tofu").strip()
         target_flags = "".join(f" -target='{t}'" for t in (targets or []))
         run_dir = f"/data/storage/git_repos/{run_rel_dir}"
-        do_apply = mode == "apply" and (force_apply or self.config.auto_apply)
+        do_apply = mode == "apply" and not dry and (force_apply or self.config.auto_apply)
+        if dry and mode in ("apply", "import"):
+            log.warning("[TF] DRY-RUN job: '%s' plans only — no apply, no state import.", host_name or "(env)")
         if mode == "state_list":
             # Read-only: list the resources tracked in state. Never plans or applies.
             action_cmd = f"{tf_bin} state list -no-color"
@@ -3200,7 +3214,7 @@ class DeploymentEngine:
         # already tracked), every decision is echoed into the job log, and a
         # not-yet-existing CT falls through to apply (see _build_import_cmd).
         import_cmd = ""
-        if import_specs and (mode == "import" or do_apply):
+        if import_specs and not dry and (mode == "import" or do_apply):
             import_cmd = self._build_import_cmd(tf_bin, import_specs)
         # stderr is folded into stdout so tofu's "Error:" blocks reach the job log
         # in order, and the EXIT trap names the failing step + exit code — before,
@@ -3378,7 +3392,7 @@ class DeploymentEngine:
 
     async def execute_terraform_provision(
         self, host_name: str, job_id: int, force_apply: bool = False,
-        mode: str = "apply", adopt_existing: bool = False,
+        mode: str = "apply", adopt_existing: bool = False, dry_run: bool = False,
     ) -> tuple[bool, dict]:
         host_name = str(host_name or "").strip().lower()
         if not host_name:
@@ -3476,6 +3490,7 @@ class DeploymentEngine:
             task_name=f"Terraform Provision: {host_name}",
             job_id=job_id,
             import_specs=import_specs,
+            dry_run=dry_run,
         )
 
     def _iter_terraform_environments(self) -> list[dict]:
@@ -3600,6 +3615,8 @@ class DeploymentEngine:
     ) -> tuple[bool, dict]:
         """Run a whole-infrastructure plan or apply across every non-empty
         Terraform environment."""
+        # Read once for the bookkeeping below; execute_terraform_docker enforces it.
+        dry = await self._job_is_dry_run(job_id)
         environments = self._iter_terraform_environments()
         if not environments:
             log.warning("No Terraform environments with containers found; nothing to %s.", mode)
@@ -3683,7 +3700,8 @@ class DeploymentEngine:
                     )
                 else:
                     self.db.update_state("pending_infra_plan", {}, "latest")
-            elif mode == "apply":
+            elif mode == "apply" and not dry:
+                # A dry-run "apply" applied nothing: the reviewed plan stays pending.
                 self.db.update_state("pending_infra_plan", {}, "latest")
 
         return overall_ok, {
@@ -3707,6 +3725,12 @@ class DeploymentEngine:
         key_path = None # Safe default so the 'finally' block doesn't crash on early exit
         
         if not shutil.which("docker"): return False, {"successful_hosts": 0, "failed_hosts": 0}
+
+        # The job's persisted mode wins over the caller's flag: a stage that does
+        # not pass check_mode can never run a dry-run job for real (audit OS-08).
+        if not check_mode and await self._job_is_dry_run(job_id):
+            log.warning(f"DRY-RUN job #{job_id}: forcing --check for {playbook_subpath}.")
+            check_mode = True
 
         if "active_tasks" not in self.state: self.state["active_tasks"] = {}
         self.state["active_tasks"][task_name] = {

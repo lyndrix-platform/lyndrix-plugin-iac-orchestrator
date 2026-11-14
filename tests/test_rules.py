@@ -177,9 +177,10 @@ def test_terraform_action_never_force_applies():
     captured = {}
 
     class FakeEngine:
-        async def execute_terraform_provision(self, host_name, job_id, mode, force_apply, adopt_existing):
+        async def execute_terraform_provision(self, host_name, job_id, mode, force_apply, adopt_existing,
+                                              dry_run=False):
             captured.update(host_name=host_name, mode=mode, force_apply=force_apply,
-                            adopt_existing=adopt_existing)
+                            adopt_existing=adopt_existing, dry_run=dry_run)
             return True, {}
 
     async def fake_changed(engine, f):
@@ -195,6 +196,13 @@ def test_terraform_action_never_force_applies():
     assert captured["force_apply"] is False      # never bypass auto_apply from a rule
     assert captured["mode"] == "apply"           # mode intent preserved
     assert captured["adopt_existing"] is True
+    assert captured["dry_run"] is False
+    # a dry-run job hands its mode to the Terraform executor (OS-08)
+    asyncio.run(stage._run_terraform_action(
+        FakeEngine(), {"job_id": 1, "dry_run": True}, action,
+        ["onprem/dev/terraform/terraform.tfvars.json"], {},
+    ))
+    assert captured["dry_run"] is True and captured["force_apply"] is False
 
 
 def test_rules_diff_the_pinned_publish_commit_not_head():
