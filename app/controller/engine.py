@@ -23,6 +23,7 @@ from . import maintenance_resolver as mres
 from .public_projection import public_names, public_scalar, public_terraform, public_url, scrub
 from .config import allowed_registry_hosts, registry_host
 from .settings_schema import resolve_credential
+from .runner_output import RunnerOutputParser
 from ...stages.git import (
     SyncRepoStage,
     PublishInventoryStateStage,
@@ -2712,17 +2713,22 @@ class DeploymentEngine:
     # ``module.lxc_cerberus.proxmox_virtual_environment_container.ct["docker-dev"]``.
     _TF_CT_HOST_RE = re.compile(r'proxmox_virtual_environment_container\.ct\["([^"]+)"\]')
 
-    async def _watch_detached_runner(self, container_name: str, task_name: str, job_id: int):
-        successful_hosts, failed_hosts = 0, 0
-        containers_created = 0  # Terraform: count freshly (re)created LXC containers
-        created_hosts: list = []      # Terraform apply: hostnames whose CT was (re)created
-        hosts_to_create: list = []    # Terraform plan: hostnames a plan would create/replace
-        hosts_to_destroy: list = []   # Terraform plan: hostnames a plan would destroy
-        plan_summary = ""             # Terraform plan: the "Plan: X to add, ..." line
+    async def _watch_detached_runner(self, container_name: str, task_name: str, job_id: int, *,
+                                     kind: str | None = None, tolerate_already_running: bool = False,
+                                     tf_host: str | None = None):
+        """Follow a runner container to its end and return ``(success, stats)``.
+
+        Success is the container's exit code, cross-checked with Ansible's recap —
+        never a phrase somewhere in the output (audit OS-14, see runner_output).
+        ``kind`` is ``ansible`` or ``terraform`` (derived from the container name
+        when a recovery path does not know it); ``tolerate_already_running`` is
+        set only by a Terraform run that really applies.
+        """
+        if kind is None:
+            kind = "terraform" if container_name.startswith("iac-tf-") else "ansible"
+        parser = RunnerOutputParser(kind, tolerate_already_running=tolerate_already_running, tf_host=tf_host)
         ansible_progress = 50.0  # Base progress for Ansible phase
-        tf_already_running = False  # Proxmox "CT already running" is a non-fatal drift condition
-        no_hosts_matched = False  # Empty --limit intersection is a no-op skip, not a failure
-        
+
         try:
             log_proc = await asyncio.create_subprocess_exec("docker", "logs", "-f", container_name, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
             while True:
@@ -2732,6 +2738,7 @@ class DeploymentEngine:
                 if decoded:
                     # 1. WRITE TO DISK + DATABASE (file for the host, DB for every instance)
                     self._log_line(job_id, f"[{task_name}] {decoded}")
+                    parser.feed(decoded)
 
                     # 2. MICRO-PROGRESS SNIFFER
                     if "TASK [" in decoded:
@@ -2745,55 +2752,6 @@ class DeploymentEngine:
                         if len(self.state["active_tasks"][task_name]["logs"]) > 50:
                             self.state["active_tasks"][task_name]["logs"].pop(0)
                         self._sync_runners(job_id)  # throttled DB snapshot for the other instances
-
-                    if "ok=" in decoded and "failed=" in decoded and ":" in decoded:
-                        try:
-                            sp = decoded.split(":")[1]
-                            fc = int(sp.split("failed=")[1].split()[0])
-                            uc = int(sp.split("unreachable=")[1].split()[0])
-                            if fc > 0 or uc > 0: failed_hosts += 1
-                            else: successful_hosts += 1
-                        except Exception: pass
-
-                    # Terraform: a fresh LXC container was actually (re)created.
-                    if "proxmox_virtual_environment_container.ct[" in decoded and "Creation complete" in decoded:
-                        containers_created += 1
-                        m = self._TF_CT_HOST_RE.search(decoded)
-                        if m and m.group(1) not in created_hosts:
-                            created_hosts.append(m.group(1))
-
-                    # Terraform plan lines: capture which hosts a plan would touch, so a
-                    # gated plan can be surfaced for operator review-and-approve.
-                    if "proxmox_virtual_environment_container.ct[" in decoded:
-                        m = self._TF_CT_HOST_RE.search(decoded)
-                        if m:
-                            _h = m.group(1)
-                            if ("will be created" in decoded or "must be replaced" in decoded):
-                                if _h not in hosts_to_create:
-                                    hosts_to_create.append(_h)
-                            elif "will be destroyed" in decoded and _h not in hosts_to_destroy:
-                                hosts_to_destroy.append(_h)
-                    stripped = decoded.strip()
-                    if stripped.startswith("Plan:") and " to add" in stripped:
-                        plan_summary = stripped
-
-                    # Terraform state drift: container exists and is already running on Proxmox.
-                    # This is the desired end-state — treat it as a non-fatal warning, not a failure.
-                    # Match the actual Proxmox error shape ("CT <id> ... already running") rather than
-                    # loose substrings, to avoid masking unrelated failures as success.
-                    if re.search(r"CT\s+\d+\b.*already running", decoded, re.IGNORECASE):
-                        tf_already_running = True
-                        log.warning("[TF] Proxmox state drift detected (%s): container is already running. Treating as success.", task_name)
-                        self._log_line(job_id, f"[{task_name}] [WARNING] State drift: container already running — desired state achieved, continuing.")
-
-                    # Ansible "no hosts to target": the --limit intersection matched zero
-                    # hosts (e.g. a service group not present on the limited host, or an
-                    # empty site/stage group). That is a no-op, not a failure — treat it
-                    # as a graceful skip so a scoped rollout or a rule targeting an empty
-                    # group does not abort the whole pipeline.
-                    if ("no hosts to target" in decoded
-                            or "Could not match supplied host pattern" in decoded):
-                        no_hosts_matched = True
 
             wait_proc = await asyncio.create_subprocess_exec(
                 "docker", "wait", container_name,
@@ -2812,14 +2770,11 @@ class DeploymentEngine:
                        "the output above may be incomplete.")
                 log.error("[Runner] %s: %s", task_name, msg)
                 self._log_line(job_id, f"[{task_name}] {msg}")
-            # Override failure if the only Terraform error was "already running" (desired state IS achieved)
-            success = exit_code == 0 or tf_already_running
-            # An empty --limit intersection exits non-zero with no PLAY RECAP on this
-            # ansible-core; treat it as a skip, but only when nothing actually ran or
-            # failed (so a real task failure is never masked).
-            if not success and no_hosts_matched and successful_hosts == 0 and failed_hosts == 0:
-                log.info("[Ansible] '%s' matched no hosts (empty --limit) — skipping (no-op).", task_name)
-                success = True
+            success, note = parser.verdict(exit_code)
+            if note:
+                level = "WARNING" if success else "ERROR"
+                log.warning("[Runner] %s: %s", task_name, note)
+                self._log_line(job_id, f"[{task_name}] [{level}] {note}.")
             if not success and exit_code is not None:
                 self._log_line(job_id, f"[{task_name}] [ERROR] runner container exited with code {exit_code}.")
 
@@ -2827,16 +2782,7 @@ class DeploymentEngine:
                 self.state["active_tasks"][task_name]["status"] = "success" if success else "failed"
                 self._sync_runners(job_id, force=True)
             await asyncio.create_subprocess_exec("docker", "rm", "-f", container_name)
-            return success, {
-                "successful_hosts": successful_hosts,
-                "failed_hosts": failed_hosts,
-                "containers_created": containers_created,
-                "created_hosts": created_hosts,
-                "hosts_to_create": hosts_to_create,
-                "hosts_to_destroy": hosts_to_destroy,
-                "plan_summary": plan_summary,
-                "exit_code": exit_code,
-            }
+            return success, parser.stats(exit_code)
 
         except Exception as exc:  # noqa: BLE001
             log.exception("[Runner] watching '%s' (%s) failed", task_name, container_name)
@@ -3306,7 +3252,13 @@ class DeploymentEngine:
                     error_msg = spawn_result.get("error") or error_msg
                 raise RuntimeError(f"Failed to spawn Terraform runner container: {error_msg}")
 
-            success, _stats = await self._watch_detached_runner(c_name, task_name, job_id)
+            success, _stats = await self._watch_detached_runner(
+                c_name, task_name, job_id, kind="terraform",
+                # Only a run that really applies may meet (and tolerate) Proxmox'
+                # "CT already running"; scoped to the targeted host when there is one.
+                tolerate_already_running=do_apply,
+                tf_host=(host_name if targets else None),
+            )
 
         return success, {
             "successful_hosts": 1 if success else 0,
@@ -3851,7 +3803,7 @@ class DeploymentEngine:
                 error_msg = stdout.decode('utf-8', errors='replace').strip()
                 raise RuntimeError(f"Failed to spawn Docker runner container: {error_msg}")
 
-            return await self._watch_detached_runner(c_name, task_name, job_id)
+            return await self._watch_detached_runner(c_name, task_name, job_id, kind="ansible")
         except Exception as e:
             log.error(f"Docker Execution Error: {e}")
             if "active_tasks" in self.state and task_name in self.state["active_tasks"]:
