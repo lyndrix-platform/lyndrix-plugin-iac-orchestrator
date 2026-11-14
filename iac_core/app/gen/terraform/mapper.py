@@ -66,6 +66,39 @@ def _collect_services(host: Dict[str, Any]) -> List[str]:
     return names
 
 
+_PROXMOX_API_PORT = 8006
+
+
+def _endpoint_url(value: str) -> str:
+    """Full API URL for a provider endpoint (bpg/proxmox needs https://HOST:PORT).
+
+    A complete URL is kept. Otherwise the default API port is added only when
+    none is given, and an IPv6 literal is bracketed — "host:8006" used to become
+    "https://host:8006:8006" and "fd00::5" "https://fd00::5:8006".
+    """
+    import ipaddress
+
+    text = value.strip()
+    if text.startswith(("http://", "https://")):
+        return text
+    host, port = text, None
+    if text.startswith("["):                       # [v6] or [v6]:port
+        end = text.find("]")
+        if end > 0:
+            host, rest = text[1:end], text[end + 1:]
+            port = rest[1:] if rest.startswith(":") and rest[1:].isdigit() else None
+    elif text.count(":") == 1:                     # host:port / v4:port
+        candidate, maybe_port = text.split(":", 1)
+        if maybe_port.isdigit():
+            host, port = candidate, maybe_port
+    try:
+        if ipaddress.ip_address(host).version == 6:
+            host = f"[{host}]"
+    except ValueError:
+        pass                                       # a host name
+    return f"https://{host}:{port or _PROXMOX_API_PORT}"
+
+
 def build_providers(config: Dict[str, Any], log: logging.Logger = _log) -> Dict[str, Any]:
     """Map hardware_hosts with terraform.is_used into provider connection entries."""
     providers: Dict[str, Any] = {}
@@ -86,10 +119,8 @@ def build_providers(config: Dict[str, Any], log: logging.Logger = _log) -> Dict[
             addr = tf.get("endpoint") or details.get("ansible_host") or details.get("ip")
             if addr:
                 entry["endpoint"] = addr
-        if "endpoint" in entry:
-            ep = entry["endpoint"]
-            if ep and not ep.startswith("http"):
-                entry["endpoint"] = f"https://{ep}:8006"
+        if "endpoint" in entry and entry["endpoint"]:
+            entry["endpoint"] = _endpoint_url(str(entry["endpoint"]))
         entry["node_name"] = name
         providers[name] = entry
     return providers
