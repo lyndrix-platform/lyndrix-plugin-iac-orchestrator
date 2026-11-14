@@ -42,6 +42,10 @@ class IaCJob(Base):
     # Heartbeat on the DATABASE clock in UTC — what the orphan sweep ages (the
     # naive ``heartbeat_at`` above is the runner's local wall clock).
     heartbeat_utc = Column(DateTime, nullable=True)
+    # Where the job is (JSON: stage index/count/name, "last" stage flag). Written with
+    # every stage start so a restarted runner knows whether a re-attached container
+    # belonged to the pipeline's last stage or stages are still missing (audit OC-10).
+    exec_state = Column(LONGTEXT, nullable=True)
 
     # --- MAINTENANCE WINDOWS (plugin 1.6): a deploy parked for its window ---
     # Status SCHEDULED: the runner evaluated the service's deploy_policy and parked the job

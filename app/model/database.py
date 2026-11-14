@@ -318,6 +318,22 @@ class JobDatabase:
         data = json.loads(raw)
         return data if isinstance(data, dict) else None
 
+    def get_exec_state(self, job_id: int) -> dict | None:
+        """Stage progress recorded by the engine (``None`` for a row of a plugin
+        version that did not record it)."""
+        session = self._get_session()
+        if not session:
+            return None
+        try:
+            raw = session.query(IaCJob.exec_state).filter(IaCJob.id == job_id).scalar()
+        finally:
+            session.close()
+        try:
+            data = json.loads(raw) if raw else None
+        except Exception:
+            return None
+        return data if isinstance(data, dict) else None
+
     def get_jobs_by_status(self, status: str) -> list:
         """Finds all jobs currently in a specific state (e.g., RUNNING)."""
         session = self._get_session()
@@ -430,7 +446,7 @@ class JobDatabase:
                 
                 
     def update_progress(self, job_id: int, progress: int = None, current_step: str = None, *,
-                        fenced: bool = True) -> bool:
+                        fenced: bool = True, exec_state: dict | None = None) -> bool:
         """Live updates the progress bar and current action text.
 
         While this process holds the job's claim the write only lands on the
@@ -444,6 +460,8 @@ class JobDatabase:
             values["progress"] = progress
         if current_step:
             values["current_step"] = str(current_step)[:250]
+        if exec_state is not None:
+            values["exec_state"] = json.dumps(exec_state, default=str)
         if not values:
             return False
         token = self.claims.get(job_id) if fenced else None

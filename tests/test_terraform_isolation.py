@@ -244,20 +244,11 @@ def test_abort_stops_terraform_gracefully_then_removes_everything(sqlite_queue, 
 
 def test_restart_recovery_reattaches_terraform_containers(sqlite_queue, monkeypatch, tmp_path):
     eng, _events = _engine(monkeypatch, sqlite_queue, tmp_path, ps_output=PS)
-    attached = []
-
-    async def finalize(c_name, task_name, job_id):
-        attached.append((c_name, task_name, job_id))
-
-    eng._reconcile_and_finalize = finalize
-    eng.ctx.create_task = lambda coro, name=None: asyncio.get_running_loop().create_task(coro)
-
-    async def scenario():
-        await eng.reconcile_orphaned_runners()
-        await asyncio.sleep(0.01)
-
-    asyncio.run(scenario())
-    assert ("iac-tf-j7-Terraform-Apply--onprem_prod", "Terraform Apply: onprem_prod", 7) in attached
-    assert ("aac-runner-aac-traefik-docker-dev", "aac-traefik", 7) in attached
+    containers = asyncio.run(eng._list_job_containers())
+    found = {(c["name"], c["task_name"], c["job_id"], c["kind"], c["state"]) for c in containers}
+    assert ("iac-tf-j7-Terraform-Apply--onprem_prod", "Terraform Apply: onprem_prod", 7, "terraform", "running") in found
+    assert ("aac-runner-aac-traefik-docker-dev", "aac-traefik", 7, "ansible", "running") in found
+    assert ("iac-tf-j7-old", "Terraform Plan: onprem_dev", 7, "terraform", "exited") in found    # kind from the name
+    eng.register_recovered(7, containers)
     assert eng.state["active_tasks"]["Terraform Apply: onprem_prod"]["status"] == "running_terraform"
-    assert eng.attended_job_ids() == {7}
+    assert eng.attended_job_ids() == {7}                    # heartbeated like a running job task

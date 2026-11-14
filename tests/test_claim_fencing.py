@@ -184,24 +184,16 @@ def _reconcile(svc, monkeypatch):
         await real_sleep(0)
 
     monkeypatch.setattr(asyncio, "sleep", fast_sleep)
-    finalized = []
+    async def no_containers(job_id=None):
+        return []
 
-    async def no_containers(*a, **k):
-        return None
-
-    async def not_finalized(job_id, *, reason=""):
-        finalized.append(job_id)
-        return False
-
-    svc.engine.reconcile_orphaned_runners = no_containers
-    svc.engine.finalize_from_containers = not_finalized
+    svc.engine._list_job_containers = no_containers
 
     async def scenario():
         await svc.run_startup_reconciliation()
         await real_sleep(0.05)
 
     asyncio.run(scenario())
-    return finalized
 
 
 def test_reconciliation_spares_jobs_of_the_current_incarnation(iac_service, monkeypatch):
@@ -217,9 +209,9 @@ def test_reconciliation_spares_jobs_of_the_current_incarnation(iac_service, monk
     svc.queue.claim_next("runner-2", "core:other")
     svc.queue.claim_next(ME, None)                            # row of a pre-fencing plugin version
 
-    finalized = _reconcile(svc, monkeypatch)
-    assert sorted(finalized) == sorted([stale, legacy])       # never asked about the fresh or the foreign job
+    _reconcile(svc, monkeypatch)
     assert _row(fresh).status == "RUNNING" and _row(foreign).status == "RUNNING"
+    assert _row(fresh).current_step == f"Claimed by {ME}"      # not even looked at
     for job_id in (stale, legacy):
         assert _row(job_id).status == "FAILED" and _row(job_id).current_step == "System Restart (Aborted)"
     assert _row(stale).claim_token != old_token and _row(stale).owner_incarnation == svc.incarnation
@@ -330,18 +322,21 @@ def test_worker_stops_a_fenced_job_and_its_containers(sqlite_queue):
     assert _row(job_id).status == "FAILED" and job_id not in q.claims
 
 
-def test_recovered_container_result_never_rewrites_a_closed_job():
-    eng = DeploymentEngine.__new__(DeploymentEngine)
-    eng.state = {"running_jobs": 1}
-    eng.db = MagicMock()
-    eng.db.claims = {}
-    eng.db.get_jobs_by_status.return_value = []                 # the sweep already FAILED the row
-    eng._notify = MagicMock()
+def test_recovered_container_result_never_rewrites_a_closed_job(iac_service):
+    """The sweep FAILED the job while its container was still running; the
+    container then exits 0 — the row stays FAILED (no FAILED→SUCCESS any more)."""
+    svc = iac_service
+    job_id = svc.queue.enqueue({"pipeline_type": "connectivity"})
+    token = svc.queue.claim_next(ME, svc.incarnation).token
+    svc.db.claims[job_id] = token
+    assert svc.queue.mark_failed(job_id, "runner_lost: docker-auto-runner")
+    svc.engine._notify = MagicMock()
 
     async def watched(*a, **k):
         return True, {}
 
-    eng._watch_detached_runner = watched
-    asyncio.run(eng._reconcile_and_finalize("aac-runner-x", "x", 5))
-    eng.db.update_job.assert_not_called()
-    eng.db.update_progress.assert_not_called()
+    svc.engine._watch_detached_runner = watched
+    container = {"id": "c1", "name": "aac-runner-x", "task_name": "x", "kind": "ansible", "state": "running", "job_id": job_id}
+    assert asyncio.run(svc.engine.recover_job(job_id, [container])) is None
+    assert _row(job_id).status == "FAILED" and _row(job_id).current_step == "runner_lost: docker-auto-runner"
+    svc.engine._notify.assert_not_called()

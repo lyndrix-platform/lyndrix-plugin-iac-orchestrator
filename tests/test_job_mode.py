@@ -249,22 +249,26 @@ def test_reattached_container_cannot_complete_an_interrupted_rollout():
     """A re-attached playbook that exits 0 must not close the job as SUCCESS while
     other services of the same rollout were never started."""
     eng = DeploymentEngine.__new__(DeploymentEngine)
-    eng.state = {"running_jobs": 1}
+    eng.state = {}
     eng.db = MagicMock()
-    eng.db.get_jobs_by_status.side_effect = lambda status: [SimpleNamespace(id=5)] if status == "RUNNING" else []
+    eng.db.claims = {}
     eng.db.get_pending_tasks.return_value = ["aac-cadvisor"]
+    eng.db.get_exec_state.return_value = {"stage": 4, "stages": 7, "stage_name": "Async Bulk Rollout", "last": False}
     eng._notify = MagicMock()
-    eng._notify_clear = MagicMock()
     eng._log_line = MagicMock()
+    eng._log_writers = {}
+    eng._cleanup_inventory_snapshot = MagicMock()
 
     async def watched(*a, **k):
         return True, {}
 
     eng._watch_detached_runner = watched
-    asyncio.run(eng._reconcile_and_finalize("aac-runner-aac-traefik", "aac-traefik", 5))
+    container = {"id": "c1", "name": "aac-runner-aac-traefik", "task_name": "aac-traefik", "kind": "ansible",
+                 "state": "running", "job_id": 5}
+    assert asyncio.run(eng.recover_job(5, [container])) == "FAILED"
     statuses = [c.args[1] for c in eng.db.update_job.call_args_list]
     assert statuses == ["FAILED"]
-    assert "not deployed" in eng.db.update_progress.call_args.kwargs["current_step"]
+    assert "not deployed" in eng.db.update_progress.call_args.args[2]
 
 
 def test_interrupted_reason_treats_unreadable_rows_as_interrupted():

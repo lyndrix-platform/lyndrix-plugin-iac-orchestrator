@@ -1166,6 +1166,14 @@ class DeploymentEngine:
         self._ci_map: dict[tuple, str] = {}
         # job id -> dry-run flag of the persisted payload (see _job_is_dry_run).
         self._job_modes: dict[int, bool] = {}
+        # Jobs an operator asked to abort. ONLY these become ABORTED when their
+        # task is cancelled; any other cancellation (plugin reload, draining
+        # instance, fenced job) detaches the job without a terminal status.
+        self._abort_requested: set[int] = set()
+        # job id -> (stage index, stage count, stage name) of the running stage.
+        self._job_stage: dict[int, tuple] = {}
+        # Why the runner is stopping (set by IaCService.shutdown) — for the log.
+        self.detaching: str | None = None
 
     def _runner_image(self, kind: str) -> str:
         """Runner image for ``kind`` (ansible|terraform), verified against the
@@ -1929,6 +1937,7 @@ class DeploymentEngine:
         logging.getLogger("IaC:Engine").addHandler(bridge)
         final_status = "FAILED"
         parked = False  # set by the JobParked handler (maintenance windows, 1.6)
+        detached = False  # cancelled without an abort request: the job lives on (OC-10)
 
         log.info("[SYSTEM] Pipeline Started")
         log.info(f"[SYSTEM] Job #{current_job_id} registered in database.")
@@ -2009,7 +2018,7 @@ class DeploymentEngine:
                 total_stages = len(pipeline)
                 for idx, stage in enumerate(pipeline):
                     pct = int((idx / total_stages) * 50)
-                    self.db.update_progress(current_job_id, progress=pct, current_step=f"Stage: {stage.name}")
+                    self._mark_stage(current_job_id, idx, total_stages, stage, pct, f"Stage: {stage.name}")
                     
                     log.info(f"--- STAGE: {stage.name} ---")
                     res = await stage.run(self, context)
@@ -2064,11 +2073,27 @@ class DeploymentEngine:
                 severity="success",
             )
         except asyncio.CancelledError:
-            # Abort (do_abort → worker.cancel): the row is closed as ABORTED by the
-            # finally below; the containers were killed by abort_job().
-            final_status = "ABORTED"
-            self.state["last_deployment"] = final_status
-            log.warning("[SYSTEM] Pipeline aborted.")
+            if current_job_id in self.__dict__.setdefault("_abort_requested", set()):
+                # Abort (do_abort → worker.cancel): the row is closed as ABORTED by the
+                # finally below; the containers are killed by abort_job().
+                final_status = "ABORTED"
+                self.state["last_deployment"] = final_status
+                log.warning("[SYSTEM] Pipeline aborted.")
+            else:
+                # Any other cancellation — plugin reload/disable, a draining
+                # instance, a job that was closed elsewhere: the containers keep
+                # running, so this is NOT the end of the job. No terminal status,
+                # the maintenance override stays; the next runner start re-attaches
+                # to the containers and closes the job from all of them (OC-10).
+                detached = True
+                stage = self.__dict__.setdefault("_job_stage", {}).get(current_job_id)
+                where = f"stage {stage[0]}/{stage[1]} ({stage[2]})" if stage else "start-up"
+                why = getattr(self, "detaching", None) or "stopping"
+                log.warning(f"[SYSTEM] Runner is {why} — pipeline detached at {where}; running containers "
+                            "are left alone. The next runner start re-attaches or closes the job.")
+                self.db.update_progress(
+                    current_job_id, progress=None,
+                    current_step=f"Runner reloading — detached at {where}; containers keep running")
             raise
         except JobParked as parked_exc:
             # Maintenance windows (1.6): the policy stage parked the job as SCHEDULED
@@ -2144,10 +2169,11 @@ class DeploymentEngine:
             _job_id_ctxvar.reset(_job_ctx_token)
             self.state["running_jobs"] = max(0, self.state.get("running_jobs", 0) - 1)
             self.state["is_running"] = self.state["running_jobs"] > 0
-            if not parked:
+            if not parked and not detached:
                 # Per-job result (never the shared last_deployment: concurrent pipelines
                 # used to overwrite each other's final status through it). A parked job
-                # is already SCHEDULED — writing a terminal status would un-park it.
+                # is already SCHEDULED — writing a terminal status would un-park it; a
+                # detached job is still running in its containers.
                 if not self.db.update_job(job_id=current_job_id, status=final_status):
                     # Conditional write (fencing): the row was closed or taken
                     # over elsewhere — the orphan sweep, an abort on another
@@ -2157,8 +2183,12 @@ class DeploymentEngine:
                 self.end_override_for(current_job_id)
             self._sync_runners(current_job_id, force=True)
             await self._close_log_writer(current_job_id)
-            self._cleanup_inventory_snapshot(current_job_id)
+            if not detached:
+                # A detached job's playbook may still read its inventory snapshot.
+                self._cleanup_inventory_snapshot(current_job_id)
             self.__dict__.setdefault("_job_modes", {}).pop(current_job_id, None)
+            self.__dict__.setdefault("_job_stage", {}).pop(current_job_id, None)
+            self.__dict__.setdefault("_abort_requested", set()).discard(current_job_id)
             await self._publish_snapshots()
 
     # NB: there is deliberately no "resume" of an interrupted bulk rollout any more
@@ -2324,7 +2354,9 @@ class DeploymentEngine:
                                     current_step="Repositories synced" if ok else "Sync completed with failures")
             log.info(f"[SYSTEM] Repository sync finished: {final_status}.")
         except asyncio.CancelledError:
-            final_status = "ABORTED"
+            # ABORTED only on an operator's abort; otherwise the row stays RUNNING
+            # and the next runner start closes it ("System Restart").
+            final_status = "ABORTED" if job_id in self.__dict__.setdefault("_abort_requested", set()) else None
             raise
         except Exception as exc:
             log.error(f"Repository sync job #{job_id} failed: {exc}")
@@ -2334,94 +2366,113 @@ class DeploymentEngine:
             _job_id_ctxvar.reset(_job_ctx_token)
             self.state["running_jobs"] = max(0, self.state.get("running_jobs", 0) - 1)
             self.state["is_running"] = self.state["running_jobs"] > 0
-            self.db.update_job(job_id, final_status)
+            if final_status:
+                self.db.update_job(job_id, final_status)
+            self.__dict__.setdefault("_abort_requested", set()).discard(job_id)
             await self._close_log_writer(job_id)
 
-    async def finalize_from_containers(self, job_id: int, *, reason: str = "runner restarted") -> bool:
-        """A job whose runner process died (self-deploy, restart) may still have
-        its ``aac-runner-*`` containers on this host: re-attach to running ones,
-        read the exit code of finished ones, append their log tail to the job log
-        and close the row. Returns True when the job was handled here."""
-        if not shutil.which("docker"):
-            return False
+    def request_abort(self, job_id: int) -> None:
+        """Mark ``job_id`` as aborted by an operator: its cancellation is an ABORT
+        (terminal), not a detach."""
+        self.__dict__.setdefault("_abort_requested", set()).add(int(job_id))
+
+    def _mark_stage(self, job_id, index: int, total: int, stage, progress, step: str) -> None:
+        """Progress write of a stage start that also records WHERE the job is, in
+        the row (``exec_state``): restart recovery decides from it whether the
+        pipeline had reached its last stage."""
+        name = str(getattr(stage, "name", "") or stage.__class__.__name__)
+        self.__dict__.setdefault("_job_stage", {})[job_id] = (index + 1, total, name)
+        self.db.update_progress(job_id, progress=progress, current_step=step, exec_state={
+            "stage": index + 1, "stages": total, "stage_name": name, "last": index + 1 >= total,
+        })
+
+    def register_recovered(self, job_id: int, containers: list[dict]) -> None:
+        """Make re-attached containers visible (UI, heartbeat) before their
+        watchers start."""
+        tasks = self.state.setdefault("active_tasks", {})
+        for container in containers:
+            tasks[container["task_name"]] = {
+                "status": "running_terraform" if container["kind"] == "terraform" else "running_ansible",
+                "logs": [], "job_id": job_id,
+            }
+        self._sync_runners(job_id, force=True)
+
+    async def recover_job(self, job_id: int, containers: list[dict]) -> str | None:
+        """Close a job a previous incarnation of this runner left behind, from ALL
+        its containers (audit OC-10) — running ones are followed to their end,
+        finished ones are read; output that is already in the job log is not
+        stored twice.
+
+        * a container failed                       → FAILED
+        * services of a bulk rollout never started → FAILED "Interrupted …" (OC-07)
+        * the pipeline was not in its last stage   → FAILED "Interrupted … at stage
+          i/n": the remaining stages (service deploy, rules, state persist) did
+          not run — a green container is not a green pipeline
+        * last stage and every container exit 0    → SUCCESS
+        * rows without stage info (older plugin)   → exit codes decide, as before
+
+        Returns the final status, ``None`` when the row was closed elsewhere
+        meanwhile (its state stands). A cancellation (another reload) leaves the
+        row RUNNING for the next incarnation.
+        """
+        self.state["running_jobs"] = self.state.get("running_jobs", 0) + 1
+        self.state["is_running"] = True
         try:
-            ps = await asyncio.create_subprocess_exec(
-                "docker", "ps", "-a", "--filter", f"label=iac_job_id={job_id}",
-                "--format", "{{.ID}}\t{{.Names}}\t{{.State}}\t{{.Label \"iac_task_name\"}}",
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
-            )
-            out, _ = await ps.communicate()
-        except Exception as exc:
-            log.debug(f"finalize_from_containers: docker ps failed: {exc}")
-            return False
-        rows = [ln.split("\t") for ln in out.decode(errors="replace").splitlines() if ln.strip()]
-        if not rows:
-            return False
+            watchers = []
+            for container in containers:
+                stored = 0
+                if getattr(self, "queue", None) is not None:
+                    stored = await asyncio.to_thread(self.queue.count_task_lines, job_id, container["task_name"])
+                watchers.append(self._watch_detached_runner(
+                    container["name"], container["task_name"], job_id,
+                    kind=container["kind"], skip_lines=stored))
+            results = await asyncio.gather(*watchers, return_exceptions=True)
+            all_ok = all(isinstance(r, tuple) and bool(r[0]) for r in results)
 
-        running = [r for r in rows if len(r) >= 3 and r[2] == "running"]
-        if running:
-            # Still executing: re-attach exactly like the startup reconciliation does.
-            for cid, name, _state, *rest in running:
-                task_name = (rest[0] if rest and rest[0] else name.replace("aac-runner-", ""))
-                self.state.setdefault("active_tasks", {})
-                self.state["active_tasks"].setdefault(task_name, {"status": "running_ansible", "logs": [], "job_id": job_id})
-                self._sync_runners(job_id, force=True)
-                self.ctx.create_task(self._reconcile_and_finalize(name, task_name, job_id),
-                                     name=f"iac:reconcile:{job_id}:{task_name}")
-            log.info(f"RECOVERY: job #{job_id} — re-attached to {len(running)} running container(s) after {reason}.")
-            return True
+            interrupted = await self.interrupted_reason(job_id)
+            try:
+                exec_state = await asyncio.to_thread(self.db.get_exec_state, job_id)
+            except Exception:
+                exec_state = {"stage": "?", "stages": "?", "stage_name": "unknown", "last": False}
+            if interrupted:
+                final, step = "FAILED", interrupted
+            elif not all_ok:
+                final, step = "FAILED", "Recovered after runner restart (failed)"
+            elif isinstance(exec_state, dict) and not exec_state.get("last"):
+                final = "FAILED"
+                step = (f"Interrupted by a runner restart at stage {exec_state.get('stage')}/{exec_state.get('stages')} "
+                        f"({exec_state.get('stage_name')}) — the remaining stages did not run; re-trigger the pipeline")
+            else:
+                final, step = "SUCCESS", "Recovered after runner restart"
+            self._log_line(job_id, f"[SYSTEM] {step}.")
+            await asyncio.to_thread(self.db.update_progress, job_id, 100 if final == "SUCCESS" else None, step[:250])
+            closed = await asyncio.to_thread(self.db.update_job, job_id, final)
+            getattr(self.db, "claims", {}).pop(job_id, None)
+            self.end_override_for(job_id)
+            await self._close_log_writer(job_id)
+            self._cleanup_inventory_snapshot(job_id)
+            if not closed:
+                log.warning(f"RECOVERY: job #{job_id} was closed elsewhere meanwhile — its state stands "
+                            f"(containers: {'ok' if all_ok else 'failed'}).")
+                return None
+            self.state["last_deployment"] = final
+            self._notify(f"Pipeline #{job_id}", f"{step}.", "positive" if final == "SUCCESS" else "negative",
+                         notification_id=f"job_{job_id}")
+            log.info(f"RECOVERY: job #{job_id} closed as {final} from {len(containers)} container(s).")
+            return final
+        finally:
+            self.state["running_jobs"] = max(0, self.state.get("running_jobs", 0) - 1)
+            self.state["is_running"] = self.state["running_jobs"] > 0
 
-        # Everything finished while nobody watched: decide from the exit codes.
-        success = True
-        for cid, name, _state, *rest in rows:
-            task_name = (rest[0] if rest and rest[0] else name.replace("aac-runner-", ""))
+    async def flush_for_shutdown(self, timeout: float = 3.0) -> None:
+        """Persist what is still buffered (job-log writers, runner snapshots)
+        before the plugin goes away. Bounded; never raises."""
+        for job_id in list(self._log_writers):
+            self._sync_runners(job_id, force=True)
             try:
-                insp = await asyncio.create_subprocess_exec(
-                    "docker", "inspect", "--format", "{{.State.ExitCode}}", cid,
-                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
-                )
-                code_out, _ = await insp.communicate()
-                exit_code = int(code_out.decode().strip() or "1")
-            except Exception:
-                exit_code = 1
-            try:
-                lg = await asyncio.create_subprocess_exec(
-                    "docker", "logs", "--tail", "400", cid,
-                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
-                )
-                log_out, _ = await lg.communicate()
-                for line in log_out.decode(errors="replace").splitlines():
-                    if line.strip():
-                        self._log_line(job_id, f"[{task_name}] {line.rstrip()}")
-            except Exception:
-                pass
-            self._log_line(job_id, f"[SYSTEM] Runner container '{name}' finished with exit code {exit_code} "
-                                   f"while the orchestrator was {reason} — recovered from the container.")
-            success = success and exit_code == 0
-            try:
-                rm = await asyncio.create_subprocess_exec("docker", "rm", "-f", cid,
-                                                          stdout=asyncio.subprocess.DEVNULL,
-                                                          stderr=asyncio.subprocess.DEVNULL)
-                await rm.wait()
-            except Exception:
-                pass
-
-        interrupted = await self.interrupted_reason(job_id)
-        if interrupted:
-            success = False
-            self._log_line(job_id, f"[SYSTEM] {interrupted}.")
-        final = "SUCCESS" if success else "FAILED"
-        self.db.update_progress(job_id, progress=100 if success else None,
-                                current_step=(interrupted[:250] if interrupted else
-                                              "Recovered after runner restart" + ("" if success else " (failed)")))
-        self.db.update_job(job_id, final)
-        self.db.claims.pop(job_id, None)
-        self.end_override_for(job_id)
-        await self._close_log_writer(job_id)
-        self._notify(f"Pipeline #{job_id}", f"Recovered after runner restart: {final}.",
-                     "positive" if success else "negative", notification_id=f"job_{job_id}")
-        log.info(f"RECOVERY: job #{job_id} closed as {final} from {len(rows)} finished container(s).")
-        return True
+                await asyncio.wait_for(self._close_log_writer(job_id), timeout=max(0.2, timeout))
+            except Exception as exc:
+                log.debug(f"shutdown flush for job #{job_id} incomplete: {exc}")
 
     #: ``active_tasks`` statuses that mean "a container of this task may be running".
     _LIVE_TASK_STATUSES = ("pulling_image", "running_ansible", "running_terraform")
@@ -2709,81 +2760,22 @@ class DeploymentEngine:
         except Exception:
             pass
 
-    async def reconcile_orphaned_runners(self, job_id=None):
-        """Re-attach to the runner containers a previous incarnation left on this
-        host — Ansible and Terraform, found by their ``iac_job_id`` label."""
-        try:
-            containers = await self._list_job_containers(job_id)
-            if not containers:
-                return
-
-            log.info(f"Reconciliation: Found {len(containers)} orphaned runners. Reattaching...")
-            self.state["is_running"] = True
-
-            for container in containers:
-                c_name, task_name, recovered_job_id = container["name"], container["task_name"], container["job_id"]
-                if "active_tasks" not in self.state: self.state["active_tasks"] = {}
-                if task_name not in self.state["active_tasks"]:
-                    self.state["active_tasks"][task_name] = {
-                        "status": "running_terraform" if container["kind"] == "terraform" else "running_ansible",
-                        "logs": [],
-                        "job_id": recovered_job_id
-                    }
-                    self._sync_runners(recovered_job_id, force=True)
-
-                self.state["running_jobs"] = self.state.get("running_jobs", 0) + 1
-                self.ctx.create_task(
-                    self._reconcile_and_finalize(c_name, task_name, recovered_job_id),
-                    name=f"iac:reconcile:{recovered_job_id}:{task_name}"
-                )
-        except Exception as e: log.error(f"Failed to reconcile: {e}")
-
-    async def _reconcile_and_finalize(self, c_name: str, task_name: str, job_id: int):
-        """Wrapper to safely close out a recovered job in the database after the runner finishes."""
-        success, _ = await self._watch_detached_runner(c_name, task_name, job_id)
-
-        if job_id != 0:
-            # A row that is no longer RUNNING was closed elsewhere (orphan sweep,
-            # abort): its state stands. The container's result is in the job log;
-            # a late success never rewrites FAILED into SUCCESS any more.
-            running = await asyncio.to_thread(self.db.get_jobs_by_status, "RUNNING")
-            job = next((j for j in running if j.id == job_id), None)
-            if job is None:
-                log.warning(f"RECOVERY: container '{c_name}' of job #{job_id} finished "
-                            f"({'ok' if success else 'failed'}), but the job was closed elsewhere — status unchanged.")
-            if job:
-                interrupted = await self.interrupted_reason(job_id)
-                if interrupted:
-                    success = False
-                    self._log_line(job_id, f"[SYSTEM] {interrupted}.")
-                final_status = "SUCCESS" if success else "FAILED"
-                self.state["last_deployment"] = final_status
-                self.db.update_progress(job_id, progress=100 if success else None,
-                                        current_step=(interrupted[:250] if interrupted else
-                                                      ("Reconciled & Completed" if success else "Reconciled & Failed")))
-                self.db.update_job(job_id, final_status)
-                self.end_override_for(job_id)
-                self._notify_clear(f"job_{job_id}")
-                self._notify(f"Pipeline #{job_id}", "Recovered job finished.", "positive" if success else "negative")
-            getattr(self.db, "claims", {}).pop(job_id, None)
-                
-        self.state["running_jobs"] = max(0, self.state.get("running_jobs", 0) - 1)
-        self.state["is_running"] = self.state["running_jobs"] > 0
-
     # Extracts the tfvars key (== hostname) from a container resource address like
     # ``module.lxc_cerberus.proxmox_virtual_environment_container.ct["docker-dev"]``.
     _TF_CT_HOST_RE = re.compile(r'proxmox_virtual_environment_container\.ct\["([^"]+)"\]')
 
     async def _watch_detached_runner(self, container_name: str, task_name: str, job_id: int, *,
                                      kind: str | None = None, tolerate_already_running: bool = False,
-                                     tf_host: str | None = None):
+                                     tf_host: str | None = None, skip_lines: int = 0):
         """Follow a runner container to its end and return ``(success, stats)``.
 
         Success is the container's exit code, cross-checked with Ansible's recap —
         never a phrase somewhere in the output (audit OS-14, see runner_output).
         ``kind`` is ``ansible`` or ``terraform`` (derived from the container name
         when a recovery path does not know it); ``tolerate_already_running`` is
-        set only by a Terraform run that really applies.
+        set only by a Terraform run that really applies. ``skip_lines``: output
+        lines that are already in the job log (re-attach after a restart) — they
+        are parsed for the verdict but not stored again.
         """
         if kind is None:
             kind = "terraform" if container_name.startswith("iac-tf-") else "ansible"
@@ -2797,9 +2789,12 @@ class DeploymentEngine:
                 if not line: break
                 decoded = line.decode('utf-8', errors='replace').rstrip()
                 if decoded:
+                    parser.feed(decoded)
+                    if skip_lines > 0:
+                        skip_lines -= 1      # stored before the restart — not again
+                        continue
                     # 1. WRITE TO DISK + DATABASE (file for the host, DB for every instance)
                     self._log_line(job_id, f"[{task_name}] {decoded}")
-                    parser.feed(decoded)
 
                     # 2. MICRO-PROGRESS SNIFFER
                     if "TASK [" in decoded:
@@ -2830,14 +2825,14 @@ class DeploymentEngine:
                 msg = (f"[ERROR] could not read the runner exit code ({wait_err}); "
                        "the output above may be incomplete.")
                 log.error("[Runner] %s: %s", task_name, msg)
-                self._log_line(job_id, f"[{task_name}] {msg}")
+                self._log_line(job_id, f"[SYSTEM] [{task_name}] {msg}")
             success, note = parser.verdict(exit_code)
             if note:
                 level = "WARNING" if success else "ERROR"
                 log.warning("[Runner] %s: %s", task_name, note)
-                self._log_line(job_id, f"[{task_name}] [{level}] {note}.")
+                self._log_line(job_id, f"[SYSTEM] [{task_name}] [{level}] {note}.")
             if not success and exit_code is not None:
-                self._log_line(job_id, f"[{task_name}] [ERROR] runner container exited with code {exit_code}.")
+                self._log_line(job_id, f"[SYSTEM] [{task_name}] [ERROR] runner container exited with code {exit_code}.")
 
             if "active_tasks" in self.state and task_name in self.state["active_tasks"]:
                 self.state["active_tasks"][task_name]["status"] = "success" if success else "failed"
@@ -2847,7 +2842,7 @@ class DeploymentEngine:
 
         except Exception as exc:  # noqa: BLE001
             log.exception("[Runner] watching '%s' (%s) failed", task_name, container_name)
-            self._log_line(job_id, f"[{task_name}] [ERROR] lost track of runner container '{container_name}': {exc!r}")
+            self._log_line(job_id, f"[SYSTEM] [{task_name}] [ERROR] lost track of runner container '{container_name}': {exc!r}")
             if "active_tasks" in self.state and task_name in self.state["active_tasks"]:
                 self.state["active_tasks"][task_name]["status"] = "error"
                 self._sync_runners(job_id, force=True)
@@ -4015,6 +4010,8 @@ class DeploymentEngine:
         
         total_tasks = len(tasks)
         task_results = []
+        flat_total = sum(len(t.stages) for t in tasks)
+        flat_index = 0
         
         for task in tasks:
             task.start_time = time.time()
@@ -4024,7 +4021,9 @@ class DeploymentEngine:
                 for idx, stage in enumerate(task.stages):
                     # Update progress per stage within task
                     stage_pct = int(((task.task_num - 1 + idx / len(task.stages)) / total_tasks) * 50)
-                    self.db.update_progress(job_id, progress=stage_pct, current_step=f"[Task {task.task_num}/{total_tasks}] {stage.name}")
+                    self._mark_stage(job_id, flat_index, flat_total, stage, stage_pct,
+                                     f"[Task {task.task_num}/{total_tasks}] {stage.name}")
+                    flat_index += 1
                     
                     log.info(f"  → Stage: {stage.name}")
                     res = await stage.run(self, context)

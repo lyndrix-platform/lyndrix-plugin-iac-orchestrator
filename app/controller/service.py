@@ -247,6 +247,33 @@ class IaCService:
             await self.worker.stop()
             self.worker = None
 
+    async def shutdown(self, reason: str = "plugin reload", budget: float = 12.0) -> None:
+        """Clean stop for teardown (plugin reload/disable/upgrade) and for a
+        draining instance (audit OC-10). Never touches a container and never
+        writes a terminal status for a job whose containers still run:
+
+        1. stop the lease-held loops and stop CLAIMING;
+        2. cancel the job tasks and wait (bounded) — they detach: step
+           "Runner reloading — detached at stage i/n", row stays RUNNING, the
+           maintenance override stays;
+        3. flush the job-log writers and runner snapshots.
+
+        The next incarnation re-attaches to the containers by label and closes
+        each job from all of them (run_startup_reconciliation → recover_job).
+        """
+        if getattr(self, "_shutting_down", False):
+            return
+        self._shutting_down = True
+        deadline = time.monotonic() + max(1.0, budget)
+        self.engine.detaching = reason
+        self.stop_webhook_sync()
+        self.sweeper.stop()
+        worker, self.worker = self.worker, None
+        if worker is not None:
+            await worker.shutdown(max(0.5, deadline - time.monotonic() - 2.0))
+        await self.engine.flush_for_shutdown(max(0.5, deadline - time.monotonic()))
+        log.info(f"IaC Orchestrator: runner stopped cleanly ({reason}).")
+
     async def run_claimed(self, payload: dict, job_id: int):
         """Execute a job this instance's worker claimed.
 
@@ -441,6 +468,9 @@ class IaCService:
         for job_id in ids:
             owned = self.worker.owns(job_id) if self.worker else False
             if owned:
+                # Only an operator's abort makes a cancellation terminal (ABORTED);
+                # every other cancellation detaches the job (engine, OC-10).
+                self.engine.request_abort(job_id)
                 await self.worker.cancel(job_id)
             if owned or any(
                 isinstance(t, dict) and t.get("job_id") == job_id
@@ -525,7 +555,13 @@ class IaCService:
         another runner's jobs are alive, and a job the current worker claimed is
         executing (audit OC-04). Each row is adopted first (new claim token,
         conditional on the old one), so everything written afterwards is fenced
-        and a row somebody else closed meanwhile is skipped. Nothing is resumed.
+        and a row somebody else closed meanwhile is skipped.
+
+        A job with containers on this host (Ansible or Terraform, found by label)
+        is handed to ``engine.recover_job``, which follows ALL of them and then
+        closes the job; a job without any is closed as FAILED now. Nothing is
+        resumed. Containers of jobs that were closed elsewhere while this runner
+        was away (orphan sweep, abort) are stopped — their job must not go on.
         """
         if not self.is_runner:
             return
@@ -535,31 +571,30 @@ class IaCService:
         await self.ensure_runtime_paths()
         await asyncio.sleep(2)  # Give the DB a moment to wake up
         log.info("IaC Orchestrator: Checking for surviving Docker runners...")
+        containers: list[dict] = []
         try:
-            await asyncio.wait_for(self.engine.reconcile_orphaned_runners(), timeout=20)
+            containers = await asyncio.wait_for(self.engine._list_job_containers(), timeout=20)
         except asyncio.TimeoutError:
             log.warning("IaC Orchestrator: Runner reconciliation timed out after 20s, continuing startup.")
         except Exception as exc:
             log.error(f"IaC Orchestrator: Runner reconciliation failed: {exc}")
-        finally:
-            log.info("IaC Orchestrator: Startup reconciliation scan finished.")
+        by_job: dict[int, list[dict]] = {}
+        for container in containers:
+            by_job.setdefault(container["job_id"], []).append(container)
 
         for row in previous:
             job_id = row["id"]
+            mine = by_job.pop(job_id, [])
             token = await asyncio.to_thread(self.queue.adopt, job_id, me, self.incarnation, row["claim_token"])
             if token is None:
-                continue  # closed or taken over meanwhile — not ours to touch
+                by_job[job_id] = mine  # closed or taken over meanwhile — see the leftovers below
+                continue
             self.db.claims[job_id] = token
-            if job_id in self.engine.attended_job_ids():
-                continue  # containers re-attached: their watchers close the job
-            # The runner process died mid-job (restart / self-deploy). Its containers
-            # may have finished meanwhile — close the job from their exit codes
-            # before giving up on it.
-            try:
-                if await self.engine.finalize_from_containers(job_id, reason="restarted"):
-                    continue
-            except Exception as exc:
-                log.debug(f"IaC Orchestrator: container recovery for job #{job_id} failed: {exc}")
+            if mine:
+                log.info(f"IaC Orchestrator: job #{job_id} — re-attaching to {len(mine)} container(s).")
+                self.engine.register_recovered(job_id, mine)
+                self.ctx.create_task(self.engine.recover_job(job_id, mine), name=f"iac:recover:{job_id}")
+                continue
             log.warning(
                 f"IaC Orchestrator: Job #{job_id} is RUNNING but has no active runners. Marking as FAILED."
             )
@@ -571,6 +606,18 @@ class IaCService:
             self.db.claims.pop(job_id, None)
             self.engine.end_override_for(job_id)
             self.state["last_deployment"] = "FAILED"
+
+        # Containers whose job is no longer RUNNING: the job was closed while this
+        # runner was away (rD §3.4) — stop them instead of letting them finish.
+        for job_id in by_job:
+            try:
+                status = await asyncio.to_thread(self.queue.job_status, job_id)
+            except Exception:
+                continue
+            if status != "RUNNING":
+                log.warning(f"IaC Orchestrator: job #{job_id} is {status or 'gone'} but has containers here — stopping them.")
+                await self.engine.stop_job_containers(job_id)
+        log.info("IaC Orchestrator: Startup reconciliation scan finished.")
 
     async def emit_monitoring_inventory_sync(self):
         """Delegate to the engine."""

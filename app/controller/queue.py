@@ -232,6 +232,8 @@ class JobQueue:
                 "owner_incarnation": "VARCHAR(64) NULL",
                 # heartbeat on the DATABASE clock in UTC (orphan sweep, audit OC-09/OC-18)
                 "heartbeat_utc": "DATETIME NULL",
+                # stage progress for restart recovery
+                "exec_state": "LONGTEXT NULL",
                 # maintenance windows (plugin 1.6)
                 "not_before": "DATETIME NULL",
                 "window_ci_ids": "LONGTEXT NULL",
@@ -1228,6 +1230,23 @@ class JobQueue:
         finally:
             session.close()
 
+    def count_task_lines(self, job_id: int, task_name: str) -> int:
+        """How many output lines of runner task ``task_name`` the job log already
+        holds (lines stored as ``[<task>] …``; the engine's own remarks about a
+        task are stored as ``[SYSTEM] [<task>] …`` and do not count). A watcher
+        that re-attaches to the container skips exactly that many lines."""
+        prefix = f"[{task_name}] "
+        session = self._session()
+        if not session:
+            return 0
+        try:
+            return int(session.execute(
+                select(sa_fn.count(IaCJobLog.id))
+                .where(IaCJobLog.job_id == job_id, sa_fn.substr(IaCJobLog.line, 1, len(prefix)) == prefix)
+            ).scalar() or 0)
+        finally:
+            session.close()
+
     def has_log(self, job_id: int) -> bool:
         session = self._session()
         if not session:
@@ -1419,6 +1438,22 @@ class JobWorker:
         for t in (self._tick_task, self._hb_task):
             if t:
                 t.cancel()
+
+    async def shutdown(self, budget: float = 10.0) -> None:
+        """Clean stop for a plugin reload / draining instance (audit OC-10): stop
+        claiming, cancel the job tasks and wait — bounded — until they let go
+        (they detach: no terminal status, containers untouched), heartbeat last."""
+        self._stopped = True
+        self._wake.set()
+        if self._tick_task:
+            self._tick_task.cancel()
+        pending = [t for t in self.tasks.values() if not t.done()]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.wait(pending, timeout=max(0.1, budget))
+        if self._hb_task:
+            self._hb_task.cancel()
 
     def wake(self, *_args) -> None:
         self._wake.set()

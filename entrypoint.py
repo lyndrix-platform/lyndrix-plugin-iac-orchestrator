@@ -115,7 +115,9 @@ manifest = ModuleManifest(
         "subscribe": ["vault:ready_for_data", "iac:webhook_verified", "git:status_update", "db:connected", "socket:response",
                       "entity_registry:identified", "iac:job_queued", "iac:job_abort_requested",
                       # core API >= 1.14 (local event); never fires on older cores
-                      "cluster:instance_lost"],
+                      "cluster:instance_lost",
+                      # this instance got SIGTERM: detach running jobs cleanly
+                      "system:draining"],
         "emit": ["iac:pipeline_started", "iac:webhook_verified", "iac:inventory_updated",
                  "entity_registry:identify", "entity_registry:relate", "server_manager:register_server",
                  "git:sync", "git:commit_push",
@@ -371,6 +373,18 @@ def setup(ctx):
     except Exception as exc:            # topic unknown to an older core
         ctx.log.debug(f"IaC Orchestrator: cluster:instance_lost not subscribed: {exc}")
 
+    # SIGTERM gives plugins no teardown: detach running jobs when the instance
+    # starts draining (flush logs, mark the step, leave the containers alone).
+    try:
+        @ctx.subscribe("system:draining")
+        async def _on_draining(payload):
+            if (payload or {}).get("_origin"):
+                return  # a peer is draining, not this instance
+            if _service is not None:
+                await _service.shutdown(reason="instance draining", budget=8)
+    except Exception as exc:
+        ctx.log.debug(f"IaC Orchestrator: system:draining not subscribed: {exc}")
+
     # Cluster: tell the operator when no runner is online (jobs would only queue)
     # and keep the sweep lease on the right kind of instance.
     ctx.create_task(_service.watch_runner_presence(), name="iac:runner_watch")
@@ -382,13 +396,15 @@ def setup(ctx):
         await render_dashboard(ctx, _service)
 
 
-def teardown(ctx):
+async def teardown(ctx):
+    """Plugin reload / disable / upgrade. Async on purpose: the core (>= 1.12)
+    awaits it (bounded, 15 s) before it cancels the plugin's tasks and releases
+    its leases; older cores run it as a task next to dispose(). Either way a job
+    in flight is DETACHED, never closed — see IaCService.shutdown."""
     global _service
     svc, _service = _service, None
     if svc is not None:
         try:
-            svc.stop_webhook_sync()
-            svc.sweeper.stop()
-            ctx.create_task(svc.stop_runner(), name="iac:worker_stop")
-        except Exception:
-            pass
+            await svc.shutdown(reason="plugin reload", budget=12)
+        except Exception as exc:
+            ctx.log.warning(f"IaC Orchestrator: teardown incomplete: {exc}")
