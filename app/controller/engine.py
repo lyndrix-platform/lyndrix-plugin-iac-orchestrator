@@ -1684,7 +1684,7 @@ class DeploymentEngine:
         (the id is taken atomically from the row). Called on every terminal path:
         pipeline end, abort, orphan sweep, container recovery. Sync and thread-safe
         (``ctx.emit`` hops onto the loop since core 1.7)."""
-        if self.queue is None or job_id in (None, -1, 0):
+        if getattr(self, "queue", None) is None or job_id in (None, -1, 0):
             return False
         try:
             override_id = self.queue.clear_override(int(job_id))
@@ -2074,8 +2074,10 @@ class DeploymentEngine:
             # (row already updated, claim released). No terminal status, no override.
             parked = True
             log.info(f"[SYSTEM] Deployment scheduled for {mw.iso(parked_exc.not_before)} ({parked_exc.reason})")
+            # The row is SCHEDULED now and its claim released — this describes a
+            # row we gave up on purpose, hence the one unfenced progress write.
             self.db.update_progress(current_job_id, progress=0,
-                                    current_step=f"Scheduled for {mw.iso(parked_exc.not_before)}")
+                                    current_step=f"Scheduled for {mw.iso(parked_exc.not_before)}", fenced=False)
             self.ctx.notify(
                 "deployment_started",
                 payload={
@@ -2145,7 +2147,12 @@ class DeploymentEngine:
                 # Per-job result (never the shared last_deployment: concurrent pipelines
                 # used to overwrite each other's final status through it). A parked job
                 # is already SCHEDULED — writing a terminal status would un-park it.
-                self.db.update_job(job_id=current_job_id, status=final_status)
+                if not self.db.update_job(job_id=current_job_id, status=final_status):
+                    # Conditional write (fencing): the row was closed or taken
+                    # over elsewhere — the orphan sweep, an abort on another
+                    # instance, a newer incarnation. Its state stands.
+                    log.warning(f"[SYSTEM] Job #{current_job_id}: result {final_status} NOT written — "
+                                "the job was already closed or taken over elsewhere.")
                 self.end_override_for(current_job_id)
             self._sync_runners(current_job_id, force=True)
             await self._close_log_writer(current_job_id)
@@ -2407,6 +2414,7 @@ class DeploymentEngine:
                                 current_step=(interrupted[:250] if interrupted else
                                               "Recovered after runner restart" + ("" if success else " (failed)")))
         self.db.update_job(job_id, final)
+        self.db.claims.pop(job_id, None)
         self.end_override_for(job_id)
         await self._close_log_writer(job_id)
         self._notify(f"Pipeline #{job_id}", f"Recovered after runner restart: {final}.",
@@ -2414,9 +2422,20 @@ class DeploymentEngine:
         log.info(f"RECOVERY: job #{job_id} closed as {final} from {len(rows)} finished container(s).")
         return True
 
-    async def abort_job(self, job_id: int, *, reason: str = "Aborted by User") -> int:
-        """Kill this host's runner containers of ``job_id`` and close its row as ABORTED.
-        Returns the number of containers removed."""
+    #: ``active_tasks`` statuses that mean "a container of this task may be running".
+    _LIVE_TASK_STATUSES = ("pulling_image", "running_ansible", "running_terraform")
+
+    def attended_job_ids(self) -> set[int]:
+        """Jobs this process still watches containers for (incl. re-attached ones
+        that are not worker tasks) — they are heartbeated like running job tasks."""
+        return {
+            int(data["job_id"]) for data in (self.state.get("active_tasks") or {}).values()
+            if isinstance(data, dict) and data.get("job_id") and data.get("status") in self._LIVE_TASK_STATUSES
+        }
+
+    async def stop_job_containers(self, job_id: int) -> int:
+        """Remove this host's runner containers of ``job_id`` (by label). No status
+        write — callers decide what the job's row becomes. Returns the count."""
         killed = 0
         if shutil.which("docker"):
             try:
@@ -2434,10 +2453,17 @@ class DeploymentEngine:
                     await rm.wait()
                     killed = len(ids)
             except Exception as exc:
-                log.debug(f"abort_job: container cleanup failed: {exc}")
+                log.debug(f"stop_job_containers: container cleanup failed: {exc}")
         for data in list((self.state.get("active_tasks") or {}).values()):
             if isinstance(data, dict) and data.get("job_id") == job_id:
                 data["status"] = "aborted"
+        return killed
+
+    async def abort_job(self, job_id: int, *, reason: str = "Aborted by User") -> int:
+        """Kill this host's runner containers of ``job_id`` and close its row as ABORTED
+        (a no-op when the row is no longer RUNNING/ours). Returns the number of
+        containers removed."""
+        killed = await self.stop_job_containers(job_id)
         self._sync_runners(job_id, force=True)
         self.db.update_progress(job_id, progress=None, current_step=reason)
         self.db.update_job(job_id, "ABORTED")
@@ -2687,11 +2713,14 @@ class DeploymentEngine:
         success, _ = await self._watch_detached_runner(c_name, task_name, job_id)
 
         if job_id != 0:
-            # The row may already have been closed as FAILED by an orphan sweep while
-            # this container was still running — a successful container wins then.
-            job = next((j for j in self.db.get_jobs_by_status("RUNNING") if j.id == job_id), None)
-            if job is None and success:
-                job = next((j for j in self.db.get_jobs_by_status("FAILED") if j.id == job_id), None)
+            # A row that is no longer RUNNING was closed elsewhere (orphan sweep,
+            # abort): its state stands. The container's result is in the job log;
+            # a late success never rewrites FAILED into SUCCESS any more.
+            running = await asyncio.to_thread(self.db.get_jobs_by_status, "RUNNING")
+            job = next((j for j in running if j.id == job_id), None)
+            if job is None:
+                log.warning(f"RECOVERY: container '{c_name}' of job #{job_id} finished "
+                            f"({'ok' if success else 'failed'}), but the job was closed elsewhere — status unchanged.")
             if job:
                 interrupted = await self.interrupted_reason(job_id)
                 if interrupted:
@@ -2703,8 +2732,10 @@ class DeploymentEngine:
                                         current_step=(interrupted[:250] if interrupted else
                                                       ("Reconciled & Completed" if success else "Reconciled & Failed")))
                 self.db.update_job(job_id, final_status)
+                self.end_override_for(job_id)
                 self._notify_clear(f"job_{job_id}")
                 self._notify(f"Pipeline #{job_id}", "Recovered job finished.", "positive" if success else "negative")
+            getattr(self.db, "claims", {}).pop(job_id, None)
                 
         self.state["running_jobs"] = max(0, self.state.get("running_jobs", 0) - 1)
         self.state["is_running"] = self.state["running_jobs"] > 0

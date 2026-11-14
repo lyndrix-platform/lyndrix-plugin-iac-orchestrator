@@ -1415,8 +1415,10 @@ async def do_abort():
             local = any(isinstance(t, dict) and t.get("job_id") == job_id
                         for t in (state.get("active_tasks") or {}).values())
             if local or not owner or (alive is not None and owner not in alive):
-                _engine.db.update_job(job_id, "ABORTED")
-                _engine.db.update_progress(job_id, progress=None, current_step="Aborted by User")
+                # Conditional on the row still being RUNNING: a job its owner
+                # finished meanwhile keeps its result.
+                if _engine.db.update_job(job_id, "ABORTED"):
+                    _engine.db.update_progress(job_id, progress=None, current_step="Aborted by User")
                 _engine.end_override_for(job_id)  # maintenance override of a dead runner's job
         aborted.extend(running_ids)
 

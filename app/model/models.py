@@ -34,6 +34,11 @@ class IaCJob(Base):
     claimed_at = Column(DateTime(timezone=True), nullable=True)
     heartbeat_at = Column(DateTime(timezone=True), nullable=True)
     runners = Column(LONGTEXT, nullable=True)            # live runner/task snapshot (JSON) for every instance's UI
+    # Fencing (audit OC-03/OC-04/OC-09): every claim gets a fresh token; the claimant's
+    # writes are conditional on it, so a runner that was declared lost (or a previous
+    # incarnation of the same instance id) can never overwrite what happened since.
+    claim_token = Column(String(64), nullable=True)
+    owner_incarnation = Column(String(64), nullable=True)  # "<core boot nonce>:<plugin load nonce>" of the claimant
 
     # --- MAINTENANCE WINDOWS (plugin 1.6): a deploy parked for its window ---
     # Status SCHEDULED: the runner evaluated the service's deploy_policy and parked the job

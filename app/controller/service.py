@@ -6,6 +6,7 @@ entrypoint.py and the UI/API layers only ever deal with this object.
 """
 import asyncio
 import logging
+import uuid
 from core.api import db_instance
 
 from ..model.models import Base
@@ -42,6 +43,14 @@ class IaCService:
         self.socket_client = SocketBusClient(ctx)
         self.db = JobDatabase()
         self.queue = JobQueue()
+        # One claim registry for both stores: the runner-side writes of a claimed
+        # job are conditional on its claim token (fencing).
+        self.queue.claims = self.db.claims
+        # Identity of THIS plugin load: "<core boot nonce>:<nonce>". Claims are
+        # stamped with it, so a restarted runner (same instance id) can tell the
+        # jobs it claimed itself from what its predecessor left behind.
+        core_nonce = getattr(ctx, "incarnation", "")
+        self.incarnation = f"{core_nonce if isinstance(core_nonce, str) else ''}:{uuid.uuid4().hex[:12]}"
         self.engine = DeploymentEngine(ctx, self.state, self.db, self.config, self.socket_client)
         self.engine.queue = self.queue
         # The engine's own hand-offs (host rollout after a provision) enter the
@@ -107,19 +116,42 @@ class IaCService:
                 self.worker.wake()
         return job_id
 
-    def start_runner(self) -> None:
+    def start_runner(self, max_parallel: int | None = None) -> None:
         """Start the job worker (runner instances only)."""
         if self.worker is not None or not self.is_runner:
             return
-        try:
-            max_parallel = int(str(self.ctx.get_secret("iac_max_parallel_jobs") or "3").strip() or "3")
-        except (ValueError, Exception):
-            max_parallel = 3
+        if max_parallel is None:
+            try:
+                max_parallel = int(str(self.ctx.get_secret("iac_max_parallel_jobs") or "3").strip() or "3")
+            except (ValueError, Exception):
+                max_parallel = 3
         self.worker = JobWorker(self.ctx, self.queue, self.run_claimed, max_parallel=max_parallel,
-                                finalize_orphan=self._finalize_orphan)
+                                finalize_orphan=self._finalize_orphan, incarnation=self.incarnation,
+                                on_fenced=self._on_fenced, extra_attended=self.engine.attended_job_ids)
         self.worker.start()
         log.info(f"IaC Orchestrator: job worker started on '{getattr(self.ctx, 'instance_id', 'local')}' "
                  f"(max {max_parallel} parallel).")
+
+    async def run_runner_boot(self) -> None:
+        """Runner start-up in a fixed order (audit OC-04): first settle what a
+        previous incarnation left behind, then start claiming. The worker used to
+        start first — and the reconciliation then FAILED the jobs it had just
+        claimed. The worker starts in any case, also when reconciling raised."""
+        try:
+            await self.run_startup_reconciliation()
+        except Exception as exc:
+            log.error(f"IaC Orchestrator: startup reconciliation failed: {exc}")
+        try:
+            raw = await asyncio.to_thread(self.ctx.get_secret, "iac_max_parallel_jobs")
+            max_parallel = int(str(raw or "3").strip() or "3")
+        except Exception:
+            max_parallel = 3
+        self.start_runner(max_parallel)
+
+    async def _on_fenced(self, job_id: int) -> None:
+        """A job this runner executes was closed or taken over elsewhere: stop its
+        containers here. No status write — the row is not ours any more."""
+        await self.engine.stop_job_containers(job_id)
 
     async def stop_runner(self) -> None:
         if self.worker is not None:
@@ -398,14 +430,20 @@ class IaCService:
         await self.engine.run_pipeline(payload)
 
     async def run_startup_reconciliation(self):
-        """Reconcile orphaned runners and resume interrupted jobs after a restart.
+        """Settle the RUNNING jobs a previous incarnation of this runner left behind.
 
-        Runner instances only, and only for jobs THIS instance owned (plus legacy
-        rows without an owner): in a cluster another runner's RUNNING jobs are
-        alive and must not be touched — the orphan sweep handles dead owners.
+        Runner instances only, and only rows this instance id owned (plus legacy
+        rows without an owner) that were NOT claimed by the current incarnation:
+        another runner's jobs are alive, and a job the current worker claimed is
+        executing (audit OC-04). Each row is adopted first (new claim token,
+        conditional on the old one), so everything written afterwards is fenced
+        and a row somebody else closed meanwhile is skipped. Nothing is resumed.
         """
         if not self.is_runner:
             return
+        me = getattr(self.ctx, "instance_id", None)
+        # Listed before anything else happens in this process.
+        previous = await asyncio.to_thread(self.queue.previous_incarnation_jobs, me, self.incarnation)
         await self.ensure_runtime_paths()
         await asyncio.sleep(2)  # Give the DB a moment to wake up
         log.info("IaC Orchestrator: Checking for surviving Docker runners...")
@@ -418,37 +456,33 @@ class IaCService:
         finally:
             log.info("IaC Orchestrator: Startup reconciliation scan finished.")
 
-        # Resume any pending tasks in the database queue — own jobs + ownerless legacy rows.
-        me = getattr(self.ctx, "instance_id", None)
-        interrupted_jobs = [
-            j for j in self.db.get_jobs_by_status("RUNNING")
-            if getattr(j, "owner_instance", None) in (None, "", me)
-        ]
-        for job in interrupted_jobs:
-            # Nothing is resumed (audit OC-07): a job whose containers are still
-            # running is closed by the re-attached watchers, everything else here.
-            if not any(
-                t.get("job_id") == job.id
-                for t in self.engine.state.get("active_tasks", {}).values()
-            ):
-                # The runner process died mid-job (restart / self-deploy). Its containers
-                # may have finished meanwhile — close the job from their exit codes
-                # before giving up on it.
-                try:
-                    if await self.engine.finalize_from_containers(job.id, reason="restarted"):
-                        continue
-                except Exception as exc:
-                    log.debug(f"IaC Orchestrator: container recovery for job #{job.id} failed: {exc}")
-                log.warning(
-                    f"IaC Orchestrator: Job #{job.id} is RUNNING but has no active runners. Marking as FAILED."
-                )
-                reason = await self.engine.interrupted_reason(job.id) or "System Restart (Aborted)"
-                self.engine._log_line(job.id, f"[SYSTEM] {reason}.")
-                await self.engine._close_log_writer(job.id)
-                self.db.update_job(job.id, "FAILED")
-                self.db.update_progress(job.id, progress=None, current_step=reason[:250])
-                self.engine.end_override_for(job.id)
-                self.state["last_deployment"] = "FAILED"
+        for row in previous:
+            job_id = row["id"]
+            token = await asyncio.to_thread(self.queue.adopt, job_id, me, self.incarnation, row["claim_token"])
+            if token is None:
+                continue  # closed or taken over meanwhile — not ours to touch
+            self.db.claims[job_id] = token
+            if job_id in self.engine.attended_job_ids():
+                continue  # containers re-attached: their watchers close the job
+            # The runner process died mid-job (restart / self-deploy). Its containers
+            # may have finished meanwhile — close the job from their exit codes
+            # before giving up on it.
+            try:
+                if await self.engine.finalize_from_containers(job_id, reason="restarted"):
+                    continue
+            except Exception as exc:
+                log.debug(f"IaC Orchestrator: container recovery for job #{job_id} failed: {exc}")
+            log.warning(
+                f"IaC Orchestrator: Job #{job_id} is RUNNING but has no active runners. Marking as FAILED."
+            )
+            reason = await self.engine.interrupted_reason(job_id) or "System Restart (Aborted)"
+            self.engine._log_line(job_id, f"[SYSTEM] {reason}.")
+            await self.engine._close_log_writer(job_id)
+            await asyncio.to_thread(self.db.update_progress, job_id, None, reason[:250])
+            await asyncio.to_thread(self.db.update_job, job_id, "FAILED")
+            self.db.claims.pop(job_id, None)
+            self.engine.end_override_for(job_id)
+            self.state["last_deployment"] = "FAILED"
 
     async def emit_monitoring_inventory_sync(self):
         """Delegate to the engine."""

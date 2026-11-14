@@ -17,6 +17,7 @@ import asyncio
 import json
 import logging
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Callable
@@ -165,6 +166,16 @@ class JobQueue:
     #: maintenance override. Set by the service; may run in a worker thread.
     on_terminal: Callable[[int], None] | None = None
 
+    def __init__(self):
+        # job id -> claim token of the jobs THIS process executes. The service
+        # shares one dict between the queue and the JobDatabase; while a token is
+        # registered, the runner-side writes for that job are conditional on it.
+        self.claims: dict[int, str] = {}
+
+    def _token_cond(self, job_id: int) -> list:
+        token = self.claims.get(job_id)
+        return [IaCJob.claim_token == token] if token else []
+
     def _session(self):
         # READ COMMITTED: several writers (progress, heartbeat, runner snapshot, claim)
         # touch one job row concurrently — see database.read_committed_session.
@@ -197,6 +208,9 @@ class JobQueue:
                 "claimed_at": "DATETIME NULL",
                 "heartbeat_at": "DATETIME NULL",
                 "runners": "LONGTEXT NULL",
+                # fencing (claim token + claimant incarnation)
+                "claim_token": "VARCHAR(64) NULL",
+                "owner_incarnation": "VARCHAR(64) NULL",
                 # maintenance windows (plugin 1.6)
                 "not_before": "DATETIME NULL",
                 "window_ci_ids": "LONGTEXT NULL",
@@ -319,7 +333,7 @@ class JobQueue:
             session.close()
 
     # ------------------------------------------------------------------- claim
-    def claim_next(self, instance_id: str) -> tuple[int, dict] | None:
+    def claim_next(self, instance_id: str, incarnation: str | None = None) -> "Claim | None":
         """Atomically move the oldest QUEUED job — or a SCHEDULED job whose
         ``not_before`` is reached — to RUNNING owned by ``instance_id``.
 
@@ -328,15 +342,23 @@ class JobQueue:
         Due SCHEDULED jobs come first (``not_before`` ascending), then QUEUED by id.
         ``not_before`` stays on the claimed row so the policy stage knows the job
         is due and does not park it again.
+
+        A claim is either returned to the caller or not made (audit OC-03): the
+        payload is read *with* the candidate, so nothing has to be read after the
+        COMMIT, and when the COMMIT itself fails on the client (lost ack, 2013
+        after the server applied it) a fresh session checks the claim token — a
+        row that carries it is ours and is returned, never left behind as
+        "Claimed by …" with nobody executing it.
         """
         for _ in range(5):
             session = self._session()
             if not session:
                 return None
+            job_id, payload, token, update_sent = None, {}, uuid.uuid4().hex, False
             try:
                 now = datetime.now()
                 cand = session.execute(
-                    select(IaCJob.id)
+                    select(IaCJob.id, IaCJob.payload)
                     .where(
                         (IaCJob.status == STATUS_QUEUED)
                         | ((IaCJob.status == STATUS_SCHEDULED) & (IaCJob.not_before <= now))
@@ -349,23 +371,31 @@ class JobQueue:
                 if not cand:
                     return None
                 job_id = int(cand[0])
+                try:
+                    payload = json.loads(cand[1]) if cand[1] else {}
+                except Exception:
+                    payload = {}
+                update_sent = True
                 res = session.execute(
                     update(IaCJob)
                     .where(IaCJob.id == job_id, IaCJob.status.in_((STATUS_QUEUED, STATUS_SCHEDULED)))
-                    .values(status=STATUS_RUNNING, owner_instance=instance_id, claimed_at=now,
-                            heartbeat_at=now, current_step=f"Claimed by {instance_id}")
+                    .values(status=STATUS_RUNNING, owner_instance=instance_id, owner_incarnation=incarnation,
+                            claim_token=token, claimed_at=now, heartbeat_at=now,
+                            current_step=f"Claimed by {instance_id}")
                 )
                 session.commit()
                 if res.rowcount != 1:
                     continue  # a peer won this row — try the next one
-                raw = session.execute(select(IaCJob.payload).where(IaCJob.id == job_id)).scalar()
-                try:
-                    payload = json.loads(raw) if raw else {}
-                except Exception:
-                    payload = {}
-                return job_id, payload
+                return Claim(job_id, payload, token)
             except Exception as exc:
-                session.rollback()
+                try:
+                    session.rollback()
+                except Exception:
+                    pass
+                if update_sent and job_id is not None and self._claim_is_mine(job_id, token):
+                    log.warning("QUEUE: claim of job #%s was committed although the client saw '%s' — keeping it.",
+                                job_id, exc)
+                    return Claim(job_id, payload, token)
                 if _is_retryable(exc):
                     time.sleep(0.1)
                     continue
@@ -374,6 +404,128 @@ class JobQueue:
             finally:
                 session.close()
         return None
+
+    def _claim_is_mine(self, job_id: int, token: str) -> bool:
+        """Does the row carry ``token`` (fresh session)? Retries briefly: the
+        connection that just failed may need a moment (VIP move, pool recycle)."""
+        for attempt in range(3):
+            session = None
+            try:
+                session = self._session()
+                if not session:
+                    return False
+                row = session.execute(
+                    select(IaCJob.status, IaCJob.claim_token).where(IaCJob.id == job_id)
+                ).first()
+                return bool(row) and row[0] == STATUS_RUNNING and row[1] == token
+            except Exception as exc:
+                log.debug("QUEUE: claim re-check for #%s failed (%s), attempt %s", job_id, exc, attempt + 1)
+                time.sleep(0.2 * (attempt + 1))
+            finally:
+                if session is not None:
+                    session.close()
+        # Unknown: the worker's unattended-claim check (own_unattended) recovers
+        # the row if the UPDATE did land.
+        return False
+
+    def own_unattended(self, instance_id: str, incarnation: str | None, attended: set[int],
+                       older_than_seconds: float) -> list[dict]:
+        """RUNNING rows claimed by THIS incarnation that nothing here executes
+        (``attended`` = ids of running job tasks and re-attached jobs) and whose
+        claim is older than ``older_than_seconds``: ``[{id, claim_token, has_log}]``."""
+        if not incarnation:
+            return []
+        session = self._session()
+        if not session:
+            return []
+        try:
+            cutoff = datetime.now() - timedelta(seconds=older_than_seconds)
+            rows = session.execute(
+                select(IaCJob.id, IaCJob.claim_token, IaCJob.claimed_at)
+                .where(IaCJob.status == STATUS_RUNNING, IaCJob.owner_instance == instance_id,
+                       IaCJob.owner_incarnation == incarnation)
+            ).all()
+            out = []
+            for job_id, token, claimed_at in rows:
+                if int(job_id) in attended:
+                    continue
+                if claimed_at is not None and claimed_at.replace(tzinfo=None) > cutoff:
+                    continue
+                has_log = session.execute(
+                    select(IaCJobLog.id).where(IaCJobLog.job_id == job_id).limit(1)).first() is not None
+                out.append({"id": int(job_id), "claim_token": token, "has_log": has_log})
+            return out
+        finally:
+            session.close()
+
+    def release(self, job_id: int, token: str | None, step: str) -> bool:
+        """RUNNING → QUEUED for a claim that never started executing (conditional
+        on the claim token): the job runs later instead of being lost."""
+        session = self._session()
+        if not session:
+            return False
+        try:
+            cond = [IaCJob.id == job_id, IaCJob.status == STATUS_RUNNING]
+            cond.append(IaCJob.claim_token == token if token else IaCJob.claim_token.is_(None))
+            res = session.execute(
+                update(IaCJob).where(*cond).values(
+                    status=STATUS_QUEUED, owner_instance=None, owner_incarnation=None, claim_token=None,
+                    claimed_at=None, heartbeat_at=None, progress=0, current_step=str(step)[:250])
+            )
+            session.commit()
+            return res.rowcount == 1
+        except Exception as exc:
+            session.rollback()
+            log.error("QUEUE: release of job #%s failed: %s", job_id, exc)
+            return False
+        finally:
+            session.close()
+
+    def previous_incarnation_jobs(self, instance_id: str | None, incarnation: str | None) -> list[dict]:
+        """RUNNING rows this instance id owns (or legacy rows without an owner)
+        that were NOT claimed by the current incarnation — what a restarted
+        runner has to reconcile. Never a job the current worker claimed."""
+        session = self._session()
+        if not session:
+            return []
+        try:
+            rows = session.execute(
+                select(IaCJob.id, IaCJob.owner_instance, IaCJob.owner_incarnation, IaCJob.claim_token)
+                .where(IaCJob.status == STATUS_RUNNING)
+            ).all()
+            return [
+                {"id": int(job_id), "claim_token": token, "owner_incarnation": inc}
+                for job_id, owner, inc, token in rows
+                if owner in (None, "", instance_id) and (not inc or inc != incarnation)
+            ]
+        finally:
+            session.close()
+
+    def adopt(self, job_id: int, instance_id: str | None, incarnation: str | None,
+              old_token: str | None) -> str | None:
+        """Take over a RUNNING row of a previous incarnation: new claim token and
+        incarnation, conditional on the token the row had when it was listed.
+        Returns the new token, ``None`` when the row changed meanwhile."""
+        token = uuid.uuid4().hex
+        session = self._session()
+        if not session:
+            return None
+        try:
+            now = datetime.now()
+            cond = [IaCJob.id == job_id, IaCJob.status == STATUS_RUNNING]
+            cond.append(IaCJob.claim_token == old_token if old_token else IaCJob.claim_token.is_(None))
+            res = session.execute(
+                update(IaCJob).where(*cond).values(
+                    owner_instance=instance_id, owner_incarnation=incarnation, claim_token=token, heartbeat_at=now)
+            )
+            session.commit()
+            return token if res.rowcount == 1 else None
+        except Exception as exc:
+            session.rollback()
+            log.error("QUEUE: adopt of job #%s failed: %s", job_id, exc)
+            return None
+        finally:
+            session.close()
 
     def queued_count(self) -> int:
         session = self._session()
@@ -402,7 +554,7 @@ class JobQueue:
             if not session:
                 return False
             try:
-                cond = [IaCJob.id == job_id, IaCJob.status == STATUS_RUNNING]
+                cond = [IaCJob.id == job_id, IaCJob.status == STATUS_RUNNING, *self._token_cond(job_id)]
                 if instance_id:
                     cond.append((IaCJob.owner_instance == instance_id) | (IaCJob.owner_instance.is_(None)))
                 res = session.execute(
@@ -410,7 +562,8 @@ class JobQueue:
                         status=STATUS_SCHEDULED, not_before=due,
                         window_ci_ids=json.dumps(list(window_ci_ids or [])),
                         schedule_reason=str(reason or "")[:250],
-                        owner_instance=None, claimed_at=None, heartbeat_at=None,
+                        owner_instance=None, owner_incarnation=None, claim_token=None,
+                        claimed_at=None, heartbeat_at=None,
                         progress=0, current_step="Scheduled",
                     )
                 )
@@ -562,7 +715,7 @@ class JobQueue:
                 return
             try:
                 session.execute(
-                    update(IaCJob).where(IaCJob.id == job_id)
+                    update(IaCJob).where(IaCJob.id == job_id, *self._token_cond(job_id))
                     .values(override_id=override_id, window_ci_ids=json.dumps(list(window_ci_ids or [])))
                 )
                 session.commit()
@@ -625,22 +778,33 @@ class JobQueue:
             session.close()
 
     # --------------------------------------------------------------- heartbeat
-    def heartbeat(self, instance_id: str, job_ids: list[int]) -> None:
+    def heartbeat(self, instance_id: str, job_ids: list[int]) -> list[int]:
+        """Refresh the heartbeat of the jobs this process executes. Returns the ids
+        whose row is no longer ours (closed by the orphan sweep or an abort,
+        adopted by someone else): the caller must stop working on them — its
+        writes for those jobs are no-ops anyway (fencing). ``[]`` on a database
+        error: unknown is not fenced."""
         if not job_ids:
-            return
+            return []
 
         def _tx():
             session = self._session()
             if not session:
-                return
+                return []
             try:
-                session.execute(
-                    update(IaCJob)
-                    .where(IaCJob.id.in_(job_ids), IaCJob.owner_instance == instance_id,
-                           IaCJob.status == STATUS_RUNNING)
-                    .values(heartbeat_at=datetime.now())
-                )
+                now = datetime.now()
+                fenced = []
+                for job_id in job_ids:
+                    res = session.execute(
+                        update(IaCJob)
+                        .where(IaCJob.id == job_id, IaCJob.owner_instance == instance_id,
+                               IaCJob.status == STATUS_RUNNING, *self._token_cond(job_id))
+                        .values(heartbeat_at=now)
+                    )
+                    if res.rowcount != 1:
+                        fenced.append(int(job_id))
                 session.commit()
+                return fenced
             except Exception:
                 session.rollback()
                 raise
@@ -648,9 +812,10 @@ class JobQueue:
                 session.close()
 
         try:
-            self._retry(_tx)
+            return list(self._retry(_tx) or [])
         except Exception as exc:
             log.debug("QUEUE: heartbeat failed: %s", exc)
+            return []
 
     def orphan_candidates(self, alive_instances: set[str] | None, stale_seconds: int = 180,
                           self_instance: str | None = None) -> list[dict]:
@@ -789,7 +954,8 @@ class JobQueue:
             if not session:
                 return
             try:
-                session.execute(update(IaCJob).where(IaCJob.id == job_id).values(runners=blob))
+                session.execute(update(IaCJob).where(IaCJob.id == job_id, *self._token_cond(job_id))
+                                .values(runners=blob))
                 session.commit()
             except Exception:
                 session.rollback()
@@ -958,6 +1124,15 @@ class JobQueue:
             session.close()
 
 
+class Claim(tuple):
+    """``(job_id, payload)`` of a claimed job plus its fencing ``token``."""
+
+    def __new__(cls, job_id: int, payload: dict, token: str):
+        obj = super().__new__(cls, (job_id, payload))
+        obj.token = token
+        return obj
+
+
 class _nullcontext:
     def __enter__(self):
         return None
@@ -1031,7 +1206,8 @@ class JobWorker:
     def __init__(self, ctx, queue: JobQueue, run_job, *, max_parallel: int = 3,
                  poll_seconds: float = 2.0, heartbeat_seconds: float = 10.0,
                  orphan_sweep_seconds: float = 60.0, stale_seconds: int = 180,
-                 first_sweep_delay: float = 90.0, finalize_orphan=None):
+                 first_sweep_delay: float = 90.0, finalize_orphan=None,
+                 incarnation: str | None = None, on_fenced=None, extra_attended=None):
         self.ctx = ctx
         self.queue = queue
         self.run_job = run_job
@@ -1047,6 +1223,16 @@ class JobWorker:
         # async (job_id, owner) -> bool: True when the job was finalized from a local
         # runner container (exit code), so it must NOT be marked "Runner lost".
         self.finalize_orphan = finalize_orphan
+        # Claims are stamped with this incarnation (one per plugin load): rows of
+        # an earlier incarnation are never mistaken for jobs this worker runs.
+        self.incarnation = incarnation
+        # async (job_id) -> None: stop whatever this host still runs for a job that
+        # was closed or taken over elsewhere (no status writes).
+        self.on_fenced = on_fenced
+        # () -> ids of jobs this process attends outside of ``tasks`` (re-attached).
+        self.extra_attended = extra_attended
+        self.fenced: set[int] = set()
+        self._last_unattended_check = time.monotonic()
         self.tasks: dict[int, asyncio.Task] = {}
         self._wake = asyncio.Event()
         self._stopped = False
@@ -1080,12 +1266,20 @@ class JobWorker:
             try:
                 self.tasks = {j: t for j, t in self.tasks.items() if not t.done()}
                 while len(self.tasks) < self.max_parallel:
-                    claimed = await asyncio.to_thread(self.queue.claim_next, self.ctx.instance_id)
+                    claimed = await asyncio.to_thread(self.queue.claim_next, self.ctx.instance_id, self.incarnation)
                     if not claimed:
                         break
                     job_id, payload = claimed
+                    # From here on the job is either executing (a task below) or
+                    # released again by _recover_unattended — never just "claimed".
+                    token = getattr(claimed, "token", None)
+                    if token:
+                        self.queue.claims[job_id] = token
                     self.ctx.log.info(f"WORKER: claimed job #{job_id} ({payload.get('pipeline_type')})")
                     self.tasks[job_id] = self.ctx.create_task(self._run(job_id, payload), name=f"iac:job:{job_id}")
+                if time.monotonic() - self._last_unattended_check >= 2 * self.heartbeat_seconds:
+                    self._last_unattended_check = time.monotonic()
+                    await self._recover_unattended()
                 if time.monotonic() - last_sweep >= self.orphan_sweep_seconds:
                     last_sweep = time.monotonic()
                     await self.sweep_orphans()
@@ -1104,16 +1298,71 @@ class JobWorker:
             raise
         except Exception as exc:
             self.ctx.log.error(f"WORKER: job #{job_id} crashed: {exc}")
+        finally:
+            self.queue.claims.pop(job_id, None)
+
+    def _attended(self) -> set[int]:
+        ids = set(self.running_ids)
+        if self.extra_attended is not None:
+            try:
+                ids |= {int(i) for i in self.extra_attended()}
+            except Exception as exc:
+                self.ctx.log.debug(f"WORKER: extra_attended failed: {exc}")
+        return ids
+
+    async def _recover_unattended(self) -> None:
+        """A row this incarnation claimed but nothing here executes (the claim's
+        result got lost between the database and this loop): give it back to the
+        queue when it never started, close it when it did (audit OC-03)."""
+        rows = await asyncio.to_thread(
+            self.queue.own_unattended, self.ctx.instance_id, self.incarnation,
+            self._attended(), 2 * self.heartbeat_seconds,
+        )
+        for row in rows:
+            job_id = row["id"]
+            if job_id in self._attended():
+                continue
+            if not row["has_log"]:
+                if await asyncio.to_thread(self.queue.release, job_id, row["claim_token"],
+                                           "Re-queued: the claim was lost before the job started"):
+                    self.ctx.log.warning(f"WORKER: job #{job_id} was claimed but never started — re-queued.")
+                    self.wake()
+            elif await asyncio.to_thread(
+                    self.queue.mark_failed, job_id, "Runner lost track of the job — re-trigger the pipeline"):
+                self.ctx.log.warning(f"WORKER: job #{job_id} is RUNNING without an executing task — closed as FAILED.")
 
     async def _heartbeat_loop(self) -> None:
         while not self._stopped:
             await asyncio.sleep(self.heartbeat_seconds)
-            ids = self.running_ids
-            if ids:
-                try:
-                    await asyncio.to_thread(self.queue.heartbeat, self.ctx.instance_id, ids)
-                except Exception as exc:
-                    self.ctx.log.debug(f"WORKER: heartbeat failed: {exc}")
+            ids = sorted(self._attended())
+            if not ids:
+                continue
+            try:
+                fenced = await asyncio.to_thread(self.queue.heartbeat, self.ctx.instance_id, ids)
+            except Exception as exc:
+                self.ctx.log.debug(f"WORKER: heartbeat failed: {exc}")
+                continue
+            still_attended = self._attended()
+            for job_id in fenced:
+                # A job that finished between collecting the ids and the UPDATE is
+                # simply done — only a job we are STILL working on was fenced.
+                if job_id in still_attended:
+                    await self._handle_fenced(job_id)
+
+    async def _handle_fenced(self, job_id: int) -> None:
+        """The row of a job we execute is no longer ours (the orphan sweep failed
+        it, an abort closed it, a newer incarnation adopted it): stop working on
+        it. Its writes are no-ops by the claim token; only the work has to end."""
+        if job_id in self.fenced:
+            return
+        self.fenced.add(job_id)
+        self.ctx.log.warning(f"WORKER: job #{job_id} was closed or taken over elsewhere — stopping it here.")
+        await self.cancel(job_id)
+        if self.on_fenced is not None:
+            try:
+                await self.on_fenced(job_id)
+            except Exception as exc:
+                self.ctx.log.warning(f"WORKER: stopping the containers of fenced job #{job_id} failed: {exc}")
 
     async def sweep_orphans(self) -> list[int]:
         """RUNNING jobs of dead/stale runners: finalize from a local container when

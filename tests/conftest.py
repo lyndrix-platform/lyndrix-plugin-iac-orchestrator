@@ -32,17 +32,24 @@ import pytest  # noqa: E402
 
 
 @pytest.fixture
-def sqlite_queue(monkeypatch):
-    """A :class:`JobQueue` on an in-memory SQLite engine patched into the core's
-    ``db_instance`` (shared by every module that imports it from ``core.api``)."""
+def sqlite_queue(monkeypatch, tmp_path):
+    """A :class:`JobQueue` on a SQLite FILE patched into the core's ``db_instance``
+    (shared by every module that imports it from ``core.api``).
+
+    A file, not ``sqlite://`` + StaticPool: the worker runs its queries in threads
+    (``asyncio.to_thread``) and an in-memory database shares ONE connection between
+    all of them — a session closing in one thread rolled back the uncommitted
+    statement of another. With a file every session has its own connection, like
+    in production.
+    """
     from sqlalchemy import create_engine
     from sqlalchemy.orm import sessionmaker
-    from sqlalchemy.pool import StaticPool
 
     from iac_plugin.app.controller import queue as queue_mod
     from iac_plugin.app.model.models import Base
 
-    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    engine = create_engine(f"sqlite:///{tmp_path / 'jobs.db'}",
+                           connect_args={"check_same_thread": False, "timeout": 30})
     Base.metadata.create_all(engine)
     monkeypatch.setattr(queue_mod.db_instance, "is_connected", True, raising=False)
     monkeypatch.setattr(queue_mod.db_instance, "SessionLocal", sessionmaker(bind=engine), raising=False)

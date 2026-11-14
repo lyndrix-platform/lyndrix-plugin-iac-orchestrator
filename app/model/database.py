@@ -3,7 +3,7 @@ import logging
 from datetime import datetime
 from core.api import db_instance
 from .models import IaCJob, IaCJobLog, IaCState, IaCJobTask
-from sqlalchemy import or_
+from sqlalchemy import or_, update
 
 log = logging.getLogger("IaC:Database")
 
@@ -79,6 +79,13 @@ def _delete_jobs(session, job_ids: list) -> int:
 
 
 class JobDatabase:
+    def __init__(self):
+        # job id -> claim token of the jobs THIS process executes (shared with the
+        # JobQueue by the service). While a token is registered, every write below
+        # for that job is conditional on it: a job closed or taken over by someone
+        # else meanwhile is never overwritten (fencing).
+        self.claims: dict[int, str] = {}
+
     def _get_session(self):
         """Safely retrieves a database session if the central engine is connected."""
         session = read_committed_session()
@@ -113,24 +120,35 @@ class JobDatabase:
             if session:
                 session.close()
 
-    # Changed signature to remove logs_list
-    def update_job(self, job_id: int, status: str):
-        """Saves the final status to the database."""
-        if job_id == -1:
-            return
+    def update_job(self, job_id: int, status: str) -> bool:
+        """RUNNING → ``status`` (the final status of a job). Returns True when this
+        call changed the row.
+
+        Conditional on the expected previous state: only a RUNNING row is closed,
+        and — when this process holds the job's claim — only while the claim token
+        still matches. A job the orphan sweep failed, an abort closed or a newer
+        incarnation adopted is left alone (the caller learns it through ``False``).
+        """
+        if job_id in (None, -1):
+            return False
+        token = self.claims.get(job_id)
 
         def _tx():
             session = self._get_session()
             if not session:
-                return
+                return False
             try:
-                job = session.query(IaCJob).filter(IaCJob.id == job_id).first()
-                if job:
-                    job.status = status
-                    if status in ["SUCCESS", "FAILED", "ERROR", "ABORTED"]: # Added ABORTED for the Kill Switch
-                        job.end_time = datetime.now()
-                        job.progress = 100 if status == "SUCCESS" else job.progress # Snap to 100% on success
-                    session.commit()
+                cond = [IaCJob.id == job_id, IaCJob.status == "RUNNING"]
+                if token:
+                    cond.append(IaCJob.claim_token == token)
+                values: dict = {"status": status}
+                if status in ("SUCCESS", "FAILED", "ERROR", "ABORTED"):
+                    values["end_time"] = datetime.now()
+                    if status == "SUCCESS":
+                        values["progress"] = 100  # Snap to 100% on success
+                res = session.execute(update(IaCJob).where(*cond).values(**values))
+                session.commit()
+                return res.rowcount == 1
             except Exception:
                 session.rollback()
                 raise
@@ -138,9 +156,10 @@ class JobDatabase:
                 session.close()
 
         try:
-            retry_write(_tx)
+            return bool(retry_write(_tx))
         except Exception as e:
             log.error(f"Failed to update job {job_id} in DB: {e}")
+            return False
 
     def get_recent_jobs(self, limit: int = 20) -> list:
         """Fetches metadata for the UI table."""
@@ -250,16 +269,17 @@ class JobDatabase:
                 session.close()
 
     def update_pending_tasks(self, job_id: int, pending_list: list):
-        """Updates the queue of services yet to be deployed."""
+        """Updates the queue of services yet to be deployed (fenced like update_job)."""
         session = self._get_session()
         if not session:
             return
-
+        token = self.claims.get(job_id)
         try:
-            job = session.query(IaCJob).filter(IaCJob.id == job_id).first()
-            if job:
-                job.pending_tasks = json.dumps(pending_list)
-                session.commit()
+            cond = [IaCJob.id == job_id]
+            if token:
+                cond.append(IaCJob.claim_token == token)
+            session.execute(update(IaCJob).where(*cond).values(pending_tasks=json.dumps(pending_list)))
+            session.commit()
         except Exception as e:
             log.error(f"Failed to update pending tasks for {job_id}: {e}")
             session.rollback()
@@ -409,23 +429,36 @@ class JobDatabase:
             if session: session.close()
                 
                 
-    def update_progress(self, job_id: int, progress: int = None, current_step: str = None):
-        """Live updates the progress bar and current action text."""
+    def update_progress(self, job_id: int, progress: int = None, current_step: str = None, *,
+                        fenced: bool = True) -> bool:
+        """Live updates the progress bar and current action text.
+
+        While this process holds the job's claim the write only lands on the
+        RUNNING row with that claim token. ``fenced=False`` is for the one writer
+        that describes a row it just gave up on purpose (parked as SCHEDULED).
+        """
         if job_id in (None, -1):
-            return
+            return False
+        values: dict = {}
+        if progress is not None:
+            values["progress"] = progress
+        if current_step:
+            values["current_step"] = str(current_step)[:250]
+        if not values:
+            return False
+        token = self.claims.get(job_id) if fenced else None
 
         def _tx():
             session = self._get_session()
             if not session:
-                return
+                return False
             try:
-                job = session.query(IaCJob).filter(IaCJob.id == job_id).first()
-                if job:
-                    if progress is not None:
-                        job.progress = progress
-                    if current_step:
-                        job.current_step = str(current_step)[:250]
-                    session.commit()
+                cond = [IaCJob.id == job_id]
+                if token:
+                    cond += [IaCJob.claim_token == token, IaCJob.status == "RUNNING"]
+                res = session.execute(update(IaCJob).where(*cond).values(**values))
+                session.commit()
+                return res.rowcount == 1
             except Exception:
                 session.rollback()
                 raise
@@ -433,9 +466,10 @@ class JobDatabase:
                 session.close()
 
         try:
-            retry_write(_tx)
+            return bool(retry_write(_tx))
         except Exception as e:
             log.error(f"Failed to update progress for job {job_id}: {e}")
+            return False
 
     def insert_job_task(self, job_id: int, task_num: int, task_name: str, task_label: str, 
                        start_time: float, end_time: float, duration_ms: int, status: str, error: str = None):

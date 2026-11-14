@@ -316,8 +316,8 @@ def setup(ctx):
     # Execution plane (runner role): worker, startup reconciliation, the
     # repo-derived publishes (they read the git working trees of this host).
     if _service.is_runner:
-        _service.start_runner()
-        ctx.create_task(_service.run_startup_reconciliation(), name="iac:startup_reconciliation")
+        # Reconcile what a previous incarnation left behind, THEN start claiming.
+        ctx.create_task(_service.run_runner_boot(), name="iac:runner_boot")
         # One ordered chain (maintenance windows, 1.6): registry ci_ids → monitoring
         # sync with ci_ids → maintenance:windows_published. Same order as NativeGenerateStage.
         ctx.create_task(_service.publish_inventory_chain(), name="iac:inventory_publish")

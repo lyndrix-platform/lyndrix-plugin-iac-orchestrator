@@ -19,9 +19,10 @@ from iac_plugin.app.model.models import Base, IaCJob
 
 
 @pytest.fixture
-def q(monkeypatch):
-    engine = create_engine("sqlite://", connect_args={"check_same_thread": False},
-                           poolclass=__import__("sqlalchemy.pool", fromlist=["StaticPool"]).StaticPool)
+def q(monkeypatch, tmp_path):
+    # A file: worker threads need their own connections (see conftest.sqlite_queue).
+    engine = create_engine(f"sqlite:///{tmp_path / 'jobs.db'}",
+                           connect_args={"check_same_thread": False, "timeout": 30})
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine)
     monkeypatch.setattr(queue_mod.db_instance, "is_connected", True, raising=False)
