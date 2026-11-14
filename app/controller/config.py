@@ -185,6 +185,11 @@ class IaCConfig:
     def auto_apply(self) -> bool: return str(self._get("PLUGIN_IAC_ORCHESTRATOR_AUTO_APPLY", "iac_auto_apply", "false")).lower() == "true"
 
     @property
+    def token_infra_apply_enabled(self) -> bool:
+        """May the GitLab-token route trigger a fleet apply? Off unless explicitly enabled."""
+        return self._get_bool("PLUGIN_IAC_ORCHESTRATOR_TOKEN_INFRA_APPLY", "iac_token_infra_apply_enabled", False)
+
+    @property
     def sync_interval_minutes(self) -> int:
         try: return int(self._get("PLUGIN_IAC_ORCHESTRATOR_SYNC_INTERVAL", "iac_sync_interval_minutes", "15"))
         except ValueError: return 15

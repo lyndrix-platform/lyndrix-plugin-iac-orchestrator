@@ -170,11 +170,23 @@ def _build_fields() -> list[SettingField]:
             "auto_apply", "Auto-Apply on webhook", kind="bool", category="Pipeline",
             default=False, vault_key="iac_auto_apply", state_key="auto_apply_enabled",
             bool_format="python", env_var="PLUGIN_IAC_ORCHESTRATOR_AUTO_APPLY",
-            safe_value="False",
+            # Enabling it unlocks unattended applies → needs the apply permission
+            # itself (audit OS-03); switching it off is open to every operator.
+            safe_value="False", tier=TIER_INFRA_APPLY,
             description=(
                 "Infrastructure only: let Terraform apply (infra_apply, rule mode: apply) and "
                 "rule-engine Ansible actions run without a manual gate. Off = plan / --check for "
                 "those. Service deploys, rollouts and compliance runs are never affected."
+            ),
+        ),
+        SettingField(
+            "token_infra_apply_enabled", "Token-triggered infra apply", kind="bool", category="Pipeline",
+            default=False, bool_format="lower", vault_key="iac_token_infra_apply_enabled",
+            env_var="PLUGIN_IAC_ORCHESTRATOR_TOKEN_INFRA_APPLY",
+            safe_value="false", tier=TIER_INFRA_APPLY,
+            description=(
+                "Enable POST /api/iac/infra/apply/gitlab: a fleet-wide `tofu apply` for anyone holding the "
+                "GitLab webhook token. Off by default — no CI pipeline uses it; approve plans in the dashboard."
             ),
         ),
         SettingField(

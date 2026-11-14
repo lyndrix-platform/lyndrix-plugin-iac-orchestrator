@@ -184,7 +184,8 @@ def build_plugin_router(service) -> APIRouter:
         payload: _api.PipelineRequest,
         identity: ApiIdentity = Depends(require_permission(PERM_WRITE)),
     ):
-        return await _api.do_run_pipeline(payload)
+        # init_host needs the infra-apply permission unless it is a dry-run.
+        return await _api.do_run_pipeline(payload, identity)
 
     @router.post("/abort")
     async def abort(identity: ApiIdentity = Depends(require_permission(PERM_WRITE))):
@@ -233,9 +234,14 @@ def build_plugin_router(service) -> APIRouter:
     ):
         return await _api.do_delete_credential(alias)
 
+    # Returns the raw token once. The token authorises the public /api/iac routes
+    # (deploys, plans and — when enabled — a fleet apply), so minting it needs the
+    # apply permission plus the credentials permission, never plain write.
     @router.post("/settings/webhook-token/generate")
     async def generate_webhook_token(
         identity: ApiIdentity = Depends(require_permission(PERM_WRITE)),
+        _apply: ApiIdentity = Depends(require_permission(PERM_INFRA_APPLY)),
+        _admin: ApiIdentity = Depends(require_permission(PERM_CREDENTIALS_ADMIN)),
     ):
         return await _api.do_generate_webhook_token()
 
@@ -289,7 +295,8 @@ def build_plugin_router(service) -> APIRouter:
         payload: _api.TestHostDeployRequest,
         identity: ApiIdentity = Depends(require_permission(PERM_WRITE)),
     ):
-        return await _api.do_trigger_test_host_deployment(host_name, payload)
+        # host_provision runs Terraform for the host → infra-apply permission.
+        return await _api.do_trigger_test_host_deployment(host_name, payload, identity)
 
     @router.post("/bootstrap/{host_name}")
     async def bootstrap_host(

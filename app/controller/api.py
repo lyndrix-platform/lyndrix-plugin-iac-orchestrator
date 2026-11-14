@@ -885,10 +885,11 @@ async def do_maintenance_default():
     }
 
 
-async def do_trigger_test_host_deployment(host_name: str, payload: TestHostDeployRequest):
+async def do_trigger_test_host_deployment(host_name: str, payload: TestHostDeployRequest, identity=None):
     """Triggers a guarded host_provision run for exactly one allow-listed host."""
     if not _ctx or not _engine:
         raise HTTPException(status_code=500, detail="Orchestrator offline")
+    _require_infra_apply(identity, "host_provision")
 
     host = str(host_name or "").strip()
     if not host or not _HOST_LIMIT_PATTERN.fullmatch(host):
@@ -989,6 +990,26 @@ async def do_trigger_infra_plan():
     _ctx.emit("iac:webhook_verified", infra_plan_payload)
     _emit_webhook_verified(infra_plan_payload)
     return {"status": "accepted", "message": "Infrastructure plan (Check Env) queued."}
+
+
+async def do_trigger_infra_apply_by_token(x_gitlab_token: str | None):
+    """``POST /api/iac/infra/apply/gitlab``: fleet apply for a token holder.
+
+    Disabled unless ``token_infra_apply_enabled`` is set (audit OS-03): the one
+    static webhook token sits in every project hook and CI variable, and no CI
+    pipeline calls this route — the reviewed path is plan → approve in the
+    dashboard. Checked before the token so a disabled route costs nothing.
+    """
+    if not _ctx or not _engine:
+        raise HTTPException(status_code=500, detail="Context offline")
+    enabled = await asyncio.to_thread(lambda: bool(_engine.config.token_infra_apply_enabled))
+    if not enabled:
+        raise HTTPException(
+            status_code=404,
+            detail="Token-triggered infrastructure apply is disabled (setting token_infra_apply_enabled).",
+        )
+    _require_gitlab_token(x_gitlab_token)
+    return await do_trigger_infra_apply()
 
 
 async def do_trigger_infra_apply():
@@ -1272,7 +1293,7 @@ async def do_job_runners(job_id: int):
 
 # ── Generic operation trigger / abort ───────────────────────────────────────
 
-async def do_run_pipeline(payload: PipelineRequest):
+async def do_run_pipeline(payload: PipelineRequest, identity=None):
     """Generic operation trigger replacing the ~10 NiceGUI global/site/host buttons.
 
     Ports the exact path those handlers use: emit ``iac:webhook_verified`` with the
@@ -1299,6 +1320,8 @@ async def do_run_pipeline(payload: PipelineRequest):
         raise HTTPException(status_code=400, detail="Invalid host_name token.")
     if limit and not _HOST_LIMIT_PATTERN.fullmatch(limit):
         raise HTTPException(status_code=400, detail="Invalid limit token.")
+    if pipeline_type in _APPLY_CAPABLE_TYPES and not payload.dry_run:
+        _require_infra_apply(identity, pipeline_type)
 
     event_payload: dict = {"pipeline_type": pipeline_type, "manual": True, "trigger": "ui_pipeline"}
     if limit:
@@ -1762,6 +1785,31 @@ def _allowed_tiers(identity) -> set[str] | None:
         except Exception:
             pass
     return tiers
+
+
+# Pipeline types whose purpose is to create or change infrastructure through
+# Terraform. Triggering them for real needs the apply permission; a dry-run
+# (plan only, enforced by the executor) stays available to every operator.
+_APPLY_CAPABLE_TYPES = frozenset({"init_host", "host_provision"})
+
+
+def _require_infra_apply(identity, what: str) -> None:
+    """403 unless ``identity`` holds the infra-apply permission (``None`` = trusted
+    in-process caller). Used wherever an action can lead to a Terraform apply
+    without passing the gated /infra/apply routes (audit OS-03)."""
+    if identity is None:
+        return
+    allowed = False
+    try:
+        allowed = bool(identity.allows(PERM_INFRA_APPLY))
+    except Exception:
+        allowed = False
+    if not allowed:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Missing required permission: {PERM_INFRA_APPLY} — {what} can apply infrastructure changes "
+                   "(a dry-run only plans and does not need it).",
+        )
 
 
 async def _save_settings(values: dict, identity) -> dict:

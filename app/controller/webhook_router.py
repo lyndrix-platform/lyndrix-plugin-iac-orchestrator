@@ -80,7 +80,7 @@ def build_webhook_router(service) -> APIRouter:
 
     @router.post("/infra/apply/gitlab")
     async def trigger_infra_apply_gitlab(x_gitlab_token: str = Header(None)):
-        _api._require_gitlab_token(x_gitlab_token)
-        return await _api.do_trigger_infra_apply()
+        # Off by default (setting token_infra_apply_enabled) — see the handler.
+        return await _api.do_trigger_infra_apply_by_token(x_gitlab_token)
 
     return router
