@@ -1366,6 +1366,12 @@ class JobLogWriter:
         self._seq: int | None = None
         self._closed = False
         self._task: asyncio.Task | None = None
+        self._wake = asyncio.Event()
+        self._lock = asyncio.Lock()
+        # The database write of the batch in flight. It runs in a thread and is
+        # not stopped by a cancellation of whoever awaits it — the next flush
+        # waits for it and continues with ITS sequence number.
+        self._inflight: asyncio.Future | None = None
 
     def append(self, line: str) -> None:
         if self._closed:
@@ -1377,30 +1383,55 @@ class JobLogWriter:
             self._task = create_task(self.run(), name=f"iac:joblog:{self.job_id}")
 
     async def _flush(self) -> None:
-        if not self._buf:
-            return
-        lines, self._buf = self._buf[: self.batch * 5], self._buf[self.batch * 5:]
-        if self._seq is None:
-            self._seq = await asyncio.to_thread(self.queue.last_seq, self.job_id)
-        self._seq = await asyncio.to_thread(self.queue.append_log, self.job_id, lines, self._seq)
+        """Write the next batch. Safe against cancellation at any await: a batch
+        is taken from the buffer only when its write starts, and a write that
+        was still running when its flush got cancelled (plugin reload, close
+        racing the timer) is awaited before more lines get sequence numbers —
+        otherwise two batches were numbered from the same start and the job log
+        came out reordered."""
+        async with self._lock:
+            if self._inflight is not None:
+                try:
+                    self._seq = await asyncio.shield(self._inflight)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    self._seq = None
+                self._inflight = None
+            if not self._buf:
+                return
+            if self._seq is None:
+                self._seq = await asyncio.to_thread(self.queue.last_seq, self.job_id)
+            if not self._buf:
+                return
+            lines, self._buf = self._buf[: self.batch * 5], self._buf[self.batch * 5:]
+            self._inflight = asyncio.ensure_future(
+                asyncio.to_thread(self.queue.append_log, self.job_id, lines, self._seq))
+            self._seq = await asyncio.shield(self._inflight)
+            self._inflight = None
 
     async def run(self) -> None:
         try:
             while not self._closed:
-                await asyncio.sleep(self.interval)
+                try:
+                    await asyncio.wait_for(self._wake.wait(), timeout=self.interval)
+                except asyncio.TimeoutError:
+                    pass
                 await self._flush()
         except asyncio.CancelledError:
             pass
 
     async def close(self) -> None:
+        """Flush what is buffered and stop. The timer task is asked to finish,
+        not cancelled mid-write."""
         self._closed = True
+        self._wake.set()
         if self._task:
-            self._task.cancel()
             try:
                 await self._task
             except (asyncio.CancelledError, Exception):
                 pass
-        while self._buf:
+        while self._buf or self._inflight is not None:
             await self._flush()
 
 

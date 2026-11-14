@@ -380,3 +380,36 @@ def test_override_bookkeeping_and_terminal_hook(q):
     assert q.mark_failed(a, "Runner 'r1' lost") is True
     assert ended == [a]
     assert q.mark_failed(a, "again") is False and ended == [a]  # hook only on the real transition
+
+
+def test_log_writer_keeps_order_when_a_flush_is_cancelled_mid_write(q):
+    """A flush whose awaiting task is cancelled while the thread still writes must
+    not make the next batch start at the same sequence number (reordered log)."""
+    import threading
+    import time as _time
+
+    a = q.enqueue({"pipeline_type": "connectivity"})
+    real_append = q.append_log
+    gate = threading.Event()
+
+    def slow_append(job_id, lines, start_seq):
+        gate.wait(2)                      # the first batch is "in flight"
+        _time.sleep(0.05)
+        return real_append(job_id, lines, start_seq)
+
+    q.append_log = slow_append
+
+    async def run():
+        w = JobLogWriter(q, a, interval=0.01)
+        w.start(lambda coro, name=None: asyncio.get_running_loop().create_task(coro))
+        for i in range(3):
+            w.append(f"first-{i}")
+        await asyncio.sleep(0.05)         # the timer task is now inside the write
+        w._task.cancel()                  # plugin reload: ctx.dispose() cancels every task
+        await asyncio.sleep(0)
+        w.append("after-cancel")
+        gate.set()
+        await w.close()
+
+    asyncio.run(run())
+    assert q.read_log(a, tail=100)["lines"] == ["first-0", "first-1", "first-2", "after-cancel"]
