@@ -113,7 +113,9 @@ manifest = ModuleManifest(
     settings_ui_route="/iac/settings",
     permissions={
         "subscribe": ["vault:ready_for_data", "iac:webhook_verified", "git:status_update", "db:connected", "socket:response",
-                      "entity_registry:identified", "iac:job_queued", "iac:job_abort_requested"],
+                      "entity_registry:identified", "iac:job_queued", "iac:job_abort_requested",
+                      # core API >= 1.14 (local event); never fires on older cores
+                      "cluster:instance_lost"],
         "emit": ["iac:pipeline_started", "iac:webhook_verified", "iac:inventory_updated",
                  "entity_registry:identify", "entity_registry:relate", "server_manager:register_server",
                  "git:sync", "git:commit_push",
@@ -143,6 +145,14 @@ manifest = ModuleManifest(
         NotificationEndpoint(
             name="deployment_failed",
             description="A pipeline finished with errors.",
+            default_active=True,
+            internal_toast=True,
+            internal_persist=True,
+            external_default=True,
+        ),
+        NotificationEndpoint(
+            name="job_orphaned",
+            description="A running pipeline was closed as FAILED because its runner instance is gone.",
             default_active=True,
             internal_toast=True,
             internal_persist=True,
@@ -210,7 +220,11 @@ async def health(ctx) -> PluginHealthStatus:
     state = getattr(_service, "state", None) or {}
     active_workers = len(state.get("active_tasks", {}) or {})
     last_deployment = state.get("last_deployment")
-    runner_online = _service.runner_online()
+    # online | restarting | absent | unknown. Only a runner that is really gone
+    # degrades the plugin: a restarting runner (core rollout) or a view that is
+    # not built yet must not turn every instance's health red.
+    runner_state = _service.runner_state()
+    runner_online = runner_state == "online"
 
     # Vault holds the auto-apply flag (env fallback). A reachable Vault returns a
     # value; unreachable/unset returns None — informational, never fatal here.
@@ -220,6 +234,11 @@ async def health(ctx) -> PluginHealthStatus:
         )
     except Exception:
         vault_ready = False
+
+    try:
+        sweep = ((await asyncio.to_thread(_service.db.get_state, "orphan_sweep")) or {}).get("data") or {}
+    except Exception:
+        sweep = {}
 
     try:
         recent = await asyncio.to_thread(_service.db.get_recent_jobs, 5)
@@ -234,7 +253,7 @@ async def health(ctx) -> PluginHealthStatus:
     return PluginHealthStatus(
         # Control plane without any live runner: the API works, jobs queue up but
         # nothing executes them — degraded, not an error.
-        status="ok" if runner_online else "degraded",
+        status="degraded" if runner_state == "absent" else "ok",
         details={
             "db_connected": True,
             "vault_ready": vault_ready,
@@ -243,6 +262,15 @@ async def health(ctx) -> PluginHealthStatus:
             "recent_jobs": len(recent or []),
             "is_runner": _service.is_runner,
             "runner_online": runner_online,
+            "runner_state": runner_state,
+            # Orphan sweep (lease-held by one instance): visible on every instance.
+            "orphan_sweep": {
+                "enabled": bool(await asyncio.to_thread(lambda: _service.config.orphan_sweep_enabled)),
+                "running_here": _service.sweeper.running,
+                "holder": sweep.get("holder"),
+                "last_sweep_at": sweep.get("last_sweep_at"),
+                "orphans_failed_total": sweep.get("orphans_failed_total", 0),
+            },
         },
         latency_ms=latency,
     )
@@ -333,7 +361,18 @@ def setup(ctx):
     else:
         _service.start_webhook_sync()
 
-    # Cluster: tell the operator when no runner is online (jobs would only queue).
+    # Orphan sweep (rD §3): one instance under a lease — a control-plane instance
+    # when there is one, so a hung or dead runner is noticed by somebody else.
+    _service.review_sweep_lease()
+    try:
+        @ctx.subscribe("cluster:instance_lost")
+        async def _on_instance_lost(_payload):
+            _service.sweeper.poke()     # a peer is gone: sweep now, not at the next tick
+    except Exception as exc:            # topic unknown to an older core
+        ctx.log.debug(f"IaC Orchestrator: cluster:instance_lost not subscribed: {exc}")
+
+    # Cluster: tell the operator when no runner is online (jobs would only queue)
+    # and keep the sweep lease on the right kind of instance.
     ctx.create_task(_service.watch_runner_presence(), name="iac:runner_watch")
 
     # UI route
@@ -349,6 +388,7 @@ def teardown(ctx):
     if svc is not None:
         try:
             svc.stop_webhook_sync()
+            svc.sweeper.stop()
             ctx.create_task(svc.stop_runner(), name="iac:worker_stop")
         except Exception:
             pass

@@ -184,6 +184,23 @@ class IaCConfig:
     @property
     def auto_apply(self) -> bool: return str(self._get("PLUGIN_IAC_ORCHESTRATOR_AUTO_APPLY", "iac_auto_apply", "false")).lower() == "true"
 
+    # --- orphan sweep (rD §3) — env > Vault (settings UI) > default ---
+    @property
+    def orphan_sweep_enabled(self) -> bool:
+        return self._get_bool("PLUGIN_IAC_ORCHESTRATOR_ORPHAN_SWEEP_ENABLED", "iac_orphan_sweep_enabled", True)
+
+    @property
+    def orphan_sweep_grace_seconds(self) -> int:
+        """No heartbeat and no log line for this long (and a dead owner) = orphaned."""
+        return self._get_int("PLUGIN_IAC_ORCHESTRATOR_ORPHAN_SWEEP_GRACE_SECONDS",
+                             "iac_orphan_sweep_grace_seconds", 90, minimum=30)
+
+    @property
+    def orphan_sweep_container_grace_seconds(self) -> int:
+        """Grace for a job whose runner containers may still be running."""
+        return self._get_int("PLUGIN_IAC_ORCHESTRATOR_ORPHAN_SWEEP_CONTAINER_GRACE_SECONDS",
+                             "iac_orphan_sweep_container_grace_seconds", 1800, minimum=60)
+
     @property
     def tf_lock_timeout_seconds(self) -> int:
         """How long a Terraform run waits for the state lock of its environment

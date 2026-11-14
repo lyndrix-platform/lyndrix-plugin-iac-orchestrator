@@ -7,7 +7,7 @@ Lyndrix's GitOps control plane for infrastructure: provisions Proxmox/Hetzner in
 - Sites × stages: every infra path is `<site=onprem|hetzner>/<stage=dev|test|prod>`; promotion dev→test→prod.
 - SSoT = iac-controller: hosts, hardware, networks, profiles, service catalog, inline `terraform:` blocks (node_name, vm_id). The bundled iac_core engine renders Ansible inventory + Terraform tfvars from it. Change infra by editing the controller SSoT and re-rendering — not the artifacts, not the live box — or the next plan proposes destroy+recreate.
 - Per-node TF modules: the rendered root splits containers per node as `module.lxc_<node>.proxmox_virtual_environment_container.ct["<host>"]`, filtered by each host's node_name. Changing node_name moves the resource to another module.
-- Cluster & runner model: the control plane runs on EVERY instance (API/UI/webhooks/queue inserts), but jobs execute only on the runner-role instance (holds the Docker socket to spawn tofu/ansible CI containers). DB job queue (QUEUED→claim→heartbeat); an orphan sweep marks a RUNNING job FAILED if its owner heartbeat is stale >180 s.
+- Cluster & runner model: the control plane runs on EVERY instance (API/UI/webhooks/queue inserts), but jobs execute only on the runner-role instance (holds the Docker socket to spawn tofu/ansible CI containers). DB job queue (QUEUED→claim→heartbeat). An orphan sweep on a control-plane instance closes a RUNNING job as FAILED `runner_lost: <instance> …` when its runner instance is gone (dead per the cluster view, no heartbeat and no log line for `orphan_sweep_grace_seconds`, default 90 s; 30 min while runner containers may still be alive). Nothing is re-run automatically — re-trigger. `GET /health` details show `runner_state` (online/restarting/absent/unknown) and `orphan_sweep`.
 - Leases coordinate cluster roles/work (e.g. `iac:webhook_sync`), TTL ~30 s, renewed ~10 s.
 
 ## API — how to drive it
@@ -33,7 +33,7 @@ Lyndrix's GitOps control plane for infrastructure: provisions Proxmox/Hetzner in
 Engine renders per env/host → `tofu init` → scoped `tofu plan|import|apply -target=module.lxc_<node>…ct["<host>"]` inside opentofu-ci-image, spawned via the Docker socket on the runner. Destroy-safety guards: `import_existing_cts.sh` (adopt live CTs before apply), renderer empty-container guard, CT import script.
 
 ## ⚠️ Guardrails — do NOT
-- Don't restart the runner while an IaC job runs (no plugin toggle/upgrade, no aac-lyndrix-core SSoT push → Renovate redeploys the runner) — the orphan sweep FAILS the job (>180 s).
+- Don't restart the runner while an IaC job runs (no plugin toggle/upgrade, no aac-lyndrix-core SSoT push → Renovate redeploys the runner) — a job without a live container is closed as FAILED (`runner_lost`, or "Interrupted by a runner restart" when the runner comes back); nothing is resumed automatically.
 - Don't trust a targeted plan's "0 to destroy" — verify against a full plan.
 - Don't apply an adopt — adopt is import/state-mv only.
 - Don't hand-edit live Proxmox/containers or rendered tfvars — change the iac-controller SSoT and re-render.

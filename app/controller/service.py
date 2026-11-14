@@ -6,6 +6,7 @@ entrypoint.py and the UI/API layers only ever deal with this object.
 """
 import asyncio
 import logging
+import time
 import uuid
 from core.api import db_instance
 
@@ -17,6 +18,7 @@ from .queue import JobQueue, JobWorker, DuplicateJob
 from .socket_client import SocketBusClient
 from .gitlab_webhooks import sync_group_webhooks_from_ctx, WebhookConfigError
 from .job_payload import ALL_ENTITLEMENTS, InvalidJobPayload, strip_unentitled, validate_structure
+from .orphan_sweep import LEASE_NAME as SWEEP_LEASE, OrphanSweeper
 
 log = logging.getLogger("IaC:Service")
 
@@ -60,6 +62,12 @@ class IaCService:
         # mark_failed) still ends its maintenance override exactly once.
         self.queue.on_terminal = self.engine.end_override_for
         self.worker: JobWorker | None = None
+        # Orphan sweep (rD §3): started/stopped by the lease, see review_sweep_lease.
+        self.sweeper = OrphanSweeper(ctx, self.queue, self.db, self.config, notify=self._notify_orphaned)
+        self._sweep_lease_wanted = False
+        # Runner presence: when a runner was last seen and when this service started.
+        self._runner_seen_at: float | None = None
+        self._started_at = time.monotonic()
 
         # Restore the Auto-Apply setting from Vault/Config on boot
         self.state["auto_apply_enabled"] = self.config.auto_apply
@@ -80,15 +88,96 @@ class IaCService:
         except Exception:
             return True
 
-    def runner_online(self) -> bool:
-        """Is any live instance a runner (this one included)? Older cores: assume yes."""
+    #: A runner that vanished is "restarting" for this long before it counts as absent
+    #: (core < 1.14 has no restarting state: a graceful stop deletes the row at once).
+    RUNNER_RESTART_GRACE_SECONDS = 120.0
+    #: After start-up the cluster view may be empty/fabricated for a while.
+    RUNNER_BOOT_GRACE_SECONDS = 60.0
+
+    def runner_state(self) -> str:
+        """``online`` | ``restarting`` | ``absent`` | ``unknown`` — is there a runner
+        that executes jobs? Uses the core's role state when it has one (API ≥ 1.14),
+        else ``has_live_role`` with a grace period, so one missed heartbeat or a
+        runner restart does not flip every instance to "no runner"."""
+        role_state = getattr(self.ctx, "role_state", None)
+        if callable(role_state):
+            try:
+                info = role_state("runner")
+                state = info.get("state") if isinstance(info, dict) else None
+            except Exception:
+                state = None
+            if state in ("alive", "draining"):
+                return "online"
+            if state == "restarting":
+                return "restarting"
+            if state == "dead":
+                return "absent"
+            if state == "unknown":
+                return "unknown"
         probe = getattr(self.ctx, "has_live_role", None)
+        now = time.monotonic()
+        seen: bool | None = None
         if callable(probe):
             try:
-                return bool(probe("runner"))
+                seen = bool(probe("runner"))
             except Exception:
-                pass
-        return self.is_runner
+                seen = None
+        if seen is None:
+            return "online" if self.is_runner else "unknown"
+        if seen:
+            self._runner_seen_at = now
+            return "online"
+        if self._runner_seen_at is not None:
+            return "restarting" if now - self._runner_seen_at < self.RUNNER_RESTART_GRACE_SECONDS else "absent"
+        return "unknown" if now - self._started_at < self.RUNNER_BOOT_GRACE_SECONDS else "absent"
+
+    def runner_online(self) -> bool:
+        """Is a runner online right now? (``runner_state`` has the nuance.)"""
+        return self.runner_state() == "online"
+
+    # -- orphan sweep placement (rD §3.1) ------------------------------------------
+    def _other_control_plane_alive(self) -> bool:
+        """Is a live instance WITHOUT the runner role around (besides this one)?"""
+        instances = getattr(self.ctx, "cluster_instances", None)
+        if not isinstance(instances, (list, tuple)):
+            return False
+        me = getattr(self.ctx, "instance_id", None)
+        try:
+            return any(i.get("alive") and i.get("instance_id") != me and "runner" not in (i.get("roles") or [])
+                       for i in instances)
+        except Exception:
+            return False
+
+    def review_sweep_lease(self) -> None:
+        """Contend for the sweep lease on control-plane instances; a runner only
+        while no other instance is alive (single mode: always). Called at setup
+        and by the presence watcher, so placement follows the cluster."""
+        want = (not self.is_runner) or not self._other_control_plane_alive()
+        on_lease = getattr(self.ctx, "on_lease", None)
+        if not callable(on_lease):
+            # Core without leases = one instance: sweep here.
+            if want and not self.sweeper.running:
+                self.sweeper.start()
+            return
+        if want and not self._sweep_lease_wanted:
+            on_lease(SWEEP_LEASE, acquired=self.sweeper.start, lost=self.sweeper.stop)
+            self._sweep_lease_wanted = True
+        elif not want and self._sweep_lease_wanted:
+            release = getattr(self.ctx, "release_lease", None)
+            if callable(release):
+                release(SWEEP_LEASE)        # fires ``lost`` → the sweeper stops
+                self._sweep_lease_wanted = False
+
+    def _notify_orphaned(self, job_id: int, reason: str, row: dict) -> None:
+        self.ctx.notify(
+            "job_orphaned",
+            payload={"job_id": job_id, "reason": reason, "owner_instance": row.get("owner_instance"),
+                     "message": f"Pipeline #{job_id} was closed as FAILED: {reason}."},
+            notification_id=f"job_{job_id}",
+            title=f"❌ Pipeline #{job_id} — runner lost",
+            body=f"{reason}. Nothing is re-run automatically — re-trigger the pipeline.",
+            severity="error",
+        )
 
     def enqueue_pipeline(self, payload: dict, *, requested_by: str | None = None) -> int:
         """Queue a pipeline for a runner. Raises :class:`DuplicateJob` when the same
@@ -126,7 +215,7 @@ class IaCService:
             except (ValueError, Exception):
                 max_parallel = 3
         self.worker = JobWorker(self.ctx, self.queue, self.run_claimed, max_parallel=max_parallel,
-                                finalize_orphan=self._finalize_orphan, incarnation=self.incarnation,
+                                incarnation=self.incarnation,
                                 on_fenced=self._on_fenced, extra_attended=self.engine.attended_job_ids)
         self.worker.start()
         log.info(f"IaC Orchestrator: job worker started on '{getattr(self.ctx, 'instance_id', 'local')}' "
@@ -157,12 +246,6 @@ class IaCService:
         if self.worker is not None:
             await self.worker.stop()
             self.worker = None
-
-    async def _finalize_orphan(self, job_id: int, owner: str | None) -> bool:
-        """Orphan sweep hook: the dead owner may have been THIS host's previous
-        process (restart, self-deploy, or the former combined api+runner instance)
-        — its runner containers are still here, so close the job from them."""
-        return await self.engine.finalize_from_containers(job_id, reason=f"restarted (owner '{owner}')")
 
     async def run_claimed(self, payload: dict, job_id: int):
         """Execute a job this instance's worker claimed.
@@ -324,23 +407,28 @@ class IaCService:
             task.cancel()
             self._webhook_sync_task = None
 
-    async def watch_runner_presence(self, interval: float = 30.0):
-        """Cluster: surface 'no runner online' as a non-blocking degraded status."""
+    async def watch_runner_presence(self, interval: float = 30.0, settle: float = 15.0):
+        """Surface 'no runner' as a non-blocking degraded status — after TWO
+        consecutive ``absent`` checks, never for ``restarting``/``unknown`` — and
+        keep the orphan-sweep lease on the right kind of instance. Only a status
+        this watcher set is reset."""
         set_status = getattr(self.ctx, "set_status", None)
-        if not callable(set_status):
-            return
         degraded = False
-        await asyncio.sleep(15)  # let the coordinator learn the live instances first
+        misses = 0
+        await asyncio.sleep(settle)  # let the coordinator learn the live instances first
         while True:
             try:
-                online = self.runner_online()
-                if not online and not degraded:
-                    set_status("degraded", message="No runner instance online — pipelines are queued, not executed",
-                               blocking=False)
-                    degraded = True
-                elif online and degraded:
-                    set_status("ready")
-                    degraded = False
+                self.review_sweep_lease()
+                state = self.runner_state()
+                misses = misses + 1 if state == "absent" else 0
+                if callable(set_status):
+                    if misses >= 2 and not degraded:
+                        set_status("degraded", message="No runner instance online — pipelines are queued, not executed",
+                                   blocking=False)
+                        degraded = True
+                    elif state in ("online", "restarting") and degraded:
+                        set_status("ready")
+                        degraded = False
             except Exception as exc:
                 log.debug(f"runner watch: {exc}")
             await asyncio.sleep(interval)

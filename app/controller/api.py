@@ -1098,11 +1098,27 @@ async def do_dismiss_pending_plan():
     return {"status": "ok"}
 
 
+def _with_wait_hints(jobs: list, runner_state: str) -> list:
+    """QUEUED jobs say what they are waiting for while no runner executes them —
+    instead of looking like a job that hangs at 0 % ("Queued by gitlab-ci")."""
+    if runner_state not in ("absent", "restarting"):
+        return jobs
+    hint = "Waiting for runner (restarting)" if runner_state == "restarting" else "Waiting for runner — none online"
+    out = []
+    for job in jobs:
+        if isinstance(job, dict) and job.get("status") == "QUEUED":
+            job = {**job, "waiting_for": "runner",
+                   "current_step": f"{hint} · {job.get('current_step') or 'Queued'}"[:250]}
+        out.append(job)
+    return out
+
+
 async def do_list_jobs(limit: int = 20):
     """Returns a list of recent and active jobs."""
     if not _engine:
         raise HTTPException(status_code=500, detail="Engine offline")
-    return _engine.db.get_recent_jobs(limit)
+    jobs = _engine.db.get_recent_jobs(limit)
+    return _with_wait_hints(jobs, _service.runner_state()) if _service else jobs
 
 
 # Default amount of trailing log to seed an offset=0 tail request with, so the UI
@@ -2040,7 +2056,8 @@ def _job_stream_snapshot() -> dict:
     """Build a single live snapshot of orchestrator state for the SSE stream."""
     if not _engine:
         return {"jobs": [], "active_tasks": {}, "is_running": False, "ts": time.time()}
-    jobs = _engine.db.get_recent_jobs(30)
+    runner_state = _service.runner_state() if _service else "online"
+    jobs = _with_wait_hints(_engine.db.get_recent_jobs(30), runner_state)
     live = _live_summary()
     return {
         "jobs": jobs,
@@ -2048,7 +2065,8 @@ def _job_stream_snapshot() -> dict:
         "is_running": bool(live.get("is_running", False)),
         "queued": live.get("queued", 0),
         "scheduled": live.get("scheduled", 0),
-        "runner_online": bool(_service.runner_online()) if _service else True,
+        "runner_online": runner_state == "online",
+        "runner_state": runner_state,
         "ts": time.time(),
     }
 

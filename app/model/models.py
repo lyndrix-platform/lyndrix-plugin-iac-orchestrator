@@ -39,6 +39,9 @@ class IaCJob(Base):
     # incarnation of the same instance id) can never overwrite what happened since.
     claim_token = Column(String(64), nullable=True)
     owner_incarnation = Column(String(64), nullable=True)  # "<core boot nonce>:<plugin load nonce>" of the claimant
+    # Heartbeat on the DATABASE clock in UTC — what the orphan sweep ages (the
+    # naive ``heartbeat_at`` above is the runner's local wall clock).
+    heartbeat_utc = Column(DateTime, nullable=True)
 
     # --- MAINTENANCE WINDOWS (plugin 1.6): a deploy parked for its window ---
     # Status SCHEDULED: the runner evaluated the service's deploy_policy and parked the job

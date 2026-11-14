@@ -326,6 +326,32 @@ def _build_fields() -> list[SettingField]:
         ),
     ]
 
+    # ── Runner / orphan sweep (rD §3) ────────────────────────────────────────
+    fields += [
+        SettingField(
+            "orphan_sweep_enabled", "Orphan sweep", kind="bool", category="Runner",
+            default=True, bool_format="lower", vault_key="iac_orphan_sweep_enabled",
+            env_var="PLUGIN_IAC_ORCHESTRATOR_ORPHAN_SWEEP_ENABLED",
+            description="Close RUNNING jobs whose runner instance is gone as FAILED (runner_lost). "
+                        "Runs on one control-plane instance; never re-runs a job.",
+        ),
+        SettingField(
+            "orphan_sweep_grace_seconds", "Orphan grace (s)", kind="int", category="Runner",
+            default=90, minimum=30, maximum=86400, vault_key="iac_orphan_sweep_grace_seconds",
+            env_var="PLUGIN_IAC_ORCHESTRATOR_ORPHAN_SWEEP_GRACE_SECONDS",
+            description="A job of a dead runner is failed after this long without heartbeat and log output "
+                        "(at least twice the cluster lease TTL).",
+        ),
+        SettingField(
+            "orphan_sweep_container_grace_seconds", "Orphan grace with containers (s)", kind="int",
+            category="Runner", default=1800, minimum=60, maximum=604800,
+            vault_key="iac_orphan_sweep_container_grace_seconds",
+            env_var="PLUGIN_IAC_ORCHESTRATOR_ORPHAN_SWEEP_CONTAINER_GRACE_SECONDS",
+            description="Grace for a job whose runner containers may still be running — time for the runner "
+                        "to come back and re-attach.",
+        ),
+    ]
+
     # ── Repository Roles (each persisted into repo_<slug>_config JSON) ─────────
     for slug, label in _REPO_ROLES:
         fields.append(SettingField(

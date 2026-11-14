@@ -1783,6 +1783,12 @@ function Dashboard() {
 
       {error && <ErrorBox msg={error} />}
 
+      {/* Jobs only queue while no runner executes them — say so instead of showing "running 0 %". */}
+      {snapshot && snapshot.runner_online === false && snapshot.runner_state !== 'unknown' && (
+        <ErrorBox msg={snapshot.runner_state === 'restarting'
+          ? t('dashboard.runnerRestarting', { defaultValue: 'The runner instance is restarting — queued pipelines start when it is back.' })
+          : t('dashboard.noRunner', { defaultValue: 'No runner instance online — pipelines are queued, not executed.' })} />
+      )}
       <PendingPlanBanner statsTick={statsTick} isRunning={isRunning} confirm={confirm} toast={toast} onLogs={setLogJob} />
 
       {tab !== 'overview' && <ViewHeader tab={tab} onBack={() => setTab('overview')} />}
