@@ -33,6 +33,7 @@ from pydantic import BaseModel, Field
 from .settings_schema import OrchestratorSettings
 from .queue import DuplicateJob as _DuplicateJob
 from . import maintenance_resolver as _mres
+from .public_projection import public_catalog_entry, public_scalar
 
 # Internal references to be set by init_api
 _ctx = None
@@ -620,7 +621,10 @@ def _read_catalog_from_disk() -> list:
     if catalog_file.exists():
         with open(catalog_file, 'r') as f:
             data = yaml.safe_load(f) or {}
-            return data.get("service_catalog", {}).get("services", []) or []
+            # Allowlisted fields only: the result is stored as a snapshot and
+            # served to every reader — never pass raw SSoT entries through.
+            entries = (data.get("service_catalog") or {}).get("services") or []
+            return [e for e in (public_catalog_entry(x) for x in entries) if e]
     return []
 
 
@@ -1571,14 +1575,14 @@ def _collect_terraform_hosts_from_disk() -> list:
                     state = "unknown"
                     state_from_jobs = True
                 else:
-                    provider = tf.get("provider", "—")
-                    resource = tf.get("resource", tf.get("type", "—"))
-                    state = tf.get("state", "unknown")
+                    provider = public_scalar(tf.get("provider")) or "—"
+                    resource = public_scalar(tf.get("resource", tf.get("type"))) or "—"
+                    state = public_scalar(tf.get("state")) or "unknown"
                 results.append({
                     "site": site, "stage": stage, "host": host_name,
-                    "ansible_host": host_data.get("ansible_host") or host_data.get("address") or "—",
+                    "ansible_host": public_scalar(host_data.get("ansible_host") or host_data.get("address")) or "—",
                     "managed": managed, "provider": provider, "resource": resource,
-                    "workspace": tf.get("workspace", "default"), "state": state,
+                    "workspace": public_scalar(tf.get("workspace")) or "default", "state": state,
                     "_state_from_jobs": state_from_jobs,
                 })
         except (ValueError, IndexError):

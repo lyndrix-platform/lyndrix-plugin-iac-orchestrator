@@ -38,7 +38,8 @@ def test_public_terraform_strips_credentials():
         "deploy_token": 7, "private_key": 8,
         "node_name": "hydra", "vm_id": 1, "token_id": "a!b", "ssh_agent": True,
     })
-    assert tf == {"node_name": "hydra", "vm_id": 1, "token_id": "a!b", "ssh_agent": True}
+    # Allowlist (OS-01): auth-related fields are not placement facts either.
+    assert tf == {"node_name": "hydra", "vm_id": 1}
     assert DeploymentEngine._public_terraform(None) == {}
 
 

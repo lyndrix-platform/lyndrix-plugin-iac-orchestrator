@@ -20,6 +20,7 @@ from ...stages.base import BaseStage
 from .utils import StageResult, JobFileLogBridge, current_job_id as _job_id_ctxvar
 from .queue import JobLogWriter
 from . import maintenance_resolver as mres
+from .public_projection import public_names, public_scalar, public_terraform, public_url, scrub
 from ...stages.git import (
     SyncRepoStage,
     PublishInventoryStateStage,
@@ -1258,9 +1259,12 @@ class DeploymentEngine:
                     "ansible_host": host_data.get("ansible_host"),
                     "groups": groups,
                     "ansible_groups": groups,
-                    "baseline_roles": host_data.get("baseline_roles") or [],
-                    "profiles": host_data.get("profiles") or [],
-                    "terraform": host_data.get("terraform") or {},
+                    "baseline_roles": public_names(host_data.get("baseline_roles")),
+                    "profiles": public_names(host_data.get("profiles")),
+                    # Allowlisted placement facts only: the merged block of a
+                    # hypervisor carries its Proxmox password, API token and SSH
+                    # key, and the monitoring serves its metadata to every viewer.
+                    "terraform": public_terraform(host_data.get("terraform")),
                     "site": site,
                     "stage": stage,
                     "ci_id": host_ci,
@@ -1280,12 +1284,15 @@ class DeploymentEngine:
                         "service_name": docker_name,
                         "service_slug": slug,
                         "name": docker_name,
-                        "state": service.get("state"),
-                        "desired_state": service.get("state"),
-                        "deploy_type": service.get("deploy_type"),
-                        "git_repo": service.get("git_repo"),
-                        "git_version": service.get("git_version"),
-                        "config": service.get("config") or {},
+                        "state": public_scalar(service.get("state")),
+                        "desired_state": public_scalar(service.get("state")),
+                        "deploy_type": public_scalar(service.get("deploy_type")),
+                        "git_repo": public_url(service.get("git_repo")),
+                        "git_version": public_scalar(service.get("git_version")),
+                        # Never the service's config block (vars + secrets of the
+                        # SSoT). The key stays, empty, so the consumer overwrites
+                        # what plugin versions <= 1.6.1 stored there.
+                        "config": {},
                         "groups": groups,
                         "ansible_groups": groups,
                         "site": site,
@@ -1354,26 +1361,13 @@ class DeploymentEngine:
     # Generic inventory event — consumed by any interested plugin
     # ------------------------------------------------------------------
 
-    # Credentials never leave the plugin on the bus: the merged terraform block
-    # can carry the Proxmox password/token and the SSH key.
-    _TERRAFORM_SECRET_KEYS = {"password", "token", "ssh_key", "api_token", "secret", "private_key"}
-
+    # Credentials never leave the plugin: the merged terraform block can carry
+    # the Proxmox password/token and the SSH key. Every outbound payload (bus,
+    # monitoring sync, snapshots) uses the allowlist in public_projection.
     @classmethod
     def _public_terraform(cls, block: dict | None) -> dict:
-        """Copy of a host's terraform block without any credential-like keys."""
-        out: dict = {}
-        for key, value in (block or {}).items():
-            lk = str(key).lower()
-            if (
-                lk in cls._TERRAFORM_SECRET_KEYS
-                or "password" in lk
-                or "secret" in lk
-                or lk.endswith("_token")
-                or lk.endswith("_key")
-            ):
-                continue
-            out[key] = value
-        return out
+        """Allowlisted, credential-free view of a host's terraform block."""
+        return public_terraform(block)
 
     def _build_inventory_hosts(self, inventory: dict | None = None) -> list[dict]:
         """Generic host list from the generated inventory (sync — YAML read)."""
@@ -1401,15 +1395,15 @@ class DeploymentEngine:
                 "hostname": host_data.get("hostname") or host_name,
                 "ip": host_data.get("ansible_host"),
                 "groups": groups,
-                "baseline_roles": host_data.get("baseline_roles") or [],
+                "baseline_roles": public_names(host_data.get("baseline_roles")),
                 "terraform": self._public_terraform(host_data.get("terraform")),
                 "entity_type": "hypervisor" if is_hypervisor else "host",
                 "site": next((g[len("site_"):] for g in groups if g.startswith("site_")), None),
                 "stage": next((g[len("stage_"):] for g in groups if g.startswith("stage_")), None),
                 # Maintenance windows (1.6): the host's own blocks travel with the event
                 # (consumers evaluate them with core.api.maintenance).
-                "maintenance": host_data.get("maintenance") if isinstance(host_data.get("maintenance"), dict) else None,
-                "incidents": host_data.get("incidents") if isinstance(host_data.get("incidents"), dict) else None,
+                "maintenance": scrub(host_data.get("maintenance")) if isinstance(host_data.get("maintenance"), dict) else None,
+                "incidents": scrub(host_data.get("incidents")) if isinstance(host_data.get("incidents"), dict) else None,
                 "ci_id": None,  # filled in by the Entity Registry when it is present
             })
         return hosts
