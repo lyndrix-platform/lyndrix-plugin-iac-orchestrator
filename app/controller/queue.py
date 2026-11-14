@@ -56,8 +56,11 @@ def from_queue_clock(naive: datetime | None) -> datetime | None:
         return None
     if naive.tzinfo is not None:
         return naive.astimezone(timezone.utc)
-    local_tz = datetime.now().astimezone().tzinfo
-    return naive.replace(tzinfo=local_tz).astimezone(timezone.utc)
+    # astimezone() on a naive value applies the local UTC offset valid AT THAT
+    # INSTANT. The former "today's offset" was one hour off for every value on
+    # the other side of a DST change (a deploy parked across the switch was
+    # shown and served an hour early/late — audit OC-18).
+    return naive.astimezone(timezone.utc)
 
 
 @dataclass(frozen=True)
