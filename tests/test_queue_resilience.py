@@ -57,12 +57,15 @@ def test_lines_survive_a_database_outage_in_order(q):
         w.MAX_RETRY_PAUSE = 0.02
         w.start(_spawn)
         w.append("before")
-        await asyncio.sleep(0.05)
+        while w.pending:
+            await asyncio.sleep(0.01)
         outage.down = True
         for n in range(5):
             w.append(f"during-{n}")
-            await asyncio.sleep(0.02)
-        assert w.pending == 5 and outage.calls > 2          # kept, and tried more than once
+        calls = outage.calls
+        while outage.calls < calls + 3:                     # tried more than once …
+            await asyncio.sleep(0.01)
+        assert w.pending == 5                               # … and kept
         outage.down = False
         w.append("after")
         await w.close()
@@ -82,7 +85,8 @@ def test_a_full_buffer_drops_the_oldest_lines_and_marks_the_gap(q):
         w.MAX_BUFFERED_LINES, w.MAX_RETRY_PAUSE = 10, 0.02
         w.start(_spawn)
         w.append("stored")
-        await asyncio.sleep(0.05)
+        while w.pending:                                    # in the database before the outage starts
+            await asyncio.sleep(0.01)
         outage.down = True
         for n in range(25):
             w.append(f"line-{n}")

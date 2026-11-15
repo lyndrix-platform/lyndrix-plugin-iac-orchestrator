@@ -142,9 +142,10 @@ def test_off_loop_uses_the_plugins_own_pool_and_keeps_the_context():
 def test_progress_writes_are_coalesced_the_newest_wins_and_the_last_is_written():
     """A thousand TASK lines against a database that answers slowly: one write
     in flight, one waiting — and what was pushed last is what is stored."""
-    release, writes = threading.Event(), []
+    release, started, writes = threading.Event(), threading.Event(), []
 
     def write(job_id, values):
+        started.set()
         release.wait(5)
         writes.append(dict(values))
 
@@ -154,7 +155,8 @@ def test_progress_writes_are_coalesced_the_newest_wins_and_the_last_is_written()
     async def scenario():
         async def produce():
             eng.push_progress(5, progress=1, current_step="Ansible: first")
-            await asyncio.sleep(0.05)                      # the first write is in flight now
+            while not started.is_set():                    # the first write is in flight now
+                await asyncio.sleep(0.005)
             for n in range(2, 1000):
                 eng.push_progress(5, progress=n, current_step=f"Ansible: task {n}")
             eng.push_progress(5, progress=None, current_step="Ansible: last")   # keeps progress 999
@@ -232,11 +234,12 @@ def test_a_late_progress_write_never_overtakes_the_terminal_write(iac_service, l
     svc = iac_service
     eng = svc.engine
     job_id = _claim(svc)
-    order, release = [], threading.Event()
+    order, release, started = [], threading.Event(), threading.Event()
     real_progress, real_close = svc.db.update_progress, svc.db.update_job
 
     def slow_progress(jid, progress=None, current_step=None, **kw):
         if current_step == "Ansible: slow":
+            started.set()
             release.wait(5)
         order.append(("progress", current_step))
         return real_progress(jid, progress, current_step, **kw)
@@ -249,7 +252,8 @@ def test_a_late_progress_write_never_overtakes_the_terminal_write(iac_service, l
 
     async def scenario():
         eng.push_progress(job_id, 60, "Ansible: slow")
-        await asyncio.sleep(0.05)                                   # in flight, hanging
+        while not started.is_set():                                 # in flight, hanging
+            await asyncio.sleep(0.005)
         eng.push_progress(job_id, 70, "Ansible: waiting")
         closing = asyncio.ensure_future(off_loop(eng.close_job_row, job_id, "SUCCESS", end_override=False))
         await asyncio.sleep(0.05)
