@@ -201,8 +201,8 @@ def test_mark_failed_is_conditional_on_running(q):
     b = q.enqueue({"pipeline_type": "connectivity"})
     q.claim_next("me")
     q.claim_next("other")
-    assert q.mark_failed(b, "Runner 'other' lost") is True
-    assert q.mark_failed(b, "again") is False  # no longer RUNNING
+    assert q.mark_failed(b, "Runner 'other' lost", token=_row(b).claim_token) is True
+    assert q.mark_failed(b, "again", token=_row(b).claim_token) is False  # no longer RUNNING
     with queue_mod.db_instance.SessionLocal() as s:
         assert s.get(IaCJob, a).status == "RUNNING" and s.get(IaCJob, b).status == "FAILED"
 
@@ -382,9 +382,9 @@ def test_override_bookkeeping_and_terminal_hook(q):
     ended = []
     q.on_terminal = ended.append
     q.set_override(a, "iac-job-x", [])
-    assert q.mark_failed(a, "Runner 'r1' lost") is True
+    assert q.mark_failed(a, "Runner 'r1' lost", token=_row(a).claim_token) is True
     assert ended == [a]
-    assert q.mark_failed(a, "again") is False and ended == [a]  # hook only on the real transition
+    assert q.mark_failed(a, "again", token=_row(a).claim_token) is False and ended == [a]  # hook only on the real transition
 
 
 def test_log_writer_keeps_order_when_a_flush_is_cancelled_mid_write(q):

@@ -313,7 +313,7 @@ class JobQueue:
     cheap; callers off-load them with ``asyncio.to_thread`` where it matters."""
 
     #: Called with the job id after this queue closed a job on a terminal path it
-    #: owns itself (``mark_failed`` → orphan sweep), so the engine can end the job's
+    #: owns itself (``fail_orphan``, ``mark_failed``), so the engine can end the job's
     #: maintenance override. Set by the service; may run in a worker thread.
     on_terminal: Callable[[int], None] | None = None
 
@@ -325,7 +325,14 @@ class JobQueue:
     lock_takeover_grace: "Callable[[], float] | float" = 1800.0
     _LOCK_GRACE_CACHE_SECONDS = 60.0
 
+    #: ``(job_id) -> bool | None``: store the result of a job that ended while the
+    #: database was away (``JobDatabase.finish_unwritten``; set by the service).
+    finish_terminal: Callable[[int], "bool | None"] | None = None
+
     def __init__(self):
+        # job id -> (status, claim token) the JobDatabase could not write when the
+        # job ended; the service shares the JobDatabase's dict (review C5).
+        self.unwritten_terminal: dict[int, tuple[str, str]] = {}
         self._lock_grace_cache: tuple[float, float] | None = None   # (read at, seconds)
         # job id -> claim token of the jobs THIS process executes. The service
         # shares one dict between the queue and the JobDatabase; while a token is
@@ -1390,14 +1397,19 @@ class JobQueue:
         finally:
             session.close()
 
-    def mark_failed(self, job_id: int, reason: str) -> bool:
-        """RUNNING → FAILED with ``reason`` as the last step (no-op when not RUNNING)."""
+    def mark_failed(self, job_id: int, reason: str, *, token: str | None) -> bool:
+        """RUNNING → FAILED with ``reason`` as the last step — conditional on the
+        claim the caller looked at (``token``; ``None`` = a row without one), like
+        every other terminal write (review C5): a row that was adopted or closed
+        since is left alone. No-op when not RUNNING."""
         session = self._session()
         if not session:
             return False
         try:
+            cond = [IaCJob.id == job_id, IaCJob.status == STATUS_RUNNING]
+            cond.append(IaCJob.claim_token == token if token else IaCJob.claim_token.is_(None))
             res = session.execute(
-                update(IaCJob).where(IaCJob.id == job_id, IaCJob.status == STATUS_RUNNING)
+                update(IaCJob).where(*cond)
                 .values(status=STATUS_FAILED, end_time=datetime.now(), current_step=reason[:250])
             )
             session.commit()
@@ -1897,13 +1909,20 @@ class JobWorker:
         """A row this incarnation claimed but nothing here executes (the claim's
         result got lost between the database and this loop): give it back to the
         queue when it never started, close it when it did (audit OC-03)."""
+        # A job that ENDED here but could not store its result (database away,
+        # review C5) is not "lost": write that result now. ``finish_terminal`` is
+        # set by the service (JobDatabase.finish_unwritten).
+        unwritten = self.queue.unwritten_terminal
+        for job_id in list(unwritten):
+            if self.queue.finish_terminal is not None:
+                await asyncio.to_thread(self.queue.finish_terminal, job_id)
         rows = await asyncio.to_thread(
             self.queue.own_unattended, self.ctx.instance_id, self.incarnation,
             self._attended(), 2 * self.heartbeat_seconds,
         )
         for row in rows:
             job_id = row["id"]
-            if job_id in self._attended():
+            if job_id in self._attended() or job_id in unwritten:
                 continue
             if not row["has_log"]:
                 if await asyncio.to_thread(self.queue.release, job_id, row["claim_token"],
@@ -1911,7 +1930,8 @@ class JobWorker:
                     self.ctx.log.warning(f"WORKER: job #{job_id} was claimed but never started — re-queued.")
                     self.wake()
             elif await asyncio.to_thread(
-                    self.queue.mark_failed, job_id, "Runner lost track of the job — re-trigger the pipeline"):
+                    lambda j=job_id, t=row["claim_token"]: self.queue.mark_failed(
+                        j, "Runner lost track of the job — re-trigger the pipeline", token=t)):
                 self.ctx.log.warning(f"WORKER: job #{job_id} is RUNNING without an executing task — closed as FAILED.")
 
     async def _heartbeat_loop(self) -> None:

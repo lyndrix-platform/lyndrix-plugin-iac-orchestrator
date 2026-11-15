@@ -48,6 +48,10 @@ class IaCService:
         # One claim registry for both stores: the runner-side writes of a claimed
         # job are conditional on its claim token (fencing).
         self.queue.claims = self.db.claims
+        # … and one registry of results that could not be written when a job
+        # ended (database away): the worker stores them later (review C5).
+        self.queue.unwritten_terminal = self.db.unwritten_terminal
+        self.queue.finish_terminal = self.db.finish_unwritten
         # Identity of THIS plugin load: "<core boot nonce>:<nonce>". Claims are
         # stamped with it, so a restarted runner (same instance id) can tell the
         # jobs it claimed itself from what its predecessor left behind.

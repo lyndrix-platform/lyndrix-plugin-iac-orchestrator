@@ -452,7 +452,7 @@ def test_end_override_for_emits_exactly_once(env):
     env.queue.on_terminal = env.engine.end_override_for
     jid2 = _claimed_job(env.queue, {**WEBHOOK, "service_name": "svc-b"})
     env.queue.set_override(jid2, f"iac-job-{jid2}", ["u-x"])
-    assert env.queue.mark_failed(jid2, "Runner lost")
+    assert env.queue.mark_failed(jid2, "Runner lost", token=_row(jid2).claim_token)
     assert (
         _emits(env.engine.ctx, mw.TOPIC_OVERRIDE_ENDED)[-1]["override_id"]
         == f"iac-job-{jid2}"

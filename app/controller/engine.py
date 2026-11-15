@@ -2225,11 +2225,17 @@ class DeploymentEngine:
                 # is already SCHEDULED — writing a terminal status would un-park it; a
                 # detached job is still running in its containers.
                 if not self.db.update_job(job_id=current_job_id, status=final_status):
-                    # Conditional write (fencing): the row was closed or taken
-                    # over elsewhere — the orphan sweep, an abort on another
-                    # instance, a newer incarnation. Its state stands.
-                    log.warning(f"[SYSTEM] Job #{current_job_id}: result {final_status} NOT written — "
-                                "the job was already closed or taken over elsewhere.")
+                    if current_job_id in getattr(self.db, "unwritten_terminal", {}):
+                        # The database did not take the write (review C5) — it is
+                        # kept and stored by the worker once the database is back.
+                        log.error(f"[SYSTEM] Job #{current_job_id}: result {final_status} could not be written — "
+                                  "the database is unreachable; it is written as soon as it answers again.")
+                    else:
+                        # Conditional write (fencing): the row was closed or taken
+                        # over elsewhere — the orphan sweep, an abort on another
+                        # instance, a newer incarnation. Its state stands.
+                        log.warning(f"[SYSTEM] Job #{current_job_id}: result {final_status} NOT written — "
+                                    "the job was already closed or taken over elsewhere.")
                 self.end_override_for(current_job_id)
             self._sync_runners(current_job_id, force=True)
             await self._close_log_writer(current_job_id)

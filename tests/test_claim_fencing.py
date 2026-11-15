@@ -249,7 +249,7 @@ def test_a_job_closed_elsewhere_is_never_overwritten(iac_service):
     svc.db.claims[job_id] = claim.token
     assert svc.db.update_progress(job_id, 10, "Stage: x") is True
     # the orphan sweep (or an abort on another instance) closes the row
-    assert svc.queue.mark_failed(job_id, "runner_lost: docker-auto-runner") is True
+    assert svc.queue.mark_failed(job_id, "runner_lost: docker-auto-runner", token=_row(job_id).claim_token) is True
     # the returning runner's writes are no-ops
     assert svc.db.update_job(job_id, "SUCCESS") is False
     assert svc.db.update_progress(job_id, 100, "Completed Successfully") is False
@@ -310,7 +310,7 @@ def test_worker_stops_a_fenced_job_and_its_containers(sqlite_queue):
             if w.owns(job_id):
                 break
         q_other = JobQueue()                                    # another instance: no claim registered
-        assert q_other.mark_failed(job_id, "runner_lost: docker-auto-runner")
+        assert q_other.mark_failed(job_id, "runner_lost: docker-auto-runner", token=_row(job_id).claim_token)
         for _ in range(100):
             await asyncio.sleep(0.02)
             if stopped:
@@ -329,7 +329,7 @@ def test_recovered_container_result_never_rewrites_a_closed_job(iac_service):
     job_id = svc.queue.enqueue({"pipeline_type": "connectivity"})
     token = svc.queue.claim_next(ME, svc.incarnation).token
     svc.db.claims[job_id] = token
-    assert svc.queue.mark_failed(job_id, "runner_lost: docker-auto-runner")
+    assert svc.queue.mark_failed(job_id, "runner_lost: docker-auto-runner", token=_row(job_id).claim_token)
     svc.engine._notify = MagicMock()
 
     async def watched(*a, **k):

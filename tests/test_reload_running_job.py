@@ -275,7 +275,7 @@ def test_containers_of_a_job_closed_elsewhere_are_stopped(iac_service, monkeypat
     """rD §3.4: the sweep failed the job while the runner was away — the returning
     runner stops the container instead of letting it finish (or rewriting the row)."""
     job_id = _detached_job(iac_service, last=True)
-    assert iac_service.queue.mark_failed(job_id, "runner_lost: docker-auto-runner")
+    assert iac_service.queue.mark_failed(job_id, "runner_lost: docker-auto-runner", token=_row(job_id).claim_token)
     new = _successor(iac_service, monkeypatch)
     seen, _ended = _recover(new, [_container(job_id)], {"aac-runner-x": (True, None)}, monkeypatch)
     stopped = []

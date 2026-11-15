@@ -1,9 +1,10 @@
 import json
 import logging
+import re
 from datetime import datetime
 from core.api import db_instance
 from .models import IaCJob, IaCJobLog, IaCState, IaCJobTask
-from sqlalchemy import or_, update
+from sqlalchemy import or_, select, update
 
 log = logging.getLogger("IaC:Database")
 
@@ -48,6 +49,50 @@ def retry_write(fn, *, attempts: int = 4, pause: float = 0.05):
             raise
 
 
+# Client-side connection errors of MariaDB/MySQL: cannot connect (2002/2003),
+# "server has gone away" (2006), "lost connection during query" (2013) — what a
+# VIP move, a pool connection the server dropped or a short network blip look
+# like. Matched as the driver prints them, "(2013, '…')".
+_CONNECTION_ERROR_RE = re.compile(r"\((?:2002|2003|2006|2013),")
+
+#: Pauses before a job's terminal status is written again after a lost
+#: connection (7.5 s in total — the write runs where the job ends).
+TERMINAL_RETRY_PAUSES = (0.5, 1.0, 2.0, 4.0)
+
+
+def is_connection_error(exc: Exception) -> bool:
+    if getattr(exc, "connection_invalidated", False):
+        return True
+    return bool(_CONNECTION_ERROR_RE.search(str(getattr(exc, "orig", exc))))
+
+
+def retry_terminal_write(tx, landed, *, pauses=TERMINAL_RETRY_PAUSES) -> bool:
+    """Run ``tx()`` — one complete conditional "close the job" transaction that
+    returns whether it changed the row — and try again after a lost connection
+    (bounded by ``pauses``), on top of the 1020/1205/1213 retry of
+    :func:`retry_write`.
+
+    A connection that breaks during COMMIT leaves the outcome unknown: the
+    server may have applied it. A later attempt then finds nothing to change —
+    ``landed()`` tells whether that is because OUR write is in the row (review
+    C5). Raises the last error when the database stays away.
+    """
+    import time as _time
+
+    lost_connection = False
+    for pause in (*pauses, None):
+        try:
+            done = bool(retry_write(tx))
+            return done or (lost_connection and bool(landed()))
+        except Exception as exc:
+            if pause is None or not is_connection_error(exc):
+                raise
+            lost_connection = True
+            log.warning("Terminal job write lost its connection (%s) — retrying in %.1fs.", exc, pause)
+            _time.sleep(pause)
+    return False  # not reached
+
+
 _DELETE_BATCH = 100
 
 
@@ -85,6 +130,17 @@ class JobDatabase:
         # for that job is conditional on it: a job closed or taken over by someone
         # else meanwhile is never overwritten (fencing).
         self.claims: dict[int, str] = {}
+        # job id -> (final status, claim token) of a claimed job whose terminal
+        # write could not reach the database even after the retries (review C5).
+        # The worker completes it when the database is back instead of closing
+        # the finished job as FAILED "lost track" (shared with the JobQueue).
+        self.unwritten_terminal: dict[int, tuple[str, str]] = {}
+        self._unwritten_attempts: dict[int, int] = {}
+
+    #: Later attempts to store an unwritten result before it is given up (the
+    #: worker tries every ~20 s → about 10 minutes). After that the job is closed
+    #: like any other job nothing executes: FAILED "Runner lost track of the job".
+    UNWRITTEN_MAX_ATTEMPTS = 30
 
     def _get_session(self):
         """Safely retrieves a database session if the central engine is connected."""
@@ -128,38 +184,88 @@ class JobDatabase:
         and — when this process holds the job's claim — only while the claim token
         still matches. A job the orphan sweep failed, an abort closed or a newer
         incarnation adopted is left alone (the caller learns it through ``False``).
+
+        A lost connection (2006/2013, …) is retried with a short bounded backoff
+        (review C5): the result of a finished job must not depend on one database
+        blip. If the database stays away, the status of a claimed job is kept in
+        ``unwritten_terminal`` for the worker to write later.
         """
         if job_id in (None, -1):
             return False
         token = self.claims.get(job_id)
-
-        def _tx():
-            session = self._get_session()
-            if not session:
-                return False
-            try:
-                cond = [IaCJob.id == job_id, IaCJob.status == "RUNNING"]
-                if token:
-                    cond.append(IaCJob.claim_token == token)
-                values: dict = {"status": status}
-                if status in ("SUCCESS", "FAILED", "ERROR", "ABORTED"):
-                    values["end_time"] = datetime.now()
-                    if status == "SUCCESS":
-                        values["progress"] = 100  # Snap to 100% on success
-                res = session.execute(update(IaCJob).where(*cond).values(**values))
-                session.commit()
-                return res.rowcount == 1
-            except Exception:
-                session.rollback()
-                raise
-            finally:
-                session.close()
-
         try:
-            return bool(retry_write(_tx))
+            done = retry_terminal_write(lambda: self._close_tx(job_id, status, token),
+                                        lambda: self._closed_as(job_id, status, token))
+            self.unwritten_terminal.pop(job_id, None)
+            self._unwritten_attempts.pop(job_id, None)
+            return done
         except Exception as e:
             log.error(f"Failed to update job {job_id} in DB: {e}")
+            if token:
+                self.unwritten_terminal[job_id] = (status, token)
             return False
+
+    def _close_tx(self, job_id: int, status: str, token: str | None) -> bool:
+        """One transaction: RUNNING (and still our claim) → ``status``."""
+        session = self._get_session()
+        if not session:
+            return False
+        try:
+            cond = [IaCJob.id == job_id, IaCJob.status == "RUNNING"]
+            if token:
+                cond.append(IaCJob.claim_token == token)
+            values: dict = {"status": status}
+            if status in ("SUCCESS", "FAILED", "ERROR", "ABORTED"):
+                values["end_time"] = datetime.now()
+                if status == "SUCCESS":
+                    values["progress"] = 100  # Snap to 100% on success
+            res = session.execute(update(IaCJob).where(*cond).values(**values))
+            session.commit()
+            return res.rowcount == 1
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    def _closed_as(self, job_id: int, status: str, token: str | None) -> bool:
+        """Does the row carry ``status`` under our claim — i.e. did a write whose
+        acknowledgement got lost land after all?"""
+        session = self._get_session()
+        if not session:
+            return False
+        try:
+            row = session.execute(select(IaCJob.status, IaCJob.claim_token).where(IaCJob.id == job_id)).first()
+            return bool(row) and row[0] == status and (not token or row[1] == token)
+        finally:
+            session.close()
+
+    def finish_unwritten(self, job_id: int) -> bool | None:
+        """Write the terminal status a job could not store when it ended. ``True``
+        written now, ``False`` nothing to do any more (the row is not RUNNING
+        under that claim: the write had landed, or the job was closed elsewhere),
+        ``None`` the database is still away — try again later."""
+        pending = self.unwritten_terminal.get(job_id)
+        if pending is None:
+            return False
+        status, token = pending
+        try:
+            done = bool(retry_write(lambda: self._close_tx(job_id, status, token)))
+        except Exception as exc:
+            attempts = self._unwritten_attempts.get(job_id, 0) + 1
+            if attempts >= self.UNWRITTEN_MAX_ATTEMPTS:
+                log.error(f"Job {job_id}: giving up writing its final status {status} after {attempts} attempts: {exc}")
+                self.unwritten_terminal.pop(job_id, None)
+                self._unwritten_attempts.pop(job_id, None)
+                return False
+            self._unwritten_attempts[job_id] = attempts
+            log.warning(f"Job {job_id}: final status {status} still not written: {exc}")
+            return None
+        self.unwritten_terminal.pop(job_id, None)
+        self._unwritten_attempts.pop(job_id, None)
+        if done:
+            log.warning(f"Job {job_id}: final status {status} written late (the database was unreachable when it ended).")
+        return done
 
     def get_recent_jobs(self, limit: int = 20) -> list:
         """Fetches metadata for the UI table."""

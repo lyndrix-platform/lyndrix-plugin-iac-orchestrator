@@ -323,7 +323,7 @@ def test_fenced_stop_is_retried_and_gives_up_loudly(iac_service, monkeypatch):
 def test_leftover_containers_of_a_closed_job_are_stopped_after_docker_recovers(iac_service, monkeypatch):
     svc = iac_service
     job_id = _previous_job(svc, lock=None)
-    assert svc.queue.mark_failed(job_id, "runner_lost: docker-auto-runner")
+    assert svc.queue.mark_failed(job_id, "runner_lost: docker-auto-runner", token=_row(job_id).claim_token)
     new = _successor(svc, monkeypatch)
     docker = _Docker([_container(job_id)])
     new.engine._list_job_containers = docker.list
