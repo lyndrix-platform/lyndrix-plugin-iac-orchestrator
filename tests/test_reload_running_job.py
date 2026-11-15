@@ -337,3 +337,34 @@ def test_watcher_skips_stored_lines_but_parses_them(monkeypatch):
     assert ok and stats["successful_hosts"] == 1              # the recap was among the skipped lines
     assert [c.args[1] for c in eng._log_line.call_args_list] == ["[x] late line"]
     eng.db.update_progress.assert_not_called()                # no progress replay for old lines
+
+
+def test_a_lease_granted_during_shutdown_starts_no_new_loop(iac_service, monkeypatch):
+    """Staging 2026-11-15 (cluster-wide disable): the k3s leader released
+    ``iac:webhook_sync``/the sweep lease first, the runner — already in its
+    teardown — was granted it and started the webhook-sync loop. The core then
+    waited its whole teardown budget (15 s) for that new task. A lease callback
+    that fires during shutdown must not start work."""
+    svc = iac_service
+    started = []
+    monkeypatch.setattr(svc.sweeper, "start", lambda: started.append("sweep"))
+    monkeypatch.setattr(svc.ctx, "create_task", lambda coro, name=None: (coro.close(), started.append(name)))
+
+    async def scenario():
+        await svc.shutdown(reason="plugin reload", budget=1)
+        svc.start_webhook_sync()        # lease "acquired" callbacks during teardown
+        svc._start_sweeper()
+
+    asyncio.run(scenario())
+    assert started == []
+    assert getattr(svc, "_webhook_sync_task", None) is None
+
+
+def test_lease_callbacks_start_the_loops_before_shutdown(iac_service, monkeypatch):
+    svc = iac_service
+    started = []
+    monkeypatch.setattr(svc.sweeper, "start", lambda: started.append("sweep"))
+    monkeypatch.setattr(svc.ctx, "create_task", lambda coro, name=None: (coro.close(), started.append(name)))
+    svc.start_webhook_sync()
+    svc._start_sweeper()
+    assert started == ["iac:webhook_sync_loop", "sweep"]

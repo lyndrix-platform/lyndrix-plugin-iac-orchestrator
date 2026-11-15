@@ -182,7 +182,7 @@ class IaCService:
                 self.sweeper.start()
             return
         if want and not self._sweep_lease_wanted:
-            on_lease(SWEEP_LEASE, acquired=self.sweeper.start, lost=self.sweeper.stop)
+            on_lease(SWEEP_LEASE, acquired=self._start_sweeper, lost=self.sweeper.stop)
             self._sweep_lease_wanted = True
         elif not want and self._sweep_lease_wanted:
             release = getattr(self.ctx, "release_lease", None)
@@ -616,8 +616,22 @@ class IaCService:
 
     # -- webhook auto-sync: one instance (lease) -----------------------------
     def start_webhook_sync(self) -> None:
+        # A lease can be granted while this incarnation is already shutting down
+        # (cluster-wide disable: the peer that held it releases first, our
+        # interest is still registered until dispose). A loop started now is
+        # new work in the middle of teardown — the core then waits its whole
+        # teardown budget for it (staging 2026-11-15: 15 s, "cancelling 1 task").
+        if getattr(self, "_shutting_down", False):
+            return
         if getattr(self, "_webhook_sync_task", None) is None:
             self._webhook_sync_task = self.ctx.create_task(self.run_webhook_sync_loop(), name="iac:webhook_sync_loop")
+
+    def _start_sweeper(self) -> None:
+        """Lease callback for the orphan sweep: never start it during shutdown
+        (see :meth:`start_webhook_sync`)."""
+        if getattr(self, "_shutting_down", False):
+            return
+        self.sweeper.start()
 
     def stop_webhook_sync(self) -> None:
         task = getattr(self, "_webhook_sync_task", None)

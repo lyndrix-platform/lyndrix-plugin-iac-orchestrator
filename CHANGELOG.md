@@ -137,7 +137,13 @@ No credential has to be changed for the upgrade: the existing webhook token keep
   marker when it overflowed); log age uses UTC; enqueue retries on 1020/1205/1213 (review C7).
 - The abort endpoint keeps jobs whose containers could not be stopped attended and names them (`unstopped_jobs`, shown
   in the UI toast); a late teardown stops only its own service.
-- The suite has 547 tests (124 on 1.6.1) and passes on core 1.11.1 and on the planned core 1.12.0.
+- **The test suite can no longer reach the host's Docker daemon (staging O-2).** One test ran the start-up
+  reconciliation unmocked: on a runner host it listed the real runner containers and removed those whose job was not
+  RUNNING in the test database. Tests now fail when they call `docker`, and a stub `docker` is first on `PATH` for
+  the whole session. Never run the suite of an older tree on a runner host.
+- A lease granted while the plugin is shutting down starts no new loop, so a cluster-wide disable no longer runs into
+  the core's teardown timeout (staging O-3).
+- The suite has 558 tests (124 on 1.6.1) and passes on core 1.11.1 and on the planned core 1.12.0.
 
 ## [1.6.1] - 2026-11-11
 Forward-port of the complete 1.5.x hotfix line (1.5.1–1.5.7, core < 1.11) plus the runner-presence fix from the 2026-11-11 incident. Requires core ≥ 1.11.0 (API 1.13) like 1.6.0; no schema migration (the queue columns are added idempotently by `JobQueue.ensure_schema` as before).

@@ -191,7 +191,7 @@ def test_control_plane_instances_contend_runners_only_when_alone(iac_service):
     svc.review_sweep_lease()
     svc.review_sweep_lease()
     assert ctx.on_lease.call_count == 1 and ctx.on_lease.call_args.args[0] == LEASE_NAME
-    assert ctx.on_lease.call_args.kwargs["acquired"] == svc.sweeper.start
+    assert ctx.on_lease.call_args.kwargs["acquired"] == svc._start_sweeper
 
     ctx = _lease_ctx(svc, roles=["runner"], instances=_view(RUNNER, POD))
     svc._sweep_lease_wanted = False
