@@ -207,7 +207,7 @@ def test_repo_snapshots_are_clean(tmp_path, monkeypatch):
     monkeypatch.setattr(api_mod, "_ctx", MagicMock())
 
     counts = api_mod.publish_repo_snapshots()
-    assert set(counts) == {"catalog", "assignments", "terraform_hosts", "inventory_hosts"}
+    assert set(counts) == {"catalog", "assignments", "terraform_hosts", "inventory_hosts", "branch_policy"}
     assert _clean(stored)
     catalog = stored["snapshot:catalog"]["items"]
     assert catalog == [{"name": "aac-grafana", "repository_name": "aac-grafana",

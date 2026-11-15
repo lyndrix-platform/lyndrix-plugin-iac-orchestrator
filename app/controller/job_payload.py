@@ -52,7 +52,7 @@ _SHA_RE = re.compile(r"^[0-9a-fA-F]{7,64}$")
 _MAX_TARGET_SERVICES = 500
 
 _NAME_KEYS = ("service_name", "service_branch", "host_name", "test_host", "limit")
-_BOOL_KEYS = ("dry_run", "manual", "adopt_existing", "skip_bootstrap", "skip_service_deploy",
+_BOOL_KEYS = ("dry_run", "manual", "adopt_existing", "skip_bootstrap", "skip_service_deploy", "require_prod_branch",
               "skip_rollout", "approve", "force")
 _LABEL_KEYS = ("trigger", "source")
 _INT_KEYS = ("plan_job_id", "source_pipeline_id", "followup_of")

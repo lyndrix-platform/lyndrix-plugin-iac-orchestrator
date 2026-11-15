@@ -37,7 +37,7 @@ from .settings_schema import (
 )
 from .queue import DuplicateJob as _DuplicateJob, SubmitResult
 from .job_payload import ENT_APPROVE, ENT_TRIGGER, InvalidJobPayload
-from . import plan_binding
+from . import branch_policy, plan_binding
 from . import maintenance_resolver as _mres
 from .offloop import off_loop
 from .public_projection import public_catalog_entry, public_scalar
@@ -636,6 +636,9 @@ def publish_repo_snapshots() -> dict:
         ("assignments", _load_assignments_from_disk),
         ("terraform_hosts", _collect_terraform_hosts_from_disk),
         ("inventory_hosts", lambda: sorted(_load_generated_inventory_hosts())),
+        # Branch → target policy of the catalog (audit OS-05): instances without a
+        # checkout judge a trigger's branch by it.
+        ("branch_policy", lambda: branch_policy.load(_engine.config.git_repos_dir) or {}),
     ):
         try:
             items = loader()
@@ -717,7 +720,15 @@ async def do_gitlab_webhook(request: Request, x_gitlab_token: str | None):
             )
             return {"status": "accepted", "triggered": False, "reason": event_reason}
 
-        result = await _submit(event_payload, ENT_TRIGGER)
+        try:
+            result = await _submit(event_payload, ENT_TRIGGER)
+        except HTTPException as exc:
+            if exc.status_code != 400:
+                raise
+            # A refused event (e.g. a pipeline of a branch that may not be
+            # deployed, audit OS-05) is still a delivered hook: 200, not triggered.
+            _ctx.log.warning(f"WEBHOOK: event not triggered — {exc.detail}")
+            return {"status": "accepted", "triggered": False, "reason": str(exc.detail)}
         # Always 200 for GitLab (a hook that answers 4xx gets disabled); whether a
         # job runs the event is in ``triggered`` / ``outcome``.
         return {"status": "accepted", "triggered": result.queued,

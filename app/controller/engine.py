@@ -25,7 +25,7 @@ from .public_projection import public_names, public_scalar, public_terraform, pu
 from .config import allowed_registry_hosts, registry_host
 from .settings_schema import resolve_credential
 from .offloop import CoalescedWriter, off_loop
-from . import plan_binding
+from . import branch_policy, plan_binding
 from .runner_output import RunnerOutputParser
 from .redaction import SecretRedactor, secret_values_of
 from ...stages.git import (
@@ -353,6 +353,35 @@ class MaintenancePolicyStage(BaseStage):
         elif marks_maintenance and not decision.ci_ids:
             log.info("[MAINTENANCE] No CI ids for the target hosts (Entity Registry absent) — no override event.")
         return StageResult(True, f"Maintenance policy '{decision.deploy_policy}': {message}")
+
+
+class BranchPolicyStage(BaseStage):
+    """The runner's check of branch → target (audit OS-05): the catalog was just
+    synced, so this is the authoritative one — the check at trigger time may
+    have had an older snapshot, or none. A branch that is neither the service's
+    production branch nor a dev/test branch is not cloned and not deployed."""
+
+    def __init__(self, payload: dict):
+        super().__init__(f"Branch Policy: {payload.get('service_name')}")
+        self.payload = payload or {}
+
+    async def run(self, engine, context: dict) -> StageResult:
+        try:
+            policy = await off_loop(branch_policy.load, engine.base_git_dir)
+        except Exception as exc:
+            return StageResult(False, f"The service catalog could not be read ({exc}) — the branch cannot be "
+                                      "checked, nothing was deployed.")
+        if policy is None:
+            # No catalog at all: there is nothing a branch could be measured by
+            # (and CloneServiceRepoStage falls back to its default URL, as before).
+            log.warning("Branch policy: no service catalog in the iac-controller checkout — not checked.")
+            return StageResult(True, "No service catalog — branch policy not checked")
+        refused = branch_policy.violation(policy, self.payload)
+        if refused:
+            return StageResult(False, f"Refused: {refused}. Nothing was cloned or deployed.")
+        stage = branch_policy.stage_of(policy, self.payload.get("service_name"),
+                                       self.payload.get("service_branch") or "main")
+        return StageResult(True, f"Branch allowed ({stage})")
 
 
 class StatePrepareStage:
@@ -966,6 +995,7 @@ class SingleServiceStrategy(PipelineStrategy):
         # "service" category / trigger endpoints either way.
         playbook_path, extra_roles = service_rollout_selector(engine, svc_name)
         return [
+            BranchPolicyStage(payload),
             CloneServiceRepoStage(svc_name, svc_branch, payload),
             # Maintenance windows (1.6): decide on the fresh service.yml whether to
             # run now, park until the window, or run with a warning; marks the override.

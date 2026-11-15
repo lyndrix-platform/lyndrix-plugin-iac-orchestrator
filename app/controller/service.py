@@ -19,6 +19,7 @@ from .queue import JobQueue, JobWorker, DuplicateJob, EnqueueResult, SubmitResul
 from .socket_client import SocketBusClient
 from .gitlab_webhooks import sync_group_webhooks_from_ctx, WebhookConfigError
 from .job_payload import InvalidJobPayload, strip_unentitled, validate_structure
+from . import branch_policy
 from .orphan_sweep import LEASE_NAME as SWEEP_LEASE, OrphanSweeper
 
 log = logging.getLogger("IaC:Service")
@@ -455,6 +456,14 @@ class IaCService:
         # A trigger that arrives while this load still prepares the tables waits
         # for that (bounded) instead of failing on a missing column.
         await self.wait_bootstrapped(timeout=30.0)
+        # Branch → target (audit OS-05), for every trigger source: this is the
+        # one door. Without a policy to judge by (no checkout here and no
+        # snapshot yet) the runner decides — it checks again in any case.
+        if clean.get("pipeline_type") == "single_service":
+            refused = branch_policy.violation(await off_loop(self.branch_policy), clean)
+            if refused:
+                log.warning(f"ENQUEUE: trigger refused — {refused}.")
+                raise InvalidJobPayload(refused)
         who = requested_by or clean.get("trigger") or ("ui" if clean.get("manual") else "webhook")
         target = clean.get("service_name") or clean.get("host_name") or clean.get("limit") or clean.get("pipeline_type")
         try:
@@ -481,6 +490,28 @@ class IaCService:
                                      "info")
             return SubmitResult(res.job_id, "coalesced")
         return SubmitResult(res.job_id, "promoted" if res.promoted else "queued")
+
+    #: Snapshot (``iac_orchestrator_state``) the runner publishes the policy under.
+    BRANCH_POLICY_SNAPSHOT = "snapshot:branch_policy"
+
+    def branch_policy(self) -> dict | None:
+        """The branch → target policy of the service catalog: from the
+        iac-controller checkout on an instance that has one (the runner), else
+        from the snapshot the runner published. ``None`` when neither exists.
+        Synchronous (YAML / database): call it off the loop."""
+        try:
+            policy = branch_policy.load(self.config.git_repos_dir)
+            if policy is not None:
+                return policy
+        except Exception as exc:
+            log.warning(f"IaC Orchestrator: service catalog unreadable for the branch policy: {exc}")
+        try:
+            record = self.db.get_state(self.BRANCH_POLICY_SNAPSHOT) or {}
+            items = (record.get("data") or {}).get("items")
+            return items if isinstance(items, dict) and items.get("prod") else None
+        except Exception as exc:
+            log.debug(f"IaC Orchestrator: branch policy snapshot unreadable: {exc}")
+            return None
 
     def _notify_trigger(self, title: str, message: str, level: str) -> None:
         try:
