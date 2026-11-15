@@ -2838,6 +2838,82 @@ class DeploymentEngine:
             if isinstance(data, dict) and data.get("job_id") and data.get("status") in self._LIVE_TASK_STATUSES
         }
 
+    # -- what a runner container may write (audit OS-06 A) -----------------------------
+    #: Where a job's scratch directory appears inside its Ansible containers.
+    SCRATCH_MOUNT = "/data/scratch"
+
+    def _git_dirs_to_mask(self) -> list[str]:
+        """Container paths of every ``.git`` directory below the two mounted
+        trees (core repositories and service checkouts). Sync (directory scan)."""
+        masks = []
+        for root, mount in ((self.base_git_dir, "/data/storage/git_repos"),
+                            (self.config.services_dir, "/data/storage/services")):
+            try:
+                for git_dir in sorted(Path(root).glob("*/.git")):
+                    if git_dir.is_dir():
+                        masks.append(f"{mount}/{git_dir.parent.name}/.git")
+            except OSError as exc:
+                log.warning(f"[Runner] could not list the checkouts below {root}: {exc}")
+        return masks
+
+    def _ansible_mounts(self, job_id, h_git: str, h_svc: str, readonly: bool) -> list[str]:
+        """``docker run`` mount options of an Ansible runner. Sync (directory
+        scan, mkdir): call through ``off_loop``.
+
+        Read-only mode (setting ``runner_readonly_mounts``, default on):
+
+        * ``git_repos`` and ``services`` are mounted READ-ONLY. The container
+          reads playbooks, roles, the inventory snapshot, the service checkout
+          and its SSH key file from them; it builds in its own filesystem
+          (``/tmp/aac_builds``) and deploys over SSH. It used to have both trees
+          read-write: a playbook, a role or a service repository could rewrite
+          another repository, the generated inventory — or plant
+          ``.git/hooks``/``.git/config`` that git on the core side runs later.
+        * every ``.git`` below them is hidden behind an empty read-only tmpfs —
+          history, remotes and credentials old clones kept in ``.git/config``
+          are none of the playbook's business;
+        * a per-job scratch directory is mounted read-write at
+          ``/data/scratch`` (``IAC_SCRATCH_DIR``) for anything a playbook wants
+          to keep between its containers; it is removed with the job's
+          inventory snapshot.
+        """
+        if not readonly:
+            return ["-v", f"{h_git}:/data/storage/git_repos", "-v", f"{h_svc}:/data/storage/services"]
+        args = ["-v", f"{h_git}:/data/storage/git_repos:ro", "-v", f"{h_svc}:/data/storage/services:ro"]
+        for path in self._git_dirs_to_mask():
+            args += ["--tmpfs", f"{path}:ro,size=64k,mode=0555"]
+        if job_id and job_id > 0:
+            scratch_rel = f".job_snapshots/job_{job_id}/scratch"
+            try:
+                (self.base_git_dir / scratch_rel).mkdir(parents=True, exist_ok=True)
+                args += ["-v", f"{h_git}/{scratch_rel}:{self.SCRATCH_MOUNT}:rw",
+                         "-e", f"IAC_SCRATCH_DIR={self.SCRATCH_MOUNT}"]
+            except OSError as exc:
+                log.warning(f"[Runner] no scratch directory for job #{job_id}: {exc}")
+        return args
+
+    def _terraform_mounts(self, h_git: str, run_rel_dir: str, readonly: bool) -> list[str]:
+        """``docker run`` mount options of a Terraform runner.
+
+        Read-only mode: tofu gets ITS run directory read-write — the rendered
+        environment with its modules, ``.terraform``, the lock file, the plan
+        file — and nothing else of ``git_repos`` (it had all of it read-write,
+        ``.git`` directories included). The provider cache is mounted read-only:
+        a run cannot replace a provider binary that later runs execute with the
+        hypervisor credentials. See the ``init`` fallback in
+        ``execute_terraform_docker`` for a cache that lacks a provider.
+        """
+        providers = getattr(self.config, "host_terraform_providers_dir", None)
+        if not readonly:
+            args = ["-v", f"{h_git}:/data/storage/git_repos:rw"]
+            if providers:
+                args += ["-v", f"{providers}:/data/storage/terraform-providers:rw"]
+            return args
+        args = ["-v", f"{h_git}/{run_rel_dir}:/data/storage/git_repos/{run_rel_dir}:rw"]
+        if providers:
+            args += ["-v", f"{providers}:/data/storage/terraform-providers:ro"]
+        return args
+
     #: Seconds a Terraform container gets to finish its current state write on abort.
     _TF_STOP_GRACE_SECONDS = 30
 
@@ -3622,9 +3698,9 @@ class DeploymentEngine:
         # The binary, the auto-apply switch and the image are settings (Vault):
         # read together, off the loop. The image check may raise — as before,
         # before anything is locked or started.
-        tf_bin, auto_apply, tf_image = await off_loop(lambda: (
+        tf_bin, auto_apply, tf_image, readonly = await off_loop(lambda: (
             str(self.config.terraform_binary or "tofu").strip(), bool(self.config.auto_apply),
-            self._runner_image("terraform")))
+            self._runner_image("terraform"), bool(getattr(self.config, "runner_readonly_mounts", False))))
         target_flags = "".join(f" -target='{t}'" for t in (targets or []))
         run_dir = f"/data/storage/git_repos/{run_rel_dir}"
         do_apply = mode in ("apply", "apply_saved") and not dry and (force_apply or auto_apply)
@@ -3667,6 +3743,15 @@ class DeploymentEngine:
         import_cmd = ""
         if import_specs and not dry and (mode == "import" or do_apply):
             import_cmd = self._build_import_cmd(tf_bin, import_specs)
+        init_cmd = f"{tf_bin} init -input=false -no-color"
+        if readonly:
+            # The provider cache is read-only. A provider (version) it does not
+            # hold cannot be added to it by this run: install into the run dir
+            # instead of failing — slower, and said so in the job log, so the
+            # cache gets filled deliberately (docs: "Runner-Container: Mounts").
+            init_cmd = (f"{{ {init_cmd} || {{ echo '[TF] init with the read-only provider cache failed — "
+                        f"retrying without the cache (providers are installed into the run dir)'; "
+                        f"unset TF_PLUGIN_CACHE_DIR; {init_cmd}; }}; }}")
         # stderr is folded into stdout so tofu's "Error:" blocks reach the job log
         # in order, and the EXIT trap names the failing step + exit code — before,
         # a failure right after `init` left nothing in the job log but the FATAL.
@@ -3675,12 +3760,15 @@ class DeploymentEngine:
             "trap 'rc=$?; if [ \"$rc\" -ne 0 ]; then "
             "echo \"[TF] step <$STEP> failed with exit code $rc\"; fi; exit \"$rc\"' EXIT; "
             f"cd '{run_dir}'; "
-            f"{tf_bin} init -input=false -no-color; "
+            f"{init_cmd}; "
             f"STEP=import; {import_cmd}"
             f"STEP={mode}; {action_cmd}"
         )
 
         h_git = self.config.host_git_repos_dir
+        # Mounts: only this run's directory read-write and the provider cache
+        # read-only (setting runner_readonly_mounts), else the whole tree as before.
+        tf_mounts = self._terraform_mounts(h_git, run_rel_dir, readonly)
         # Spawned with the docker CLI like the Ansible runner (not via the core's
         # docker:spawn, which cannot set labels): the labels are what abort and
         # restart recovery find the container by (audit OC-02).
@@ -3690,10 +3778,8 @@ class DeploymentEngine:
             "--label", "iac_kind=terraform", "--label", f"iac_tf_mode={mode}",
             "-e", f"IAC_JOB_ID={job_id}", "-e", "TF_IN_AUTOMATION=1", "-e", "CHECKPOINT_DISABLE=1",
             "-e", "TF_PLUGIN_CACHE_DIR=/data/storage/terraform-providers",
-            "-v", f"{h_git}:/data/storage/git_repos:rw",
+            *tf_mounts,
         ]
-        if getattr(self.config, "host_terraform_providers_dir", None):
-            cmd += ["-v", f"{self.config.host_terraform_providers_dir}:/data/storage/terraform-providers:rw"]
         # No --rm: a fast-failing tofu run would otherwise vanish before
         # `docker logs -f` drained it and before `docker wait` read the exit code
         # (→ empty output, swallowed error). _watch_detached_runner removes it.
@@ -4529,15 +4615,17 @@ class DeploymentEngine:
 
             # Image and diff mode are settings (Vault). The image check may raise
             # — inside this try, so the task ends as "error" as before.
-            ansible_image, diff_mode = await off_loop(lambda: (
-                self._runner_image("ansible"), getattr(self.config, "ansible_diff_mode", "dry_run")))
+            ansible_image, diff_mode, readonly = await off_loop(lambda: (
+                self._runner_image("ansible"), getattr(self.config, "ansible_diff_mode", "dry_run"),
+                bool(getattr(self.config, "runner_readonly_mounts", False))))
+            mounts = await off_loop(self._ansible_mounts, job_id, h_git, h_svc, readonly)
 
             cmd = [
                 "docker", "run", "-d", "--name", c_name, "--pull", "always",
                 "--label", f"iac_job_id={job_id}", "--label", f"iac_task_name={task_name}",
                 "--label", "iac_kind=ansible",
                 "-e", f"IAC_JOB_ID={job_id}",
-                "-v", f"{h_git}:/data/storage/git_repos", "-v", f"{h_svc}:/data/storage/services",
+                *mounts,
                 "-e", "ANSIBLE_HOST_KEY_CHECKING=False", "-e", "PYTHONUNBUFFERED=1", "-e", "ANSIBLE_NOCOLOR=1", "-e", "ANSIBLE_DEPRECATION_WARNINGS=0", "-e", "ANSIBLE_INTERPRETER_PYTHON=auto_silent",
                 "-e", f"ANSIBLE_ROLES_PATH={ansible_roles_path}", "-e", "PYTHONPATH=/data/storage/git_repos/aac_factory/scripts",
                 "--entrypoint", "",

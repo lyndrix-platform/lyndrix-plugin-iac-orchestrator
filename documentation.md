@@ -366,6 +366,25 @@ Der Default-Schalter `maintenance_default.enabled` ist **kein** Setting — er l
 
 ---
 
+### Runner-Container: Mounts (Audit OS-06)
+
+Setting `runner_readonly_mounts` (Kategorie *Runner*, Standard **an**; Vault `iac_runner_readonly_mounts`, Env `PLUGIN_IAC_ORCHESTRATOR_RUNNER_READONLY_MOUNTS`):
+
+| Container | Pfad im Container | an (Standard) | aus (wie ≤ 1.6.1) |
+|---|---|---|---|
+| Ansible | `/data/storage/git_repos` | **read-only**, jedes `<repo>/.git` durch ein leeres read-only-tmpfs verdeckt | read-write |
+| Ansible | `/data/storage/services` | **read-only**, jedes `<service>/.git` verdeckt | read-write |
+| Ansible | `/data/scratch` (`IAC_SCRATCH_DIR`) | read-write, pro Job (`git_repos/.job_snapshots/job_<id>/scratch`), wird mit dem Job-Snapshot gelöscht | — |
+| tofu | `/data/storage/git_repos/<Run-Dir des Jobs>` | **nur dieses Verzeichnis**, read-write | ganz `git_repos` read-write |
+| tofu | `/data/storage/terraform-providers` | **read-only** | read-write |
+
+Hintergrund: Die Container führen Inhalte aus Repositories aus (Playbooks, Rollen, Service-Repos, Provider). Mit Schreibrechten auf die Checkouts konnten sie andere Repositories, das generierte Inventar oder `.git/hooks`/`.git/config` verändern — git im Core führt das später aus.
+
+Hinweise für den Betrieb:
+
+- Der Ansible-Container baut weiterhin in seinem eigenen Dateisystem (`/tmp/aac_builds`) und deployt per SSH; der SSH-Key wird aus `services/.iac_keys/` gelesen. Ein Playbook, das **in den Checkout schreiben** muss, scheitert mit „Read-only file system“ → entweder nach `/data/scratch` schreiben oder das Setting ausschalten.
+- Fehlt dem read-only Provider-Cache ein Provider (neue Version), wiederholt der Lauf `tofu init` ohne Cache und installiert in sein Run-Dir (Job-Log: „init with the read-only provider cache failed — retrying without the cache“). Das funktioniert, ist aber langsamer und lädt bei jedem Lauf neu. **Cache gezielt füllen:** das Setting kurz ausschalten, einen Plan (Check Env) laufen lassen, wieder einschalten.
+
 ## React-Routen
 
 | Pfad | Sichtbar in Sidebar | Beschreibung |

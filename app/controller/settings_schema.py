@@ -382,6 +382,15 @@ def _build_fields() -> list[SettingField]:
                         "to come back and re-attach.",
         ),
         SettingField(
+            "runner_readonly_mounts", "Read-only repository mounts", kind="bool", category="Runner",
+            default=True, bool_format="lower", vault_key="iac_runner_readonly_mounts",
+            env_var="PLUGIN_IAC_ORCHESTRATOR_RUNNER_READONLY_MOUNTS",
+            description="Runner containers cannot write the repositories: Ansible gets git_repos and services "
+                        "read-only (with .git hidden) plus a scratch dir per job (/data/scratch); tofu gets only "
+                        "its run dir read-write and the provider cache read-only. Switch off only if a playbook "
+                        "must write into the tree — that restores the old read-write mounts.",
+        ),
+        SettingField(
             "job_max_runtime_seconds", "Maximum job runtime (s)", kind="int", category="Runner",
             default=21600, minimum=0, maximum=2592000, vault_key="iac_job_max_runtime_seconds",
             env_var="PLUGIN_IAC_ORCHESTRATOR_JOB_MAX_RUNTIME_SECONDS", rule="runtime_limit",

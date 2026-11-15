@@ -209,6 +209,15 @@ class IaCConfig:
         return self._get_int("PLUGIN_IAC_ORCHESTRATOR_ORPHAN_SWEEP_CONTAINER_GRACE_SECONDS",
                              "iac_orphan_sweep_container_grace_seconds", 1800, minimum=60)
 
+    @property
+    def runner_readonly_mounts(self) -> bool:
+        """Runner containers get the repositories read-only (audit OS-06 A):
+        Ansible reads ``git_repos``/``services`` and writes only its scratch
+        dir; tofu writes only its run dir, the provider cache is read-only.
+        On by default; off restores the read-write mounts of <= 1.6.1 (for a
+        playbook that turns out to write into the tree)."""
+        return self._get_bool("PLUGIN_IAC_ORCHESTRATOR_RUNNER_READONLY_MOUNTS", "iac_runner_readonly_mounts", True)
+
     #: Smallest limit that is honoured — anything below would stop ordinary jobs.
     JOB_MAX_RUNTIME_FLOOR_SECONDS = 600
 
