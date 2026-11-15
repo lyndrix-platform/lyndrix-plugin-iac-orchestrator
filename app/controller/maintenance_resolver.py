@@ -14,6 +14,9 @@ are *replaced*, never merged):
               ``hosts[].services[].maintenance`` → host ``maintenance`` (unless
               ``inherit: false``) → stage ``maintenance_default`` (if ``enabled``) →
               site ``maintenance_default`` → none
+
+A host's services are its own ``services[]`` **plus those of its ``profiles``**
+(``environments/global/03_profiles.yml``) — see :func:`effective_services`.
 * host:       own ``maintenance`` → stage default → site default → none
 * hypervisor: own ``maintenance`` → site default → none (hardware sees no stage vars)
 * incidents:  own block → ``incident_defaults[<kind>]`` of the stage → of the site → none
@@ -25,6 +28,7 @@ aborts a deploy. Kinds are the Entity-Registry kinds and open (``is_valid_kind``
 
 from __future__ import annotations
 
+import copy
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -131,12 +135,73 @@ def discover(inventory_root: Path) -> list[tuple[str, str]]:
     return out
 
 
+#: Service-entry blocks a more specific level replaces as a whole (never merged).
+_REPLACED_BLOCKS = ("maintenance", "incidents")
+
+
+def load_profiles(inventory_root: Path) -> dict:
+    """``profile name → {services: [...], …}`` from ``environments/global/03_profiles.yml``
+    (``{}`` when the file is missing or has no profiles)."""
+    data = _read_yaml(Path(inventory_root) / "environments" / "global" / "03_profiles.yml")
+    profiles = data.get("profiles")
+    return profiles if isinstance(profiles, dict) else {}
+
+
+def effective_services(host: Mapping | None, profiles: Mapping | None) -> list[dict]:
+    """The ``services[]`` entries a controller host really has: those of its
+    ``profiles`` (in the listed order), then its own.
+
+    Same rule as the generator (``iac_core`` ``resolve_profiles`` /
+    ``merge_services_by_name``): an entry whose name already exists is merged ON
+    TOP of the earlier one, key by key — a host entry overrides a same-named
+    profile entry without restating it. One deliberate difference: a later
+    ``maintenance`` / ``incidents`` block REPLACES the earlier one as a whole
+    (the rule of this module: the most specific level wins, lists are never
+    merged) — a union would silently add the profile's windows to the host's.
+
+    The resolver used to read ``hosts[].services[]`` only, so the fleet services
+    that hosts get through profiles (reverse proxy, agents, …) had no deploy
+    policy, no maintenance override and no published windows (audit OC-12).
+    """
+    out: list[dict] = []
+    index: dict[str, dict] = {}
+
+    def _add(entries: Any) -> None:
+        if not isinstance(entries, list):
+            return
+        for entry in entries:
+            if isinstance(entry, str):
+                entry = {"name": entry}
+            if not isinstance(entry, dict) or not entry.get("name"):
+                continue
+            name = str(entry["name"]).strip()
+            incoming = copy.deepcopy(dict(entry))
+            if name in index:
+                for key in _REPLACED_BLOCKS:
+                    if key in incoming:
+                        index[name][key] = incoming.pop(key)
+                _merge(index[name], incoming)
+            else:
+                index[name] = incoming
+                out.append(incoming)
+
+    host = host if isinstance(host, Mapping) else {}
+    assigned = host.get("profiles")
+    for profile_name in assigned if isinstance(assigned, list) else []:
+        profile = (profiles or {}).get(profile_name)
+        if isinstance(profile, Mapping):
+            _add(profile.get("services"))
+    _add(host.get("services"))
+    return out
+
+
 def load_tree(inventory_root: Path, site: str, stage: str) -> dict:
     """Raw merged site + stage configuration (values are literal, no Jinja).
 
     Reads ``site_vars.yml``, ``hardware.yml`` and ``stages/<stage>/{stage_vars,stage,
     hosts}.yml`` — the files that carry maintenance data — with the loader's merge
-    semantics. Global files (``01..04_*.yml``) carry none and are skipped.
+    semantics, plus the global ``profiles`` (the services hosts inherit). The
+    other global files (``01``, ``02``, ``04``) carry none and are skipped.
     """
     sd, std = site_dir(inventory_root, site), stage_dir(inventory_root, site, stage)
     tree: dict = {}
@@ -152,28 +217,29 @@ def load_tree(inventory_root: Path, site: str, stage: str) -> dict:
     tree.setdefault("stage_vars", {})
     tree.setdefault("hosts", {})
     tree.setdefault("hardware_hosts", {})
+    # Always from the global file: a site/stage file is not where profiles live.
+    tree["profiles"] = load_profiles(inventory_root)
     return tree
 
 
 def find_service_hosts(
     inventory_root: Path, service_name: str, *, stage: str | None = None
 ) -> list[tuple[str, str, str]]:
-    """``(site, stage, host)`` of every controller host that lists ``service_name``
-    under ``services[]`` — optionally only in ``stage``. Sorted."""
+    """``(site, stage, host)`` of every controller host that has ``service_name`` —
+    under its own ``services[]`` or through one of its ``profiles`` — optionally
+    only in ``stage``. Sorted."""
     svc = str(service_name or "").strip().lower()
     out: list[tuple[str, str, str]] = []
     for site, stg in discover(inventory_root):
         if stage and stg != stage:
             continue
-        hosts = load_tree(inventory_root, site, stg).get("hosts") or {}
-        for host, data in hosts.items():
+        tree = load_tree(inventory_root, site, stg)
+        for host, data in (tree.get("hosts") or {}).items():
             if not isinstance(data, dict):
                 continue
-            for entry in data.get("services") or []:
-                name = entry.get("name") if isinstance(entry, dict) else entry
-                if str(name or "").strip().lower() == svc:
-                    out.append((site, stg, str(host)))
-                    break
+            if any(str(entry["name"]).strip().lower() == svc
+                   for entry in effective_services(data, tree.get("profiles"))):
+                out.append((site, stg, str(host)))
     return sorted(out)
 
 
@@ -462,11 +528,8 @@ def resolve(
         )
 
         inherit_ok = host_block.get("inherit", True) is not False
-        for entry in host.get("services") or []:
-            if isinstance(entry, str):
-                entry = {"name": entry}
-            if not isinstance(entry, dict) or not entry.get("name"):
-                continue
+        # Own services and those inherited through profiles (audit OC-12).
+        for entry in effective_services(host, tree.get("profiles")):
             svc = str(entry["name"]).strip()
             where = f"{site}/{stage}/hosts.{host_name}.services.{svc}"
             svc_yml = services.get(svc) or services.get(svc.lower())
@@ -787,6 +850,8 @@ __all__ = [
     "is_maintenance_commit",
     "discover",
     "load_tree",
+    "load_profiles",
+    "effective_services",
     "find_service_hosts",
     "read_service_yml",
     "scan_service_ymls",
