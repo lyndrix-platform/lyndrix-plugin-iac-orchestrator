@@ -170,6 +170,14 @@ manifest = ModuleManifest(
             external_default=True,
         ),
         NotificationEndpoint(
+            name="job_timed_out",
+            description="A running pipeline exceeded the maximum runtime and was stopped.",
+            default_active=True,
+            internal_toast=True,
+            internal_persist=True,
+            external_default=True,
+        ),
+        NotificationEndpoint(
             name="webhook_verified",
             description="Incoming webhook accepted and dispatched to the engine.",
             default_active=False,
@@ -289,6 +297,8 @@ async def health(ctx) -> PluginHealthStatus:
                 "holder": sweep.get("holder"),
                 "last_sweep_at": sweep.get("last_sweep_at"),
                 "orphans_failed_total": sweep.get("orphans_failed_total", 0),
+                # Jobs the sweep closed itself after the maximum runtime (review C4).
+                "timed_out_total": sweep.get("timed_out_total", 0),
             },
         },
         latency_ms=latency,

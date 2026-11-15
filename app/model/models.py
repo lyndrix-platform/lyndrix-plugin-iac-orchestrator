@@ -42,6 +42,10 @@ class IaCJob(Base):
     # Heartbeat on the DATABASE clock in UTC — what the orphan sweep ages (the
     # naive ``heartbeat_at`` above is the runner's local wall clock).
     heartbeat_utc = Column(DateTime, nullable=True)
+    # When the current run was claimed, on the DATABASE clock in UTC (review C4):
+    # the maximum runtime is measured from here. Set by the claim, kept across an
+    # adoption by a restarted runner, cleared when the job goes back to the queue.
+    claimed_utc = Column(DateTime, nullable=True)
     # Where the job is (JSON: stage index/count/name, "last" stage flag). Written with
     # every stage start so a restarted runner knows whether a re-attached container
     # belonged to the pipeline's last stage or stages are still missing (audit OC-10).

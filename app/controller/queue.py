@@ -390,6 +390,8 @@ class JobQueue:
                 "owner_incarnation": "VARCHAR(64) NULL",
                 # heartbeat on the DATABASE clock in UTC (orphan sweep, audit OC-09/OC-18)
                 "heartbeat_utc": "DATETIME NULL",
+                # start of the current run on the DATABASE clock in UTC (maximum runtime, review C4)
+                "claimed_utc": "DATETIME NULL",
                 # stage progress for restart recovery
                 "exec_state": "LONGTEXT NULL",
                 # who triggered the job
@@ -670,7 +672,7 @@ class JobQueue:
                     .where(IaCJob.id == job_id, IaCJob.status.in_((STATUS_QUEUED, STATUS_SCHEDULED)))
                     .values(status=STATUS_RUNNING, owner_instance=instance_id, owner_incarnation=incarnation,
                             claim_token=token, claimed_at=now, heartbeat_at=now,
-                            heartbeat_utc=self._utc_now(session),
+                            heartbeat_utc=self._utc_now(session), claimed_utc=self._utc_now(session),
                             current_step=f"Claimed by {instance_id}")
                 )
                 session.commit()
@@ -760,7 +762,7 @@ class JobQueue:
             res = session.execute(
                 update(IaCJob).where(*cond).values(
                     status=STATUS_QUEUED, owner_instance=None, owner_incarnation=None, claim_token=None,
-                    claimed_at=None, heartbeat_at=None, heartbeat_utc=None, progress=0,
+                    claimed_at=None, heartbeat_at=None, heartbeat_utc=None, claimed_utc=None, progress=0,
                     current_step=str(step)[:250])
             )
             session.commit()
@@ -855,7 +857,7 @@ class JobQueue:
                         window_ci_ids=json.dumps(list(window_ci_ids or [])),
                         schedule_reason=str(reason or "")[:250],
                         owner_instance=None, owner_incarnation=None, claim_token=None,
-                        claimed_at=None, heartbeat_at=None, heartbeat_utc=None,
+                        claimed_at=None, heartbeat_at=None, heartbeat_utc=None, claimed_utc=None,
                         progress=0, current_step="Scheduled",
                     )
                 )
@@ -1288,7 +1290,9 @@ class JobQueue:
         """RUNNING jobs with an owner, with their ages on the database clock —
         the facts the orphan sweep decides on (it never asks a runner's Docker
         socket): ``[{id, owner_instance, owner_incarnation, claim_token,
-        heartbeat_utc, hb_age, log_age, has_container, holds_lock, current_step}]``.
+        heartbeat_utc, hb_age, log_age, runtime, has_container, holds_lock,
+        current_step}]``. ``runtime`` — seconds since the claim that started the
+        current run (``None`` for a row claimed by a plugin version without it).
         ``has_container`` is true when the runner snapshot reports a live task
         OR the job holds a lock (review C2): the snapshot is written
         fire-and-forget and can be stale or lost, while a ``tf:``/``rules`` lock
@@ -1303,13 +1307,13 @@ class JobQueue:
             db_local = session.execute(select(sa_fn.now())).scalar()
             rows = session.execute(
                 select(IaCJob.id, IaCJob.owner_instance, IaCJob.owner_incarnation, IaCJob.claim_token,
-                       IaCJob.heartbeat_utc, IaCJob.runners, IaCJob.current_step)
+                       IaCJob.heartbeat_utc, IaCJob.runners, IaCJob.current_step, IaCJob.claimed_utc)
                 .where(IaCJob.status == STATUS_RUNNING, IaCJob.owner_instance.isnot(None),
                        IaCJob.heartbeat_utc.isnot(None))
             ).all()
             lock_holders = {int(r[0]) for r in session.execute(select(IaCLock.job_id)).all()}
             out = []
-            for job_id, owner, incarnation, token, hb, runners_raw, step in rows:
+            for job_id, owner, incarnation, token, hb, runners_raw, step, claimed_utc in rows:
                 last_log = session.execute(
                     select(sa_fn.max(IaCJobLog.ts)).where(IaCJobLog.job_id == job_id)).scalar()
                 try:
@@ -1326,6 +1330,7 @@ class JobQueue:
                     "claim_token": token, "heartbeat_utc": hb,
                     "hb_age": _seconds_between(db_utc, hb),
                     "log_age": _seconds_between(db_local, last_log) if last_log is not None else None,
+                    "runtime": _seconds_between(db_utc, claimed_utc) if claimed_utc is not None else None,
                     "has_container": has_container, "holds_lock": holds_lock, "current_step": step,
                 })
             return out
@@ -1338,19 +1343,42 @@ class JobQueue:
         heartbeat since (database clock). A runner that came back in between wins;
         a second sweeper finds nothing left to do. Appends the reason to the job
         log and ends the maintenance override through ``on_terminal``."""
+        return self._fail_from_outside(
+            job_id, token, reason, min_hb_age=min_hb_age, what="fail_orphan",
+            log_line=f"{reason} — the job was closed as FAILED by the orphan sweep. "
+                     "Nothing is re-run automatically; re-trigger the pipeline.")
+
+    def fail_overdue(self, job_id: int, token: str | None, reason: str, log_line: str) -> bool:
+        """RUNNING → FAILED for a job that exceeded the maximum runtime and that
+        its runner did not close when asked to (review C4). Conditional on the
+        claim the sweep looked at — not on the heartbeat: the owner may well be
+        alive (its plugin part is not, or its Docker does not answer).
+
+        Nobody confirmed that the job's containers are gone, so the close also
+        stamps the heartbeat with "now": locks the job still holds (``tf:<env>``,
+        ``rules``) stay reserved for the takeover grace from THIS moment
+        (``acquire_lock`` ages a closed holder by its last heartbeat) — unless
+        the runner stops the containers earlier and gives them back itself.
+        """
+        return self._fail_from_outside(job_id, token, reason, min_hb_age=None, what="fail_overdue",
+                                       log_line=log_line)
+
+    def _fail_from_outside(self, job_id: int, token: str | None, reason: str, *, min_hb_age: float | None,
+                           what: str, log_line: str) -> bool:
         def _tx():
             session = self._session()
             if not session:
                 return False
             try:
-                db_utc = session.execute(select(self._utc_now(session))).scalar()
-                cutoff = _naive(db_utc) - timedelta(seconds=max(0.0, float(min_hb_age)))
-                cond = [IaCJob.id == job_id, IaCJob.status == STATUS_RUNNING, IaCJob.heartbeat_utc <= cutoff]
+                cond = [IaCJob.id == job_id, IaCJob.status == STATUS_RUNNING]
+                values: dict = {"status": STATUS_FAILED, "end_time": datetime.now(), "current_step": str(reason)[:250]}
+                if min_hb_age is not None:
+                    db_utc = session.execute(select(self._utc_now(session))).scalar()
+                    cond.append(IaCJob.heartbeat_utc <= _naive(db_utc) - timedelta(seconds=max(0.0, float(min_hb_age))))
+                else:
+                    values["heartbeat_utc"] = self._utc_now(session)
                 cond.append(IaCJob.claim_token == token if token else IaCJob.claim_token.is_(None))
-                res = session.execute(
-                    update(IaCJob).where(*cond)
-                    .values(status=STATUS_FAILED, end_time=datetime.now(), current_step=str(reason)[:250])
-                )
+                res = session.execute(update(IaCJob).where(*cond).values(**values))
                 session.commit()
                 return res.rowcount == 1
             except Exception:
@@ -1362,16 +1390,14 @@ class JobQueue:
         try:
             done = bool(self._retry(_tx))
         except Exception as exc:
-            log.warning("QUEUE: fail_orphan(#%s) failed: %s", job_id, exc)
+            log.warning("QUEUE: %s(#%s) failed: %s", what, job_id, exc)
             return False
         if not done:
             return False
         try:
-            self.append_log(job_id, [f"[SYSTEM] {reason} — the job was closed as FAILED by the orphan sweep. "
-                                     "Nothing is re-run automatically; re-trigger the pipeline."],
-                            self.last_seq(job_id))
+            self.append_log(job_id, [f"[SYSTEM] {log_line}"], self.last_seq(job_id))
         except Exception as exc:
-            log.debug("QUEUE: orphan log line for #%s not written: %s", job_id, exc)
+            log.debug("QUEUE: log line of %s for #%s not written: %s", what, job_id, exc)
         if self.on_terminal is not None:
             try:
                 self.on_terminal(job_id)

@@ -209,6 +209,18 @@ class IaCConfig:
         return self._get_int("PLUGIN_IAC_ORCHESTRATOR_ORPHAN_SWEEP_CONTAINER_GRACE_SECONDS",
                              "iac_orphan_sweep_container_grace_seconds", 1800, minimum=60)
 
+    #: Smallest limit that is honoured — anything below would stop ordinary jobs.
+    JOB_MAX_RUNTIME_FLOOR_SECONDS = 600
+
+    @property
+    def job_max_runtime_seconds(self) -> int:
+        """Longest time a job may stay RUNNING before the sweep stops and closes
+        it (review C4); ``0`` = no limit. A value between 1 and the floor is
+        raised to the floor instead of stopping every job after seconds."""
+        value = self._get_int("PLUGIN_IAC_ORCHESTRATOR_JOB_MAX_RUNTIME_SECONDS",
+                              "iac_job_max_runtime_seconds", 21600, minimum=0)
+        return 0 if value <= 0 else max(self.JOB_MAX_RUNTIME_FLOOR_SECONDS, value)
+
     @property
     def tf_lock_timeout_seconds(self) -> int:
         """How long a Terraform run waits for the state lock of its environment

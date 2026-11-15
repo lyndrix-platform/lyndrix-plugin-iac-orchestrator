@@ -79,7 +79,8 @@ class IaCService:
         # job id -> background retry of a container stop that Docker refused.
         self._stop_retries: dict[int, asyncio.Task] = {}
         # Orphan sweep (rD §3): started/stopped by the lease, see review_sweep_lease.
-        self.sweeper = OrphanSweeper(ctx, self.queue, self.db, self.config, notify=self._notify_orphaned)
+        self.sweeper = OrphanSweeper(ctx, self.queue, self.db, self.config, notify=self._notify_orphaned,
+                                     notify_overdue=self._notify_overdue)
         self._sweep_lease_wanted = False
         # Runner presence: when a runner was last seen and when this service started.
         self._runner_seen_at: float | None = None
@@ -199,6 +200,19 @@ class IaCService:
             severity="error",
         )
 
+    def _notify_overdue(self, job_id: int, text: str, row: dict, closed: bool) -> None:
+        """A job exceeded the maximum runtime (review C4): one sticky bell entry,
+        updated when the sweep had to close the job itself."""
+        self.ctx.notify(
+            "job_timed_out",
+            payload={"job_id": job_id, "owner_instance": row.get("owner_instance"), "closed_by_sweep": closed,
+                     "runtime_seconds": row.get("runtime"), "message": f"Pipeline #{job_id}: {text}"},
+            notification_id=f"job_{job_id}",
+            title=f"❌ Pipeline #{job_id} — maximum runtime exceeded",
+            body=text,
+            severity="error",
+        )
+
     def enqueue_pipeline(self, payload: dict, *, requested_by: str | None = None) -> int:
         """:meth:`enqueue_pipeline_ex` for callers that only need the job id."""
         return self.enqueue_pipeline_ex(payload, requested_by=requested_by).job_id
@@ -298,9 +312,9 @@ class IaCService:
         except Exception as exc:
             log.debug(f"job note for #{job_id} not written: {exc}")
 
-    async def _stop_once(self, job_id: int, abort: bool) -> None:
+    async def _stop_once(self, job_id: int, abort: bool, close: dict | None = None) -> None:
         if abort:
-            await self.engine.abort_job(job_id)
+            await self.engine.abort_job(job_id, **(close or {}))
         else:
             await self.engine.stop_job_containers(job_id)
         # Docker answered and the containers are gone: the job's locks are free
@@ -311,13 +325,14 @@ class IaCService:
             self._unsettled.discard(job_id)
             self.db.claims.pop(job_id, None)
 
-    async def stop_containers(self, job_id: int, *, abort: bool = False) -> bool:
+    async def stop_containers(self, job_id: int, *, abort: bool = False, close: dict | None = None) -> bool:
         """Stop the containers of ``job_id`` on this host (``abort``: and close its
-        row as ABORTED). ``False`` when Docker did not answer: nothing is assumed
-        about the containers, the stop is retried in the background (bounded) and
-        the job log says so — a failed stop is never a silent no-op."""
+        row — as ABORTED, or as ``close = {"status", "reason"}`` says). ``False``
+        when Docker did not answer: nothing is assumed about the containers, the
+        stop is retried in the background (bounded) and the job log says so — a
+        failed stop is never a silent no-op."""
         try:
-            await self._stop_once(job_id, abort)
+            await self._stop_once(job_id, abort, close)
             return True
         except ContainerStateUnknown as exc:
             log.warning(f"IaC Orchestrator: containers of job #{job_id} could not be stopped ({exc}) — retrying.")
@@ -328,16 +343,16 @@ class IaCService:
             task = self._stop_retries.get(job_id)
             if task is None or task.done():
                 self._stop_retries[job_id] = self.ctx.create_task(
-                    self._retry_container_stop(job_id, abort), name=f"iac:stop_retry:{job_id}")
+                    self._retry_container_stop(job_id, abort, close), name=f"iac:stop_retry:{job_id}")
             return False
 
-    async def _retry_container_stop(self, job_id: int, abort: bool) -> None:
+    async def _retry_container_stop(self, job_id: int, abort: bool, close: dict | None = None) -> None:
         last = "unknown"
         try:
             for attempt in range(self.CONTAINER_STOP_RETRY_ATTEMPTS):
                 await asyncio.sleep(self._docker_retry_delay(attempt))
                 try:
-                    await self._stop_once(job_id, abort)
+                    await self._stop_once(job_id, abort, close)
                 except ContainerStateUnknown as exc:
                     last = str(exc)
                     continue
@@ -604,22 +619,33 @@ class IaCService:
 
         Returns the ids whose containers could NOT be stopped (Docker did not
         answer, review C1): their abort is retried in the background and the
-        caller must not report them as stopped."""
+        caller must not report them as stopped.
+
+        ``final_status: "FAILED"`` + ``reason`` (the sweep's maximum-runtime stop,
+        review C4): the same stop, but the job is closed as FAILED with that
+        reason instead of ABORTED "Aborted by User". The bus has no sender
+        identity — the fields only choose between two terminal labels for a job
+        that this topic could always stop."""
         ids = [int(j) for j in ((payload or {}).get("job_ids") or []) if str(j).isdigit()]
+        close: dict | None = None
+        if (payload or {}).get("final_status") == "FAILED":
+            close = {"status": "FAILED",
+                     "reason": str((payload or {}).get("reason") or "Stopped (maximum runtime exceeded)")[:250]}
         unstopped: list[int] = []
         for job_id in ids:
             owned = self.worker.owns(job_id) if self.worker else False
             if owned:
-                # Only an operator's abort makes a cancellation terminal (ABORTED);
-                # every other cancellation detaches the job (engine, OC-10).
-                self.engine.request_abort(job_id)
+                # Only a requested stop makes a cancellation terminal (ABORTED, or
+                # FAILED for the runtime limit); every other cancellation detaches
+                # the job (engine, OC-10).
+                self.engine.request_abort(job_id, **(close or {}))
                 await self.worker.cancel(job_id)
             if owned or job_id in self._unsettled or any(
                 isinstance(t, dict) and t.get("job_id") == job_id
                 for t in (self.state.get("active_tasks") or {}).values()
             ):
                 try:
-                    if not await self.stop_containers(job_id, abort=True):
+                    if not await self.stop_containers(job_id, abort=True, close=close):
                         unstopped.append(job_id)
                 except Exception as exc:
                     log.warning(f"abort of job #{job_id} failed: {exc}")
@@ -799,9 +825,14 @@ class IaCService:
 
     async def _reconcile_when_docker_answers(self) -> None:
         """Retry the container listing (bounded pauses, at most one per minute)
-        until Docker answers, then settle what start-up could not. Not bounded in
-        total: closing a job without knowing its containers is exactly the
-        defect — the way out is Docker coming back, or an operator's abort."""
+        until Docker answers, then settle what start-up could not. This loop has
+        no bound of its own: closing a job without knowing its containers is
+        exactly the defect. The bound is the job's maximum runtime (review C4):
+        the sweep then closes the row as FAILED "containers may still be
+        running" and keeps its locks reserved for the container grace; this loop
+        finds the row closed, stops the leftovers once Docker answers and ends.
+        With ``job_max_runtime_seconds = 0`` the way out is Docker coming back
+        or an operator's abort."""
         attempt = 0
         while True:
             await asyncio.sleep(self._docker_retry_delay(attempt))

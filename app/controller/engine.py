@@ -2212,10 +2212,15 @@ class DeploymentEngine:
         except asyncio.CancelledError:
             if current_job_id in self.__dict__.setdefault("_abort_requested", set()):
                 # Abort (do_abort → worker.cancel): the row is closed as ABORTED by the
-                # finally below; the containers are killed by abort_job().
-                final_status = "ABORTED"
+                # finally below; the containers are killed by abort_job(). A stop
+                # for the runtime limit closes it as FAILED with its reason instead.
+                final_status, stop_reason = self._stop_verdict(current_job_id)
                 self.state["last_deployment"] = final_status
-                log.warning("[SYSTEM] Pipeline aborted.")
+                if stop_reason:
+                    log.error(f"[SYSTEM] Pipeline stopped: {stop_reason}.")
+                    self.push_progress(current_job_id, progress=None, current_step=stop_reason)
+                else:
+                    log.warning("[SYSTEM] Pipeline aborted.")
             else:
                 # Any other cancellation — plugin reload/disable, a draining
                 # instance, a job that was closed elsewhere: the containers keep
@@ -2338,6 +2343,7 @@ class DeploymentEngine:
             self.__dict__.setdefault("_job_modes", {}).pop(current_job_id, None)
             self.__dict__.setdefault("_job_stage", {}).pop(current_job_id, None)
             self.__dict__.setdefault("_abort_requested", set()).discard(current_job_id)
+            self.__dict__.setdefault("_stop_reasons", {}).pop(current_job_id, None)
             self.__dict__.setdefault("_redactors", {}).pop(current_job_id, None)
             await self._publish_snapshots()
 
@@ -2608,7 +2614,8 @@ class DeploymentEngine:
         except asyncio.CancelledError:
             # ABORTED only on an operator's abort; otherwise the row stays RUNNING
             # and the next runner start closes it ("System Restart").
-            final_status = "ABORTED" if job_id in self.__dict__.setdefault("_abort_requested", set()) else None
+            requested = job_id in self.__dict__.setdefault("_abort_requested", set())
+            final_status = self._stop_verdict(job_id)[0] if requested else None
             raise
         except Exception as exc:
             log.error(f"Repository sync job #{job_id} failed: {exc}")
@@ -2621,12 +2628,22 @@ class DeploymentEngine:
             if final_status:
                 await off_loop(self.close_job_row, job_id, final_status, end_override=False)
             self.__dict__.setdefault("_abort_requested", set()).discard(job_id)
+            self.__dict__.setdefault("_stop_reasons", {}).pop(job_id, None)
             await self._close_log_writer(job_id)
 
-    def request_abort(self, job_id: int) -> None:
-        """Mark ``job_id`` as aborted by an operator: its cancellation is an ABORT
-        (terminal), not a detach."""
+    def request_abort(self, job_id: int, *, status: str = "ABORTED", reason: str | None = None) -> None:
+        """Mark ``job_id`` as stopped on request: its cancellation is terminal, not
+        a detach. An operator's abort ends as ABORTED; the sweep's stop for the
+        maximum runtime (review C4) passes ``status="FAILED"`` and its reason."""
         self.__dict__.setdefault("_abort_requested", set()).add(int(job_id))
+        if status == "FAILED":
+            self.__dict__.setdefault("_stop_reasons", {})[int(job_id)] = ("FAILED", str(reason or "")[:250])
+
+    def _stop_verdict(self, job_id: int) -> tuple[str, str | None]:
+        """``(final status, reason)`` of a requested stop — ABORTED unless the
+        request said otherwise."""
+        status, reason = self.__dict__.setdefault("_stop_reasons", {}).get(int(job_id), ("ABORTED", None))
+        return status, (reason or None)
 
     def _mark_stage(self, job_id, index: int, total: int, stage, progress, step: str) -> None:
         """Progress write of a stage start that also records WHERE the job is, in
@@ -2854,15 +2871,16 @@ class DeploymentEngine:
                 data["status"] = "aborted"
         return len(ids)
 
-    async def abort_job(self, job_id: int, *, reason: str = "Aborted by User") -> int:
-        """Kill this host's runner containers of ``job_id`` and close its row as ABORTED
-        (a no-op when the row is no longer RUNNING/ours). Returns the number of
+    async def abort_job(self, job_id: int, *, reason: str = "Aborted by User", status: str = "ABORTED") -> int:
+        """Kill this host's runner containers of ``job_id`` and close its row as
+        ``status`` (ABORTED; FAILED for a stop by the runtime limit) — a no-op
+        when the row is no longer RUNNING/ours. Returns the number of
         containers removed. Raises :class:`ContainerStateUnknown` — before any
         row write — when the containers could not be stopped."""
         killed = await self.stop_job_containers(job_id)
         self._sync_runners(job_id, force=True)
 
-        await off_loop(self.close_job_row, job_id, "ABORTED", step=reason)
+        await off_loop(self.close_job_row, job_id, "FAILED" if status == "FAILED" else "ABORTED", step=reason)
         return killed
 
     async def _on_git_status(self, payload: dict):

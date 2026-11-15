@@ -358,6 +358,15 @@ def _build_fields() -> list[SettingField]:
             description="Grace for a job whose runner containers may still be running — time for the runner "
                         "to come back and re-attach.",
         ),
+        SettingField(
+            "job_max_runtime_seconds", "Maximum job runtime (s)", kind="int", category="Runner",
+            default=21600, minimum=0, maximum=2592000, vault_key="iac_job_max_runtime_seconds",
+            env_var="PLUGIN_IAC_ORCHESTRATOR_JOB_MAX_RUNTIME_SECONDS", rule="runtime_limit",
+            description="A job that is still RUNNING after this long is stopped and closed as FAILED "
+                        "(max_runtime): the runner is asked to stop its containers; if it does not answer the "
+                        "job is closed anyway and its locks stay reserved for the container grace. "
+                        "0 = no limit, otherwise at least 600. Default 6 h.",
+        ),
     ]
 
     # ── Repository Roles (each persisted into repo_<slug>_config JSON) ─────────
@@ -565,6 +574,11 @@ class OrchestratorSettings:
         elif rule == "digits":
             if not value.isdigit():
                 error = "must be numeric"
+        elif rule == "runtime_limit":
+            # Seconds: 0 switches the limit off; a small positive value would
+            # stop every ordinary job, so it is refused rather than clamped silently.
+            if not value.isdigit() or 0 < int(value) < 600:
+                error = "must be 0 (no limit) or at least 600 seconds"
         elif rule == "plain":
             if not _PLAIN_RE.fullmatch(value):
                 error = "contains unsupported characters"
