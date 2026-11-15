@@ -354,3 +354,106 @@ def test_publish_stage_without_a_checkout_fails_cleanly(sqlite_queue, tmp_path):
     res = asyncio.run(git_stage.PublishInventoryStateStage().run(engine, ctx))
     assert not res.success and "not a git checkout" in res.message
     assert "inventory_state_head_sha" not in ctx and JobDatabase().rules_marker() is None
+
+
+# --- review C6: the marker only moves forward (compare-and-set) --------------------------------------
+#
+# The rules lock keeps a second rule stage out — as long as the holder job is
+# RUNNING in the database. A job that was closed from outside (orphan sweep,
+# maximum runtime) goes on until its runner notices, and its lock is taken
+# over after the grace. These tests run two rule stages side by side the way
+# that looks from the database: without the lock.
+
+def test_set_rules_marker_is_a_compare_and_set(env):
+    db, base = env.db, env.repo.base
+    c1 = env.repo.commit("one", docker_a="node_exporter")
+    assert db.set_rules_marker(c1, job_id=1, expected="f" * 40) is False      # not what the marker is
+    assert db.rules_marker()["sha"] == base
+    assert db.set_rules_marker(c1, job_id=1, expected=None) is False          # "absent" — but there is one
+    assert db.set_rules_marker(c1, job_id=1, expected=base) is True
+    assert db.set_rules_marker(base, job_id=2, expected=base) is False        # the loser of the race
+    marker = db.rules_marker()
+    assert marker["sha"] == c1 and marker["job_id"] == 1
+    assert db.set_rules_marker(base) is True                                  # unconditional, as before
+    assert db.rules_marker()["sha"] == base
+
+
+def _overlap(env, first_ctx, second_ctx):
+    """Rule stage A starts and hangs in its action; B runs to its end; A finishes."""
+    async def scenario():
+        gate = env.rec.gate = asyncio.Event()
+        first = asyncio.ensure_future(Rules("infra_plan").run(env.engine, first_ctx))
+        while not env.rec.calls:
+            await asyncio.sleep(0.01)
+        env.rec.gate = None                                    # only A waits
+        second = await Rules("infra_plan").run(env.engine, second_ctx)
+        gate.set()
+        return await first, second
+
+    return asyncio.run(scenario())
+
+
+def test_a_stage_with_an_outdated_view_does_not_move_the_marker_back(env):
+    """A (stale lock, still running) evaluates base..c1, B meanwhile base..c2 and
+    moves the marker to c2. A's unconditional write used to set it back to c1:
+    the next pipeline evaluated c1..c2 again — the same rule actions twice."""
+    c1 = env.repo.commit("one", docker_a="node_exporter")
+    c2 = env.repo.commit("two", docker_b="fail2ban")
+    res_a, res_b = _overlap(env, _ctx(c1, base=env.repo.base, job_id=1), _ctx(c2, base=c1, job_id=2))
+    assert res_a.success and res_b.success
+    marker = env.db.rules_marker()
+    assert marker["sha"] == c2 and marker["job_id"] == 2       # not moved back by job 1
+
+    calls = len(env.rec.calls)
+    assert _run(env, _ctx(c2, published=False, job_id=3)).message == BYPASS
+    assert len(env.rec.calls) == calls                          # nothing is evaluated a second time
+
+
+def test_a_marker_that_is_still_behind_is_moved_forward_from_where_it_is(env):
+    """The other stage was the OLDER one: its marker (c1) is behind what this
+    stage evaluated (c2) — the marker goes forward to c2, never stays at c1."""
+    c1 = env.repo.commit("one", docker_a="node_exporter")
+    c2 = env.repo.commit("two", docker_b="fail2ban")
+    res_a, res_b = _overlap(env, _ctx(c2, base=c1, job_id=1), _ctx(c1, base=env.repo.base, job_id=2))
+    assert res_a.success and res_b.success
+    marker = env.db.rules_marker()
+    assert marker["sha"] == c2 and marker["job_id"] == 1
+
+
+def test_a_failure_is_not_recorded_on_a_marker_that_moved_on(env):
+    c1 = env.repo.commit("one", docker_a="node_exporter")
+    c2 = env.repo.commit("two", docker_b="fail2ban")
+
+    async def scenario():
+        gate = env.rec.gate = asyncio.Event()
+        first = asyncio.ensure_future(Rules("infra_plan").run(env.engine, _ctx(c1, base=env.repo.base, job_id=1)))
+        while not env.rec.calls:
+            await asyncio.sleep(0.01)
+        env.rec.gate = None
+        await Rules("infra_plan").run(env.engine, _ctx(c2, base=c1, job_id=2))
+        env.rec.fail = True                                    # A's action fails in the end
+        gate.set()
+        return await first
+
+    assert asyncio.run(scenario()).success is False
+    marker = env.db.rules_marker()
+    assert marker["sha"] == c2 and marker["failures"] == 0     # B's success stands
+
+
+def test_giving_up_a_backlog_is_refused_when_the_marker_moved(env, monkeypatch):
+    """The give-up skips changes for good and announces it: only the stage whose
+    view of the marker is current may do that."""
+    stale = env.repo.commit("stale", docker_a="node_exporter")
+    own = env.repo.commit("own", docker_b="fail2ban")
+    env.db.set_rules_marker(env.repo.base, failures=Rules.MAX_BACKLOG_ATTEMPTS, last_error="boom")
+    real_set = env.db.set_rules_marker
+
+    def set_after_someone_else(sha, **kwargs):
+        real_set(own, job_id=99)                               # another job got there first
+        return real_set(sha, **kwargs)
+
+    monkeypatch.setattr(env.db, "set_rules_marker", set_after_someone_else)
+    res = _run(env, _ctx(own, base=stale, job_id=1))
+    assert res.success is False and "moved by another job" in res.message
+    assert env.rec.calls == [] and not env.engine._notify.called
+    assert env.db.rules_marker()["sha"] == own and env.db.rules_marker()["job_id"] == 99

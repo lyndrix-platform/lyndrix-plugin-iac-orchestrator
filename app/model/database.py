@@ -583,19 +583,40 @@ class JobDatabase:
         finally:
             session.close()
 
+    #: ``set_rules_marker(expected=…)`` default: write whatever the marker is now.
+    ANY_MARKER = object()
+
     def set_rules_marker(self, sha: str, *, job_id: int | None = None, failures: int = 0,
-                         last_error: str = "", only_if_absent: bool = False) -> bool:
-        """Write the marker; raises on a database error. ``only_if_absent``
-        initialises it (atomic by the primary key) and returns False when one
-        exists already."""
+                         last_error: str = "", only_if_absent: bool = False, expected=ANY_MARKER) -> bool:
+        """Write the marker; raises on a database error. Returns whether THIS
+        call wrote it.
+
+        ``expected`` makes the write a compare-and-set (review C6): the marker
+        is only written while it still points at the commit the caller read —
+        ``expected="<sha>"`` — or while there is none (``expected=None``, the
+        same as ``only_if_absent``; atomic by the primary key). One conditional
+        UPDATE: of two writers that read the same marker only one succeeds, and
+        a writer whose view is outdated (its ``rules`` lock was taken over) never
+        moves the marker back. Without ``expected`` the write is unconditional.
+        """
         from sqlalchemy.exc import IntegrityError
 
         data = json.dumps({"sha": sha, "failures": int(failures), "last_error": str(last_error or "")[:500],
                            "job_id": job_id, "at": datetime.now().isoformat(timespec="seconds")})
+        if expected is None:
+            only_if_absent = True
         session = self._get_session()
         if not session:
             raise RuntimeError("the job database is not connected")
         try:
+            if expected is not self.ANY_MARKER and expected is not None:
+                # The row's commit_hash column always carries the marker's sha.
+                res = session.execute(
+                    update(IaCState)
+                    .where(IaCState.id == self.RULES_MARKER, IaCState.commit_hash == str(expected)[:40])
+                    .values(state_data=data, commit_hash=sha[:40]))
+                session.commit()
+                return res.rowcount == 1
             rec = session.query(IaCState).filter(IaCState.id == self.RULES_MARKER).first()
             if rec is not None:
                 if only_if_absent:
