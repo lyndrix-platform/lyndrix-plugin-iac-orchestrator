@@ -219,7 +219,8 @@ def test_last_stage_container_ok_closes_the_job_as_success_without_duplicate_lin
 
     async def scenario():
         await new.run_startup_reconciliation()
-        await _until(lambda: _row(job_id).status != "RUNNING")
+        # The close (status, locks, claim, override) is one thread call: wait for its end.
+        await _until(lambda: _row(job_id).status != "RUNNING" and ended and not new.db.claims)
 
     asyncio.run(scenario())
     row = _row(job_id)
@@ -240,7 +241,7 @@ def test_green_container_in_a_middle_stage_is_not_a_green_pipeline(iac_service, 
 
     async def scenario():
         await new.run_startup_reconciliation()
-        await _until(lambda: _row(job_id).status != "RUNNING")
+        await _until(lambda: _row(job_id).status != "RUNNING" and ended)   # the whole close, see above
 
     asyncio.run(scenario())
     row = _row(job_id)
