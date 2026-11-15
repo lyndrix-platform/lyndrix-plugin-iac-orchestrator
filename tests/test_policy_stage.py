@@ -278,31 +278,108 @@ def test_force_and_ui_triggers_skip_the_policy(env):
     assert res.success and _row(jid2).status == "RUNNING"
 
 
-def test_due_scheduled_job_runs_without_reparking(env):
-    _controller(env.ctrl, windows=[SUN], policy="window")
-    jid = _claimed_job(env.queue, WEBHOOK)
-    # The queue compares not_before with the REAL process clock, so this test runs on it too.
-    real_now = lambda: datetime.now(timezone.utc)  # noqa: E731
-    past = real_now() - timedelta(hours=1)
-    assert env.queue.park(
-        jid,
-        not_before=past,
-        window_ci_ids=["u-svc"],
-        reason="test",
-        instance_id="runner-1",
-    )
+# 2026-10-18 02:00 UTC — the start of the Sunday window the fake clocks refer to. It is
+# in the past of the REAL clock too, which is what the queue's claim compares with.
+WINDOW_START = datetime(2026, 10, 18, 2, 0, tzinfo=timezone.utc)
+NEXT_WINDOW = datetime(2026, 10, 25, 2, 0, tzinfo=timezone.utc)
+
+
+def _due_job(env, payload=WEBHOOK):
+    """A deploy that was parked for the window of 2026-10-18 and is claimed again."""
+    jid = _claimed_job(env.queue, payload)
+    assert env.queue.park(jid, not_before=WINDOW_START, window_ci_ids=["u-svc"], reason="test",
+                          instance_id="runner-1")
     claimed = env.queue.claim_next("runner-1")  # due → claimed again, not_before kept
     assert claimed and claimed[0] == jid
-    res = _run(
-        MaintenancePolicyStage("svc-a", "main", WEBHOOK, clock=real_now),
-        env.engine,
-        {"job_id": jid, "payload": WEBHOOK},
-    )
-    assert (
-        res.success
-        and "scheduled window reached" in res.message
-        and _row(jid).status == "RUNNING"
-    )
+    return jid
+
+
+def test_due_scheduled_job_runs_while_its_window_is_open(env):
+    _controller(env.ctrl, windows=[SUN], policy="window")
+    jid = _due_job(env)
+    res = _run(MaintenancePolicyStage("svc-a", "main", WEBHOOK, clock=lambda: IN_WINDOW), env.engine,
+               {"job_id": jid, "payload": WEBHOOK})
+    assert res.success and "scheduled window reached" in res.message and _row(jid).status == "RUNNING"
+    assert len(_emits(env.engine.ctx, mw.TOPIC_OVERRIDE_STARTED)) == 1
+
+
+def test_due_job_whose_window_has_closed_waits_for_the_next_window(env):
+    """OC-13: window Sun 02:00–04:00, the runner was down until 10:00. The due deploy
+    used to run at 10:00 — in business hours."""
+    _controller(env.ctrl, windows=[SUN], policy="window")
+    jid = _due_job(env)
+    with pytest.raises(JobParked) as exc:
+        _run(MaintenancePolicyStage("svc-a", "main", WEBHOOK, clock=lambda: NOW), env.engine,
+             {"job_id": jid, "payload": WEBHOOK})
+    assert exc.value.not_before == NEXT_WINDOW and "missed its window" in exc.value.reason
+    row = _row(jid)
+    assert row.status == "SCHEDULED" and row.owner_instance is None and row.claim_token is None
+    assert queue_mod.from_queue_clock(row.not_before) == NEXT_WINDOW
+    assert "missed its window" in row.schedule_reason
+    # nothing of the deploy happened: no maintenance override was announced
+    assert _emits(env.engine.ctx, mw.TOPIC_OVERRIDE_STARTED) == []
+    assert _emits(env.engine.ctx, mw.TOPIC_WINDOW_MISSING) == []
+
+
+def test_due_job_runs_when_forced_or_when_the_policy_no_longer_asks_for_a_window(env):
+    _controller(env.ctrl, windows=[SUN], policy="window")
+    forced = {**WEBHOOK, "force": True}                      # "run now" from the schedule
+    jid = _due_job(env, forced)
+    res = _run(MaintenancePolicyStage("svc-a", "main", forced, clock=lambda: NOW), env.engine,
+               {"job_id": jid, "payload": forced})
+    assert res.success and _row(jid).status == "RUNNING"
+    with queue_mod.db_instance.SessionLocal() as s:
+        s.get(IaCJob, jid).status = "SUCCESS"
+        s.commit()
+
+    _controller(env.ctrl, windows=[SUN], policy="immediate")  # changed while the job was parked
+    jid2 = _due_job(env)
+    res = _run(MaintenancePolicyStage("svc-a", "main", WEBHOOK, clock=lambda: NOW), env.engine,
+               {"job_id": jid2, "payload": WEBHOOK})
+    assert res.success and "scheduled window reached" in res.message and _row(jid2).status == "RUNNING"
+
+
+def test_job_that_cannot_be_parked_fails_instead_of_deploying_outside_the_window(env, monkeypatch):
+    """It used to log "Could not park … deploying now"."""
+    _controller(env.ctrl, windows=[SUN], policy="window")
+    monkeypatch.setattr(env.queue, "park", lambda *a, **k: False)
+    jid = _claimed_job(env.queue, WEBHOOK)
+    res = _run(MaintenancePolicyStage("svc-a", "main", WEBHOOK, clock=lambda: NOW), env.engine,
+               {"job_id": jid, "payload": WEBHOOK})
+    assert not res.success and "NOT deployed outside the window" in res.message
+    assert _emits(env.engine.ctx, mw.TOPIC_OVERRIDE_STARTED) == []   # the deploy did not proceed
+
+
+def test_prod_host_is_not_deployed_at_once_because_a_dev_host_sorts_first(env):
+    """OC-13: one service on a dev host (``immediate``) and a prod host (``window``),
+    deployed from ``main`` to both. The name-sorted first host (the dev one) decided."""
+    for stage, host in (("dev", "aaa-dev"), ("prod", "zzz-prod")):
+        std = env.ctrl / "environments" / "sites" / "onprem" / "stages" / stage
+        _write(std / "stage_vars.yml", {"stage_vars": {}})
+        entry = {"name": "svc-a"}
+        if stage == "prod":
+            entry["maintenance"] = {"windows": [SUN]}
+        _write(std / "hosts.yml", {"hosts": {host: {"services": [entry]}}})
+    _write(env.ctrl / "environments" / "sites" / "onprem" / "site_vars.yml", {"site_vars": {"timezone": "UTC"}})
+    jid = _claimed_job(env.queue, WEBHOOK)
+    ctx = {"job_id": jid, "payload": WEBHOOK}
+    with pytest.raises(JobParked) as exc:
+        _run(MaintenancePolicyStage("svc-a", "main", WEBHOOK, clock=lambda: NOW), env.engine, ctx)
+    assert exc.value.not_before == NEXT_WINDOW and "zzz-prod" in exc.value.reason
+    decision = ctx["maintenance_decision"]
+    assert decision.host == "zzz-prod" and decision.deploy_policy == "window"
+    assert any("aaa-dev" in note for note in decision.notes)
+    assert _row(jid).status == "SCHEDULED" and _emits(env.engine.ctx, mw.TOPIC_OVERRIDE_STARTED) == []
+
+    # the dev branch still only looks at the dev stage and deploys at once
+    dev = {**WEBHOOK, "service_branch": "dev"}
+    with queue_mod.db_instance.SessionLocal() as s:
+        s.get(IaCJob, jid).status = "ABORTED"
+        s.commit()
+    jid2 = _claimed_job(env.queue, dev)
+    res = _run(MaintenancePolicyStage("svc-a", "dev", dev, clock=lambda: NOW), env.engine,
+               {"job_id": jid2, "payload": dev})
+    assert res.success and _row(jid2).status == "RUNNING"
 
 
 def test_immediate_policy_and_unknown_service(env):

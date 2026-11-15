@@ -195,14 +195,19 @@ class MaintenancePolicyStage(BaseStage):
 
     Runs right after ``CloneServiceRepoStage`` so the fresh ``service.yml`` is on disk.
 
-    1. Target hosts = controller hosts whose ``services[]`` list the service (branch
-       ``dev``/``*-dev``/``test`` narrows the stage); the first sorted host decides.
+    1. Target hosts = controller hosts that have the service — own ``services[]`` or
+       through a profile (branch ``dev``/``*-dev``/``test`` narrows the stage). The
+       strictest host decides (``mres.service_policy``): one ``window`` host is
+       enough to make the deploy wait.
     2. Policy applies only to webhook/CI triggers (``policy_applies``). ``force``
-       (run now, promoted job), UI deploys and a due SCHEDULED job (``not_before``
-       reached) skip the evaluation.
+       (run now, promoted job) and UI deploys skip the evaluation.
     3. ``deploy_policy: window`` and not inside a window → park as SCHEDULED until the
        next window start within ``maintenance_schedule_horizon_days`` and raise
-       :class:`JobParked`. No window within the horizon (or none defined at all) →
+       :class:`JobParked`. That also holds for a SCHEDULED job that is due but could
+       not start before its window closed (runner down, backlog): it waits for the
+       next window instead of deploying in business hours (audit OC-13). A job that
+       cannot be parked FAILS — it is never deployed outside its window because the
+       bookkeeping failed. No window within the horizon (or none defined at all) →
        warning, deploy now **and** emit ``maintenance:window_missing`` (decision H; only
        when the service has a CI and the setting is on — ITSM opens a task from it).
     4. Every deploy that proceeds announces a maintenance override for the service
@@ -261,12 +266,13 @@ class MaintenancePolicyStage(BaseStage):
         if not mres.policy_applies(self.payload):
             why = "force / run now" if self.payload.get("force") else f"trigger '{self.payload.get('trigger') or 'ui'}'"
             log.info(f"[MAINTENANCE] {why} — deploy policy not applied, deploying now.")
-        elif due:
-            log.info(f"[MAINTENANCE] Scheduled deployment is due (not_before {mw.iso(sched['not_before'])}) — running.")
-            message = "scheduled window reached, deploying"
         elif decision.deploy_policy == "window":
             current = mw.current_interval(decision.schedules, now) if decision.schedules else None
-            if current is not None:
+            if current is not None and due:
+                log.info(f"[MAINTENANCE] Scheduled deployment is due (not_before {mw.iso(sched['not_before'])}) "
+                         f"and the window is open until {mw.iso(current.end)} — running.")
+                message = "scheduled window reached, deploying"
+            elif current is not None:
                 log.info(f"[MAINTENANCE] Inside maintenance window of {svc} @ {decision.host} "
                          f"until {mw.iso(current.end)} — deploying now.")
                 message = f"inside maintenance window until {mw.iso(current.end)}"
@@ -275,8 +281,17 @@ class MaintenancePolicyStage(BaseStage):
                 nxt = (mw.next_start(decision.schedules, now, horizon=timedelta(days=horizon_days))
                        if decision.schedules else None)
                 if nxt is not None:
-                    reason = (f"deploy_policy window — next window of {svc} @ {decision.host} "
-                              f"opens {mw.iso(nxt)}")
+                    if due:
+                        # Due, but no runner started it while the window was open
+                        # (runner down or hung, every slot busy): the window is the
+                        # agreement — wait for the next one.
+                        reason = (f"missed its window (due since {mw.iso(sched['not_before'])}, the window had "
+                                  f"closed before the deploy could start) — next window of {svc} @ "
+                                  f"{decision.host} opens {mw.iso(nxt)}")
+                        log.warning(f"[MAINTENANCE] Scheduled deployment {reason}.")
+                    else:
+                        reason = (f"deploy_policy window — next window of {svc} @ {decision.host} "
+                                  f"opens {mw.iso(nxt)}")
                     parked = False
                     if engine.queue is not None and job_id:
                         parked = await asyncio.to_thread(
@@ -285,7 +300,11 @@ class MaintenancePolicyStage(BaseStage):
                         )
                     if parked:
                         raise JobParked(nxt, reason)
-                    log.warning(f"[MAINTENANCE] Could not park job #{job_id} ({reason}) — deploying now.")
+                    # Never "deploy now" because the bookkeeping failed: that is a
+                    # deploy outside the agreed window (it used to be one).
+                    return StageResult(False, f"The deploy could not be parked for its maintenance window "
+                                              f"({reason}) — it was NOT deployed outside the window. "
+                                              "Re-trigger it (a deploy from the UI runs at once).")
                 else:
                     log.warning(
                         f"[MAINTENANCE] deploy_policy is 'window' for {svc} @ {decision.host} but no "
@@ -300,6 +319,11 @@ class MaintenancePolicyStage(BaseStage):
                     else:
                         engine.ctx.emit(mw.TOPIC_WINDOW_MISSING, mres.window_missing_payload(
                             decision, job_id=job_id, horizon_days=horizon_days, now=now))
+        elif due:
+            # Parked under "window", but the policy is a different one by now.
+            log.info(f"[MAINTENANCE] Scheduled deployment is due (not_before {mw.iso(sched['not_before'])}), "
+                     f"deploy_policy is '{decision.deploy_policy}' now — running.")
+            message = "scheduled window reached, deploying"
         else:
             log.info(f"[MAINTENANCE] deploy_policy '{decision.deploy_policy}' for {svc} @ {decision.host} — deploying now.")
 

@@ -664,7 +664,7 @@ class PolicyDecision:
     deploy_policy: str = "immediate"
     windows: list = field(default_factory=list)  # normal form (for logs/UI)
     schedules: list = field(default_factory=list)  # parsed (for evaluation)
-    host: Optional[str] = None  # the deciding (first sorted) target host
+    host: Optional[str] = None  # the deciding target host (the strictest, see service_policy)
     site: Optional[str] = None
     stage: Optional[str] = None
     service_ci_id: Optional[str] = None
@@ -683,9 +683,17 @@ class PolicyDecision:
 def service_policy(
     items: Iterable[dict], service_name: str, hosts: Iterable[str]
 ) -> PolicyDecision:
-    """Decide from resolved ``items``: the policy and windows of the **first target
-    host (sorted)**; other hosts that differ are listed in ``notes`` (documented limit:
-    one service on several hosts follows the first host's window)."""
+    """Decide from resolved ``items``: the policy and windows of the **strictest
+    target host**; other hosts that differ are listed in ``notes``.
+
+    Strictest first: a host whose policy is ``window`` and that has windows, then
+    a ``window`` host without any, then the rest — by name within each group. One
+    run deploys the service to all its target hosts, so one host that must wait
+    makes the deploy wait; the name-sorted first host used to decide, and a dev
+    host (``immediate``) sorting before a prod host had the prod host deployed at
+    once (audit OC-13). Remaining limit: several ``window`` hosts with different
+    windows follow the deciding host's windows (see ``notes``).
+    """
     svc = str(service_name or "").strip().lower()
     wanted = sorted({str(h) for h in hosts})
     by_host: dict[str, dict] = {}
@@ -700,7 +708,8 @@ def service_policy(
     if not by_host:
         return decision
     ordered = [by_host[h] for h in wanted if h in by_host]
-    primary = ordered[0]
+    primary = min(ordered, key=lambda it: (it.get("deploy_policy") != "window", not it.get("windows"),
+                                           str(it.get("host"))))
     tz = primary.get("tz") or "UTC"
     try:
         schedules = mw.parse_windows(primary.get("windows") or [], default_tz=tz)
@@ -728,7 +737,9 @@ def service_policy(
             if val and val not in ci_ids:
                 ci_ids.append(val)
     decision.ci_ids = ci_ids
-    for it in ordered[1:]:
+    for it in ordered:
+        if it is primary:
+            continue
         if it.get("deploy_policy") != primary.get("deploy_policy") or it.get(
             "windows"
         ) != primary.get("windows"):

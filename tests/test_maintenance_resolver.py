@@ -431,6 +431,26 @@ def test_service_policy_first_host_decides_and_notes_differences(tree):
     assert not mres.service_policy(items, "nope", ["host-own"]).found
 
 
+def test_service_policy_strictest_host_decides():
+    """OC-13: ``window`` beats ``immediate`` whatever the host names; among window
+    hosts one that HAS windows decides before one without."""
+    def item(host, policy, windows):
+        return {"kind": "service", "service": "svc", "host": host, "name": f"svc @ {host}", "tz": "UTC",
+                "deploy_policy": policy, "windows": mw.to_dicts(mw.parse_windows(windows, default_tz="UTC")),
+                "ci_id": f"u-{host}", "host_ci_id": None, "site": "onprem", "stage": "x"}
+
+    items = [item("aaa-dev", "immediate", []), item("mmm-prod", "window", []), item("zzz-prod", "window", [TUE])]
+    d = mres.service_policy(items, "svc", ["aaa-dev", "mmm-prod", "zzz-prod"])
+    assert d.host == "zzz-prod" and d.deploy_policy == "window" and d.windows[0]["days"] == ["tue"]
+    assert sorted(n.split(":")[0] for n in d.notes) == ["host aaa-dev", "host mmm-prod"]
+    assert d.ci_ids == ["u-aaa-dev", "u-mmm-prod", "u-zzz-prod"]          # every CI the deploy touches
+
+    d = mres.service_policy(items[:2], "svc", ["aaa-dev", "mmm-prod"])
+    assert d.host == "mmm-prod" and d.deploy_policy == "window" and d.schedules == []
+    d = mres.service_policy(items[:1], "svc", ["aaa-dev"])
+    assert d.host == "aaa-dev" and d.deploy_policy == "immediate" and d.notes == []
+
+
 def test_policy_applies_and_commit_guard():
     assert mres.policy_applies({"trigger": "gitlab-ci"})
     assert mres.policy_applies({"trigger": "webhook"})
