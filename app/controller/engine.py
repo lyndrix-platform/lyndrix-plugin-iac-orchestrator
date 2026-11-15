@@ -26,6 +26,7 @@ from .config import allowed_registry_hosts, registry_host
 from .settings_schema import resolve_credential
 from .offloop import CoalescedWriter, off_loop
 from . import branch_policy, plan_binding
+from .subprocess_env import generator_env, render_env
 from .runner_output import RunnerOutputParser
 from .redaction import SecretRedactor, secret_values_of
 from ...stages.git import (
@@ -3062,8 +3063,10 @@ class DeploymentEngine:
         if not generator_script.exists():
             raise FileNotFoundError(f"Generator script not found at {generator_script}")
 
-        # Inject the private vendor directory into the subprocess PYTHONPATH
-        env = os.environ.copy()
+        # The generator renders Jinja from the iac-controller: it gets an explicit,
+        # minimal environment (audit OS-06) — not the core's, with its database
+        # password, session secret and Vault material — plus the PYTHONPATH below.
+        env = generator_env()
         
         # Build a new PYTHONPATH, prioritizing the plugin's vendored libraries
         # and its own source root for relative imports.
@@ -4009,6 +4012,7 @@ class DeploymentEngine:
                 *render_cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
+                env=render_env(),    # repository code: never the core's environment (OS-06)
             )
             render_out, _ = await render_proc.communicate()
             render_text = render_out.decode("utf-8", errors="replace").strip()
@@ -4171,6 +4175,7 @@ class DeploymentEngine:
                 *render_cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
+                env=render_env(),    # repository code: never the core's environment (OS-06)
             )
             render_out, _ = await render_proc.communicate()
             render_text = render_out.decode("utf-8", errors="replace").strip()
