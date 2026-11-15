@@ -216,6 +216,29 @@ def _build_fields() -> list[SettingField]:
             options_source="credentials", tier=TIER_CREDENTIALS, rule="credential_ref",
             description="Stored credential alias used for GitLab API calls (webhook upsert).",
         ),
+        # One token per purpose (audit OS-04). Secret slots, written through
+        # POST /settings/secrets/<key>. Empty = the shared webhook token keeps
+        # authorising that purpose; set = ONLY this token is accepted for it.
+        SettingField(
+            "gitlab_hook_token", "Token: GitLab group hooks", kind="password", category="GitLab Webhooks",
+            sensitive=True, vault_key="gitlab_hook_token", tier=TIER_CREDENTIALS,
+            description="Secret of the GitLab group/project hooks (POST /api/iac/webhook/gitlab — merge request "
+                        "notifications only; with this token a pipeline event never starts a deployment). "
+                        "Empty: the shared webhook token is accepted.",
+        ),
+        SettingField(
+            "gitlab_service_ci_token", "Token: service CI", kind="password", category="GitLab Webhooks",
+            sensitive=True, vault_key="gitlab_service_ci_token", tier=TIER_CREDENTIALS,
+            description="CI variable of the service pipelines (deploy/service/<svc>/gitlab and its status). With "
+                        "this token only the catalog's production branch of the service is deployed. "
+                        "Empty: the shared webhook token is accepted.",
+        ),
+        SettingField(
+            "gitlab_controller_ci_token", "Token: controller CI", kind="password", category="GitLab Webhooks",
+            sensitive=True, vault_key="gitlab_controller_ci_token", tier=TIER_CREDENTIALS,
+            description="CI variable of the iac-controller pipeline (infra/plan/gitlab, webhook/sync, test-host). "
+                        "Empty: the shared webhook token is accepted.",
+        ),
         SettingField(
             "autosync_enabled", "Auto-sync webhooks", kind="bool",
             category="GitLab Webhooks", vault_key="iac_webhook_autosync_enabled",

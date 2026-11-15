@@ -25,6 +25,7 @@ import time
 import re
 import secrets
 import asyncio
+from collections import OrderedDict, deque
 from pathlib import Path
 
 from fastapi import Request, Header, HTTPException
@@ -157,7 +158,44 @@ def _trigger_response(result: SubmitResult, message: str, **extra) -> dict:
 # one per request.
 _TOKEN_TTL_SECONDS = 30.0
 _TOKEN_REFRESH_MIN_SECONDS = 5.0
-_token_cache: dict = {"value": None, "at": 0.0, "forced_at": 0.0, "loaded": False}
+_token_cache: dict = {"value": None, "at": 0.0, "forced_at": 0.0, "loaded": False, "purpose": {}}
+
+# ── One token per purpose (audit OS-04, option A — backward compatible) ───────
+# The ONE shared token (``gitlab_webhook_token``) sits in every project hook and
+# in two CI variables and authorised every public action: a token leaked from a
+# hook could deploy. Each purpose now has its own secret slot. While a slot is
+# empty the shared token keeps authorising that purpose exactly as before (with
+# a deprecation warning); once it is set, ONLY that token is accepted for the
+# purpose — not the shared one, not the token of another purpose. Nothing here
+# ever writes, moves or deletes the shared token.
+SHARED_TOKEN_KEY = "gitlab_webhook_token"
+PURPOSE_HOOK = "hook"                    # POST /webhook/gitlab (group hooks: merge request events)
+PURPOSE_SERVICE_CI = "service_ci"        # deploy/service/<svc>/gitlab (+ status)
+PURPOSE_CONTROLLER_CI = "controller_ci"  # infra/plan/gitlab, webhook/sync, test-host, infra/apply/gitlab
+PURPOSE_TOKEN_KEYS = {
+    PURPOSE_HOOK: "gitlab_hook_token",
+    PURPOSE_SERVICE_CI: "gitlab_service_ci_token",
+    PURPOSE_CONTROLLER_CI: "gitlab_controller_ci_token",
+}
+MODE_DEDICATED, MODE_SHARED = "dedicated", "shared"
+#: The "shared token still in use" warning is logged once per purpose per hour.
+_DEPRECATION_LOG_SECONDS = 3600.0
+_deprecation_logged: dict[str, float] = {}
+
+# ── Failure rate limit per source address ──────────────────────────────────────
+# Counts REJECTED calls only, and a valid token is always accepted whatever the
+# count: the limit cannot be turned into a lock-out of the legitimate CI (all
+# GitLab runners share one egress address — one project with a stale token
+# variable polling the status route must not stop every other pipeline). What
+# the limit does: after ``_FAIL_LIMIT`` rejected calls within
+# ``_FAIL_WINDOW_SECONDS`` from one address, further rejected calls from it are
+# answered 429 + Retry-After and are not logged one by one (the Vault re-read
+# is limited for the whole instance anyway). In-process and bounded (``_FAIL_TRACKED_ADDRESSES``, least recently
+# failing address dropped first); each instance counts for itself.
+_FAIL_LIMIT = 20
+_FAIL_WINDOW_SECONDS = 60.0
+_FAIL_TRACKED_ADDRESSES = 2048
+_failures_by_address: "OrderedDict[str, deque]" = OrderedDict()
 #: Rejected token-route calls on this instance (health/diagnostics, audit OC-16:
 #: a rotated token that CI still uses otherwise fails without a trace).
 webhook_auth_failures: dict = {"count": 0, "last_at": None}
@@ -167,47 +205,135 @@ def _reset_token_cache(value: str | None = None) -> None:
     _token_cache.update(value=value, at=time.monotonic() if value else 0.0, loaded=bool(value))
 
 
-async def _expected_webhook_token(*, force: bool = False) -> str | None:
+def _read_tokens() -> tuple[str | None, dict]:
+    """The shared token and the purpose tokens from Vault (sync: thread)."""
+    def read(key: str) -> str | None:
+        value = _ctx.get_secret(key)
+        return value if isinstance(value, str) and value else None
+
+    return read(SHARED_TOKEN_KEY), {purpose: read(key) for purpose, key in PURPOSE_TOKEN_KEYS.items()}
+
+
+async def _load_tokens(*, force: bool = False) -> tuple[str | None, dict]:
+    """``(shared token, {purpose: dedicated token | None})`` — cached, read off
+    the event loop in one go."""
     now = time.monotonic()
     if not force and _token_cache["loaded"] and now - _token_cache["at"] < _TOKEN_TTL_SECONDS:
-        return _token_cache["value"]
-    reader = getattr(_ctx, "aget_secret", None)      # core API >= 1.14
-    if callable(reader) and asyncio.iscoroutinefunction(reader):
-        value = await reader("gitlab_webhook_token")
-    else:
-        value = await off_loop(_ctx.get_secret, "gitlab_webhook_token")
-    value = value if isinstance(value, str) and value else None
-    _token_cache.update(value=value, at=time.monotonic(), loaded=True)
-    return value
+        return _token_cache["value"], _token_cache.get("purpose") or {}
+    shared, dedicated = await off_loop(_read_tokens)
+    _token_cache.update(value=shared, purpose=dedicated, at=time.monotonic(), loaded=True)
+    return shared, dedicated
 
 
-def _token_matches(presented: str | None, expected: str) -> bool:
-    if not presented:
+async def _expected_webhook_token(*, force: bool = False) -> str | None:
+    """The shared webhook token (kept for callers that need only that)."""
+    return (await _load_tokens(force=force))[0]
+
+
+def _token_matches(presented: str | None, expected: str | None) -> bool:
+    if not presented or not expected:
         return False
     # Bytes, so a non-ASCII header is a plain mismatch (compare_digest raises on
     # non-ASCII str — that used to be a 500).
-    return hmac.compare_digest(str(presented).encode("utf-8", "replace"), expected.encode("utf-8", "replace"))
+    return hmac.compare_digest(str(presented).encode("utf-8", "replace"), str(expected).encode("utf-8", "replace"))
 
 
-async def _require_gitlab_token(x_gitlab_token: str | None):
+def _accepted_token(purpose: str | None, shared: str | None, dedicated: dict) -> tuple[str | None, str]:
+    """``(the one token accepted for this purpose, mode)``. A purpose whose slot
+    is set accepts that token only; an empty slot (or no purpose) the shared one."""
+    own = (dedicated or {}).get(purpose) if purpose else None
+    return (own, MODE_DEDICATED) if own else (shared, MODE_SHARED)
+
+
+def _source_address(request) -> str:
+    try:
+        return str(request.client.host or "unknown")[:64]
+    except Exception:
+        return "unknown"
+
+
+def _failures_in_window(address: str, now: float) -> int:
+    stamps = _failures_by_address.get(address)
+    if not stamps:
+        return 0
+    while stamps and now - stamps[0] > _FAIL_WINDOW_SECONDS:
+        stamps.popleft()
+    if not stamps:
+        _failures_by_address.pop(address, None)
+        return 0
+    return len(stamps)
+
+
+def _record_failure(address: str, now: float) -> None:
+    stamps = _failures_by_address.get(address)
+    if stamps is None:
+        stamps = _failures_by_address[address] = deque(maxlen=_FAIL_LIMIT)
+        while len(_failures_by_address) > _FAIL_TRACKED_ADDRESSES:
+            _failures_by_address.popitem(last=False)
+    stamps.append(now)
+    _failures_by_address.move_to_end(address)
+
+
+def _warn_shared_token(purpose: str) -> None:
+    now = time.monotonic()
+    last = _deprecation_logged.get(purpose)
+    if last is not None and now - last < _DEPRECATION_LOG_SECONDS:
+        return
+    _deprecation_logged[purpose] = now
+    _ctx.log.warning(
+        f"DEPRECATED: a '{purpose}' call was authorised by the shared webhook token. Store a token of its own "
+        f"in the secret slot '{PURPOSE_TOKEN_KEYS[purpose]}' (documentation.md → Webhook-Tokens); from then on "
+        "only that token is accepted for this purpose.")
+
+
+async def token_modes() -> dict:
+    """``{purpose: "dedicated" | "shared" | "unconfigured"}`` — for the plugin health."""
+    try:
+        shared, dedicated = await _load_tokens()
+    except Exception:
+        return {purpose: "unknown" for purpose in PURPOSE_TOKEN_KEYS}
+    return {purpose: (MODE_DEDICATED if dedicated.get(purpose) else (MODE_SHARED if shared else "unconfigured"))
+            for purpose in PURPOSE_TOKEN_KEYS}
+
+
+async def _require_gitlab_token(x_gitlab_token: str | None, purpose: str | None = None, request=None) -> str:
+    """Authorise a call of a public route for ``purpose``. Returns the mode it
+    was accepted in (``dedicated`` — the purpose's own token — or ``shared``).
+    Raises 401, 429 for an address over the failure limit, 500 when no token is
+    configured at all."""
     if not _ctx:
         raise HTTPException(status_code=500, detail="API Context not initialized")
-    expected = await _expected_webhook_token()
-    if expected and _token_matches(x_gitlab_token, expected):
-        return
-    # Unknown or changed? One fresh read at most every few seconds.
-    now = time.monotonic()
-    if now - _token_cache["forced_at"] >= _TOKEN_REFRESH_MIN_SECONDS:
+    shared, dedicated = await _load_tokens()
+    expected, mode = _accepted_token(purpose, shared, dedicated)
+    address, now = _source_address(request), time.monotonic()
+    throttled = _failures_in_window(address, now) >= _FAIL_LIMIT
+    if not _token_matches(x_gitlab_token, expected) \
+            and now - _token_cache["forced_at"] >= _TOKEN_REFRESH_MIN_SECONDS:
+        # Unknown or changed? One fresh read at most every few seconds (for the
+        # whole instance, whoever asks) — so a token rotated on another instance
+        # is accepted quickly, also from an address that is over its failure limit.
         _token_cache["forced_at"] = now
-        expected = await _expected_webhook_token(force=True)
-        if expected and _token_matches(x_gitlab_token, expected):
-            return
+        shared, dedicated = await _load_tokens(force=True)
+        expected, mode = _accepted_token(purpose, shared, dedicated)
+    if _token_matches(x_gitlab_token, expected):
+        if mode == MODE_SHARED and purpose in PURPOSE_TOKEN_KEYS:
+            _warn_shared_token(purpose)
+        return mode
     if not expected:
         _ctx.log.error("SECURITY HALT: Webhook token missing in Vault.")
         raise HTTPException(status_code=500, detail="Configuration Error")
     webhook_auth_failures["count"] += 1
     webhook_auth_failures["last_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    _ctx.log.warning("SECURITY REJECTION: Unauthorized webhook attempt.")
+    if throttled:
+        retry_after = max(1, int(_FAIL_WINDOW_SECONDS - (now - _failures_by_address[address][0])) + 1)
+        raise HTTPException(status_code=429, detail="Too many rejected calls from this address",
+                            headers={"Retry-After": str(retry_after)})
+    _record_failure(address, now)
+    if _failures_in_window(address, now) >= _FAIL_LIMIT:
+        _ctx.log.warning(f"SECURITY REJECTION: {_FAIL_LIMIT} unauthorized webhook attempts from {address} within "
+                         f"{int(_FAIL_WINDOW_SECONDS)}s — further rejected calls from it get 429.")
+    else:
+        _ctx.log.warning(f"SECURITY REJECTION: Unauthorized webhook attempt ({purpose or 'token'} route, {address}).")
     raise HTTPException(status_code=401, detail="Unauthorized")
 
 
@@ -292,7 +418,7 @@ def _ticket_scopes(ticket: str | None) -> set[str]:
         body, sig = raw.rsplit(":", 1)
         exp_s, scopes = body.split(":", 1)
         expected = hmac.new(_STREAM_TICKET_KEY, body.encode(), "sha256").hexdigest()
-        if not hmac.compare_digest(sig, expected):
+        if not hmac.compare_digest(sig.encode("utf-8", "replace"), expected.encode()):
             return set()
         if int(exp_s) < int(time.time()):
             return set()
@@ -691,12 +817,24 @@ async def do_gitlab_webhook(request: Request, x_gitlab_token: str | None):
     if not _ctx:
         raise HTTPException(status_code=500, detail="API Context not initialized")
 
-    await _require_gitlab_token(x_gitlab_token)
+    mode = await _require_gitlab_token(x_gitlab_token, PURPOSE_HOOK, request)
 
     try:
         payload = await request.json()
         project_name = payload.get("project", {}).get("name", "unknown")
         _ctx.log.info(f"WEBHOOK: Verified push for project '{project_name}'.")
+        if mode == MODE_DEDICATED and str(payload.get("object_kind") or "").lower() == "pipeline":
+            # The dedicated hook token is for what the group hooks really send:
+            # merge request events (gitlab_webhooks registers them with
+            # pipeline_events/push_events/job_events off). A ``pipeline`` body on
+            # this route is hand-built — it could start a deploy, which is the
+            # service CI's job with its own token. 200, so a hook that does send
+            # one is not disabled by GitLab; nothing is triggered or announced.
+            _ctx.log.warning(f"WEBHOOK: pipeline event for '{project_name}' ignored — the hook token does not "
+                             "trigger deployments.")
+            return {"status": "accepted", "triggered": False,
+                    "reason": "pipeline events are not accepted with the hook token; deployments are triggered "
+                              "by the service CI"}
 
         now = time.time()
         _prune_recent_events(now)
@@ -741,11 +879,11 @@ async def do_gitlab_webhook(request: Request, x_gitlab_token: str | None):
         raise HTTPException(status_code=400, detail="Malformed JSON payload")
 
 
-async def do_sync_webhooks(x_gitlab_token: str | None):
+async def do_sync_webhooks(x_gitlab_token: str | None, request=None):
     """Token-protected, idempotent re-registration of the group webhooks."""
     if not _ctx:
         raise HTTPException(status_code=500, detail="API Context not initialized")
-    await _require_gitlab_token(x_gitlab_token)
+    await _require_gitlab_token(x_gitlab_token, PURPOSE_CONTROLLER_CI, request)
     from .gitlab_webhooks import sync_group_webhooks_from_ctx, WebhookConfigError
     try:
         result = await off_loop(sync_group_webhooks_from_ctx, _ctx)
@@ -783,7 +921,7 @@ async def do_get_catalog():
 
 
 async def do_trigger_service_deployment(service_name: str, payload: DeployRequest, *, trigger: str = "ui",
-                                        identity=None):
+                                        identity=None, prod_only: bool = False):
     """Triggers a targeted single-service deployment.
 
     ``trigger`` tells the maintenance policy stage where the deploy comes from:
@@ -795,6 +933,21 @@ async def do_trigger_service_deployment(service_name: str, payload: DeployReques
         raise HTTPException(status_code=500, detail="Context offline")
     normalized_service = str(service_name or "").strip().lower()
     branch = str(payload.branch or "main").strip() or "main"
+    require_prod = False
+    if prod_only:
+        # The dedicated service-CI token deploys the catalog's production branch
+        # of the service and nothing else (audit OS-04/OS-05): the branch in the
+        # body is not a choice the token holder has. Without a policy on this
+        # instance yet, the runner enforces it (``require_prod_branch``).
+        policy = await off_loop(_service.branch_policy) if _service is not None else None
+        if policy:
+            forced = branch_policy.prod_branch(policy, normalized_service)
+            if forced != branch:
+                _ctx.log.info(f"API: service-CI trigger for '{normalized_service}' asked for branch '{branch}' — "
+                              f"deploying the production branch '{forced}'.")
+            branch = forced
+        else:
+            require_prod = True
     if not _is_safe_git_ref_token(normalized_service):
         raise HTTPException(
             status_code=400,
@@ -820,6 +973,8 @@ async def do_trigger_service_deployment(service_name: str, payload: DeployReques
     }
     if payload.dry_run:
         event_payload["dry_run"] = True
+    if require_prod:
+        event_payload["require_prod_branch"] = True
     result = await _submit(event_payload, ENT_TRIGGER, actor=_actor(identity))
     kind = "Dry-run (--check)" if payload.dry_run else "Deployment"
     return _trigger_response(result, f"{kind} queued for {normalized_service}", dry_run=bool(payload.dry_run))
@@ -1124,7 +1279,7 @@ async def do_trigger_infra_plan(identity=None):
     return _trigger_response(result, "Infrastructure plan (Check Env) queued.")
 
 
-async def do_trigger_infra_apply_by_token(x_gitlab_token: str | None):
+async def do_trigger_infra_apply_by_token(x_gitlab_token: str | None, request=None):
     """``POST /api/iac/infra/apply/gitlab``: fleet apply for a token holder.
 
     Disabled unless ``token_infra_apply_enabled`` is set (audit OS-03): the one
@@ -1140,7 +1295,7 @@ async def do_trigger_infra_apply_by_token(x_gitlab_token: str | None):
             status_code=404,
             detail="Token-triggered infrastructure apply is disabled (setting token_infra_apply_enabled).",
         )
-    await _require_gitlab_token(x_gitlab_token)
+    await _require_gitlab_token(x_gitlab_token, PURPOSE_CONTROLLER_CI, request)
     return await do_trigger_infra_apply()
 
 

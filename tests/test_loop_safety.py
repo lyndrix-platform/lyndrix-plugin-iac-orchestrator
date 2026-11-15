@@ -58,7 +58,7 @@ def test_token_check_is_cached_and_off_the_loop(monkeypatch):
         return await _max_loop_lag(many())
 
     _, lag = asyncio.run(scenario())
-    assert ctx.reads == 1                         # 20 requests, one Vault read
+    assert ctx.reads == 4                         # 20 requests, ONE read of the four token slots
     assert lag < 0.2                              # … and that one did not stall the loop (0.3 s read)
 
 
@@ -70,10 +70,11 @@ def test_bogus_tokens_cost_at_most_one_read_per_interval(monkeypatch):
         for bad in ["x", "", None, "wrong-token-not-real", "tökén-nön-ascii"] * 20:
             with pytest.raises(HTTPException) as exc:
                 await api_mod._require_gitlab_token(bad)
-            assert exc.value.status_code == 401   # a non-ASCII header is a 401, not a 500
+            # a non-ASCII header is a 401, not a 500; past the failure limit of an address: 429
+            assert exc.value.status_code in (401, 429)
 
     asyncio.run(hammer())
-    assert ctx.reads <= 2                         # initial read + one forced re-read, not 100
+    assert ctx.reads <= 8                         # initial read + one forced re-read (4 slots each), not 100
     assert api_mod.webhook_auth_failures["count"] == 100 and api_mod.webhook_auth_failures["last_at"]
 
 

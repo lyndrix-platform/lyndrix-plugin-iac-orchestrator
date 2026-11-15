@@ -6,7 +6,10 @@ plugin registry wraps every registered route with ``require_api_auth``, which
 would reject a GitLab caller that has no Lyndrix user token. Instead this router
 is mounted DIRECTLY on the FastAPI app (the sanctioned exception for public
 endpoints) and every handler validates the GitLab ``x_gitlab_token`` itself,
-in-handler, via :func:`_require_gitlab_token`.
+in-handler, via :func:`_require_gitlab_token` — for the PURPOSE of its route
+(hook / service CI / controller CI, audit OS-04): each purpose has its own
+secret slot, and the shared ``gitlab_webhook_token`` authorises a purpose only
+while that slot is empty.
 
 Mounted from ``entrypoint.setup()`` with::
 
@@ -39,27 +42,31 @@ def build_webhook_router(service) -> APIRouter:
         return await _api.do_gitlab_webhook(request, x_gitlab_token)
 
     @router.post("/webhook/sync")
-    async def sync_webhooks(x_gitlab_token: str = Header(None)):
-        return await _api.do_sync_webhooks(x_gitlab_token)
+    async def sync_webhooks(request: Request, x_gitlab_token: str = Header(None)):
+        return await _api.do_sync_webhooks(x_gitlab_token, request)
 
     @router.post("/deploy/service/{service_name}/gitlab")
     async def trigger_service_deployment_gitlab(
         service_name: str,
         payload: _api.DeployRequest,
+        request: Request,
         x_gitlab_token: str = Header(None),
     ):
-        await _api._require_gitlab_token(x_gitlab_token)
+        mode = await _api._require_gitlab_token(x_gitlab_token, _api.PURPOSE_SERVICE_CI, request)
         # CI-originated: the service's deploy_policy applies (may be parked as SCHEDULED).
-        return await _api.do_trigger_service_deployment(service_name, payload, trigger="gitlab-ci")
+        # With the dedicated service-CI token only the production branch is deployed.
+        return await _api.do_trigger_service_deployment(service_name, payload, trigger="gitlab-ci",
+                                                        prod_only=mode == _api.MODE_DEDICATED)
 
     @router.get("/deploy/service/{service_name}/gitlab/status")
     async def get_service_deployment_status_gitlab(
         service_name: str,
+        request: Request,
         since_epoch: int = 0,
         accept: str | None = None,
         x_gitlab_token: str = Header(None),
     ):
-        await _api._require_gitlab_token(x_gitlab_token)
+        await _api._require_gitlab_token(x_gitlab_token, _api.PURPOSE_SERVICE_CI, request)
         # ``accept=scheduled``: the caller understands a parked deploy and gets
         # ``status: "scheduled"``; older CI templates get the compatibility mapping.
         return await _api.do_get_service_status(service_name, since_epoch=since_epoch, accept=accept)
@@ -68,19 +75,20 @@ def build_webhook_router(service) -> APIRouter:
     async def gitlab_test_host_webhook(
         host_name: str,
         payload: _api.TestHostDeployRequest,
+        request: Request,
         x_gitlab_token: str = Header(None),
     ):
-        await _api._require_gitlab_token(x_gitlab_token)
+        await _api._require_gitlab_token(x_gitlab_token, _api.PURPOSE_CONTROLLER_CI, request)
         return await _api.do_trigger_test_host_deployment(host_name, payload)
 
     @router.post("/infra/plan/gitlab")
-    async def trigger_infra_plan_gitlab(x_gitlab_token: str = Header(None)):
-        await _api._require_gitlab_token(x_gitlab_token)
+    async def trigger_infra_plan_gitlab(request: Request, x_gitlab_token: str = Header(None)):
+        await _api._require_gitlab_token(x_gitlab_token, _api.PURPOSE_CONTROLLER_CI, request)
         return await _api.do_trigger_infra_plan()
 
     @router.post("/infra/apply/gitlab")
-    async def trigger_infra_apply_gitlab(x_gitlab_token: str = Header(None)):
+    async def trigger_infra_apply_gitlab(request: Request, x_gitlab_token: str = Header(None)):
         # Off by default (setting token_infra_apply_enabled) — see the handler.
-        return await _api.do_trigger_infra_apply_by_token(x_gitlab_token)
+        return await _api.do_trigger_infra_apply_by_token(x_gitlab_token, request)
 
     return router

@@ -91,6 +91,8 @@ def _reset_api_caches():
         api_mod._health_cache.update(at=0.0, value=None)
         api_mod._snapshot_cache.update(at=0.0, value=None, task=None)
         api_mod.webhook_auth_failures.update(count=0, last_at=None)
+        api_mod._failures_by_address.clear()
+        api_mod._deprecation_logged.clear()
 
     _reset()
     yield

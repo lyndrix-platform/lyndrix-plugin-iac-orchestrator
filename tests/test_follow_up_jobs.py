@@ -344,7 +344,7 @@ def test_webhook_answers_200_and_tells_the_truth_about_a_refused_event(monkeypat
     async def submit_job_ex(payload, *, entitlements=(), requested_by=None):
         return SubmitResult(None, "duplicate", duplicate_of=9, reason="a queued job for this target does something else")
 
-    async def no_token_check(_token):
+    async def no_token_check(_token, *_purpose_and_request):
         return None
 
     async def body():

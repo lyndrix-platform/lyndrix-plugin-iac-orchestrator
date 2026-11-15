@@ -148,7 +148,11 @@ def sync_group_webhooks_from_ctx(ctx) -> dict:
     group_id_raw = (ctx.get_secret("iac_gitlab_group_id") or "").strip()
     lyndrix_base_url = (ctx.get_secret("iac_lyndrix_base_url") or "").strip()
     token_key = (ctx.get_secret("iac_gitlab_api_token_key") or "").strip()
-    webhook_token = ctx.get_secret("gitlab_webhook_token")
+    # The secret the hooks send: the dedicated hook token once its slot is set
+    # (audit OS-04) — from then on the receiving route accepts nothing else, so
+    # the next sync writes it into every project hook. Until then the shared
+    # webhook token, as before.
+    webhook_token = ctx.get_secret("gitlab_hook_token") or ctx.get_secret("gitlab_webhook_token")
 
     if not group_id_raw.isdigit():
         raise WebhookConfigError("GitLab Group ID is not set or not numeric.")

@@ -281,6 +281,10 @@ async def health(ctx) -> PluginHealthStatus:
             latency_ms=round((time.perf_counter() - start) * 1000, 1),
         )
 
+    # Which public purposes still run on the shared webhook token (audit OS-04).
+    token_modes = await _api_module.token_modes()
+    on_shared = sorted(p for p, mode in token_modes.items() if mode == "shared")
+
     latency = round((time.perf_counter() - start) * 1000, 1)
     return PluginHealthStatus(
         # Control plane without any live runner: the API works, jobs queue up but
@@ -298,6 +302,14 @@ async def health(ctx) -> PluginHealthStatus:
             # Rejected calls on the token routes of this instance — a rotated
             # webhook token that CI still uses shows up here, not only in CI.
             "webhook_auth_failures": dict(_api_module.webhook_auth_failures),
+            # hook / service_ci / controller_ci: "dedicated" (own secret slot) or
+            # "shared" (still authorised by gitlab_webhook_token — deprecated).
+            "webhook_tokens": {
+                **token_modes,
+                "hint": ("Purposes still authorised by the shared webhook token: " + ", ".join(on_shared)
+                         + " — store a token per purpose (secret slots "
+                         + ", ".join(_api_module.PURPOSE_TOKEN_KEYS[p] for p in on_shared) + ").") if on_shared else "",
+            },
             # Orphan sweep (lease-held by one instance): visible on every instance.
             "orphan_sweep": {
                 "enabled": bool(await off_loop(lambda: svc.config.orphan_sweep_enabled)),
