@@ -229,9 +229,15 @@ def test_interrupted_rollout_is_failed_not_resumed(sqlite_queue, monkeypatch):
     async def not_finalized(job_id, *, reason=""):
         return False
 
+    async def no_job_containers(*a, **k):
+        return []
+
     svc.engine.execute_ansible_docker = fake_ansible
     svc.engine.reconcile_orphaned_runners = no_containers
     svc.engine.finalize_from_containers = not_finalized
+    # Never the host's Docker: unmocked, the reconciliation listed (and removed)
+    # the runner containers of whatever orchestrator runs on the same machine.
+    svc.engine._list_job_containers = no_job_containers
 
     async def scenario():
         await svc.run_startup_reconciliation()

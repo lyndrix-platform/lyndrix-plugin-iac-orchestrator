@@ -172,3 +172,62 @@ def loop_guard(monkeypatch):
     monkeypatch.setattr(yaml, "safe_load", guard.wrap(yaml.safe_load, "yaml.safe_load"))
     yield guard
     assert not guard.violations, "blocking calls on the event loop:\n" + "\n".join(guard.violations)
+
+
+class RealDockerCalled(AssertionError):
+    """A test reached the host's real Docker CLI."""
+
+
+@pytest.fixture(autouse=True)
+def _no_real_docker(monkeypatch):
+    """Tests never talk to the Docker daemon of the machine they run on.
+
+    Staging 2026-11-15: a test ran the startup reconciliation unmocked —
+    ``docker ps --filter label=iac_job_id`` listed the runner containers of the
+    staging orchestrator on the same host and ``docker rm -f`` removed every one
+    whose job was not RUNNING in the test database (three IaC jobs killed). On
+    a runner host (docker-auto) that kills production jobs. A test that needs
+    Docker mocks ``engine._docker`` / ``_list_job_containers`` itself; a
+    monkeypatch inside the test replaces this guard."""
+    import asyncio as _asyncio
+    import subprocess as _subprocess
+
+    def _is_docker(args) -> bool:
+        first = args[0] if args else ""
+        if isinstance(first, (list, tuple)):
+            first = first[0] if first else ""
+        return str(first).rsplit("/", 1)[-1] == "docker"
+
+    real_exec = _asyncio.create_subprocess_exec
+
+    async def guarded_exec(*args, **kwargs):
+        if _is_docker(args):
+            raise RealDockerCalled(f"test called the real Docker CLI: {args[:4]}")
+        return await real_exec(*args, **kwargs)
+
+    real_run = _subprocess.run
+
+    def guarded_run(*args, **kwargs):
+        if _is_docker(args):
+            raise RealDockerCalled(f"test called the real Docker CLI: {args[0][:4]}")
+        return real_run(*args, **kwargs)
+
+    real_shell = _asyncio.create_subprocess_shell
+
+    async def guarded_shell(cmd, *args, **kwargs):
+        if "docker" in str(cmd).split():
+            raise RealDockerCalled(f"test called the real Docker CLI: {str(cmd)[:60]}")
+        return await real_shell(cmd, *args, **kwargs)
+
+    def _guard_sync(real):
+        def guarded(*args, **kwargs):
+            if _is_docker(args):
+                raise RealDockerCalled(f"test called the real Docker CLI: {args[0][:4]}")
+            return real(*args, **kwargs)
+        return guarded
+
+    monkeypatch.setattr(_asyncio, "create_subprocess_exec", guarded_exec)
+    monkeypatch.setattr(_asyncio, "create_subprocess_shell", guarded_shell)
+    monkeypatch.setattr(_subprocess, "run", guarded_run)
+    for name in ("call", "check_call", "check_output"):
+        monkeypatch.setattr(_subprocess, name, _guard_sync(getattr(_subprocess, name)))
