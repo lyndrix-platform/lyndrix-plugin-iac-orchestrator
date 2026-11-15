@@ -95,3 +95,78 @@ def _reset_api_caches():
     _reset()
     yield
     _reset()
+
+
+class LoopGuard:
+    """Fails a test when blocking work runs on an event-loop thread (review C3).
+
+    Every database session of the plugin (``read_committed_session`` — the
+    JobDatabase and the JobQueue both go through it) and every
+    ``yaml.safe_load`` is checked; ``guard.ctx(ctx)`` adds the Vault accessor
+    of a (mock) plugin context and ``guard.watch(obj, "method", …)`` any other
+    synchronous call. The test's OWN inspection of the database belongs outside
+    the loop or inside ``with guard.paused():``.
+    """
+
+    def __init__(self):
+        self.violations: list[str] = []
+        self._paused = 0
+
+    def check(self, what: str) -> None:
+        import asyncio
+        import traceback
+
+        if self._paused:
+            return
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return                                   # a worker thread: fine
+        frames = [f for f in traceback.extract_stack()[:-2] if "/asyncio/" not in f.filename][-5:]
+        trail = " <- ".join(f"{Path(f.filename).name}:{f.lineno} {f.name}" for f in reversed(frames))
+        self.violations.append(f"{what} on the event loop: {trail}")
+
+    def wrap(self, fn, what: str):
+        def guarded(*args, **kwargs):
+            self.check(what)
+            return fn(*args, **kwargs)
+
+        return guarded
+
+    def watch(self, obj, *names: str, label: str | None = None):
+        for name in names:
+            setattr(obj, name, self.wrap(getattr(obj, name), f"{label or type(obj).__name__}.{name}"))
+        return obj
+
+    def ctx(self, ctx):
+        return self.watch(ctx, "get_secret", label="ctx")
+
+    def paused(self):
+        guard = self
+
+        class _Paused:
+            def __enter__(self):
+                guard._paused += 1
+
+            def __exit__(self, *exc):
+                guard._paused -= 1
+                return False
+
+        return _Paused()
+
+
+@pytest.fixture
+def loop_guard(monkeypatch):
+    """Opt-in: the test fails when a database session, a YAML parse or a guarded
+    call happens on the event loop. ``loop_guard.violations`` can be inspected
+    (and cleared) by a test that provokes one on purpose."""
+    import yaml
+
+    from iac_plugin.app.model import database as database_mod
+
+    guard = LoopGuard()
+    monkeypatch.setattr(database_mod, "read_committed_session",
+                        guard.wrap(database_mod.read_committed_session, "database session"))
+    monkeypatch.setattr(yaml, "safe_load", guard.wrap(yaml.safe_load, "yaml.safe_load"))
+    yield guard
+    assert not guard.violations, "blocking calls on the event loop:\n" + "\n".join(guard.violations)

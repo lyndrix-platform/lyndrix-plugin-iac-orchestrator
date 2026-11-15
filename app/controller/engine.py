@@ -24,6 +24,7 @@ from . import maintenance_resolver as mres
 from .public_projection import public_names, public_scalar, public_terraform, public_url, scrub
 from .config import allowed_registry_hosts, registry_host
 from .settings_schema import resolve_credential
+from .offloop import CoalescedWriter, off_loop
 from .runner_output import RunnerOutputParser
 from .redaction import SecretRedactor, secret_values_of
 from ...stages.git import (
@@ -242,19 +243,23 @@ class MaintenancePolicyStage(BaseStage):
         controller_root = engine.base_git_dir / "iac_controller"
         svc = self.service_name
 
+        async def setting(name: str):
+            # The maintenance settings live in Vault (sync hvac round trip).
+            return await off_loop(getattr, cfg, name)
+
         # 1. Target hosts (controller is the SSoT; the branch only narrows the stage).
         hint = self._stage_hint()
-        targets = await asyncio.to_thread(mres.find_service_hosts, controller_root, svc, stage=hint)
+        targets = await off_loop(mres.find_service_hosts, controller_root, svc, stage=hint)
         if not targets and hint:
-            targets = await asyncio.to_thread(mres.find_service_hosts, controller_root, svc)
+            targets = await off_loop(mres.find_service_hosts, controller_root, svc)
         if not targets:
             log.info(f"[MAINTENANCE] No controller host lists service '{svc}' — no deploy policy, no override.")
             return StageResult(True, "No target host in the controller — maintenance policy skipped")
 
-        services = await asyncio.to_thread(mres.scan_service_ymls, [engine.config.services_dir])
+        services = await off_loop(mres.scan_service_ymls, [engine.config.services_dir])
         items: list[dict] = []
         for site, stage in sorted({(s, st) for s, st, _ in targets}):
-            tree = await asyncio.to_thread(mres.load_tree, controller_root, site, stage)
+            tree = await off_loop(mres.load_tree, controller_root, site, stage)
             items.extend(mres.resolve(site, stage, tree, services, getattr(engine, "_ci_map", None) or {},
                                       include_hypervisors=False))
         decision = mres.service_policy(items, svc, [h for _, _, h in targets])
@@ -265,7 +270,7 @@ class MaintenancePolicyStage(BaseStage):
         # 2./3. Policy.
         sched = None
         if engine.queue is not None and job_id:
-            sched = await asyncio.to_thread(engine.queue.job_schedule, job_id)
+            sched = await off_loop(engine.queue.job_schedule, job_id)
         due = bool(sched and sched.get("not_before") and sched["not_before"] <= now)
         message = "deploying now"
         if not mres.policy_applies(self.payload):
@@ -282,7 +287,7 @@ class MaintenancePolicyStage(BaseStage):
                          f"until {mw.iso(current.end)} — deploying now.")
                 message = f"inside maintenance window until {mw.iso(current.end)}"
             else:
-                horizon_days = int(cfg.maintenance_schedule_horizon_days)
+                horizon_days = int(await setting("maintenance_schedule_horizon_days"))
                 nxt = (mw.next_start(decision.schedules, now, horizon=timedelta(days=horizon_days))
                        if decision.schedules else None)
                 if nxt is not None:
@@ -299,7 +304,7 @@ class MaintenancePolicyStage(BaseStage):
                                   f"opens {mw.iso(nxt)}")
                     parked = False
                     if engine.queue is not None and job_id:
-                        parked = await asyncio.to_thread(
+                        parked = await off_loop(
                             engine.queue.park, job_id, not_before=nxt, window_ci_ids=decision.ci_ids,
                             reason=reason, instance_id=getattr(engine.ctx, "instance_id", None),
                         )
@@ -317,7 +322,7 @@ class MaintenancePolicyStage(BaseStage):
                         f"window in service.yml or the iac-controller (maintenance / maintenance_default)."
                     )
                     message = f"no maintenance window within {horizon_days} days — deployed at once (warning)"
-                    if not cfg.maintenance_report_missing_window:
+                    if not await setting("maintenance_report_missing_window"):
                         log.info("[MAINTENANCE] window_missing report disabled by setting.")
                     elif not decision.service_ci_id:
                         log.info("[MAINTENANCE] Service has no CI id (Entity Registry absent) — no window_missing event.")
@@ -333,17 +338,18 @@ class MaintenancePolicyStage(BaseStage):
             log.info(f"[MAINTENANCE] deploy_policy '{decision.deploy_policy}' for {svc} @ {decision.host} — deploying now.")
 
         # 4. Override: every executed deploy restarts containers → mark maintenance.
-        if cfg.maintenance_deploy_marks_maintenance and decision.ci_ids and job_id and engine.queue is not None:
+        marks_maintenance = bool(await setting("maintenance_deploy_marks_maintenance"))
+        if marks_maintenance and decision.ci_ids and job_id and engine.queue is not None:
             override_id = f"iac-job-{job_id}"
             engine.ctx.emit(mw.TOPIC_OVERRIDE_STARTED, mres.override_started_payload(
                 override_id, decision.ci_ids, reason=f"IaC deploy of {svc} (job #{job_id})", now=now,
-                max_override_minutes=int(cfg.maintenance_max_override_minutes),
-                linger_minutes=int(cfg.maintenance_linger_minutes),
+                max_override_minutes=int(await setting("maintenance_max_override_minutes")),
+                linger_minutes=int(await setting("maintenance_linger_minutes")),
             ))
-            await asyncio.to_thread(engine.queue.set_override, job_id, override_id, decision.ci_ids)
+            await off_loop(engine.queue.set_override, job_id, override_id, decision.ci_ids)
             context["override_id"] = override_id
             log.info(f"[MAINTENANCE] Override {override_id} started for {len(decision.ci_ids)} CI(s).")
-        elif cfg.maintenance_deploy_marks_maintenance and not decision.ci_ids:
+        elif marks_maintenance and not decision.ci_ids:
             log.info("[MAINTENANCE] No CI ids for the target hosts (Entity Registry absent) — no override event.")
         return StageResult(True, f"Maintenance policy '{decision.deploy_policy}': {message}")
 
@@ -436,7 +442,7 @@ class TerraformStateCheckStage(BaseStage):
         if not self.host_name:
             return StageResult(False, "Missing host_name for state check.")
         try:
-            ctx = engine._find_terraform_context_for_host(self.host_name)
+            ctx = await off_loop(engine._find_terraform_context_for_host, self.host_name)
         except Exception as exc:
             return StageResult(False, f"State check: {exc}")
         addr = (
@@ -450,9 +456,9 @@ class TerraformStateCheckStage(BaseStage):
         )
         present = False
         try:
-            log_text = Path(
-                engine.config.get_log_path(context.get("job_id", 0))
-            ).read_text(encoding="utf-8", errors="replace")
+            log_text = await off_loop(
+                Path(engine.config.get_log_path(context.get("job_id", 0))).read_text,
+                encoding="utf-8", errors="replace")
             present = addr in log_text
         except Exception:
             pass
@@ -616,7 +622,7 @@ class ComplianceBootstrapStage(BaseStage):
     async def run(self, engine, context: dict) -> StageResult:
         if not self.host_name:
             return StageResult(False, "Missing host_name for compliance bootstrap.")
-        if not engine.ctx.get_secret("iac_tf_ssh_private_key"):
+        if not await off_loop(engine.ctx.get_secret, "iac_tf_ssh_private_key"):
             return StageResult(
                 False,
                 "Missing root SSH private key. Set 'Root SSH Private Key' in the "
@@ -653,7 +659,7 @@ class InvalidateHostStateStage(BaseStage):
         if not context.get("container_created"):
             return StageResult(True, "No fresh container created; preserving last_known_good.")
 
-        record = engine.db.get_state("last_known_good")
+        record = await off_loop(engine.db.get_state, "last_known_good")
         state = (record.get("data") if record else {}) or {}
         removed = False
         for key in list(state.keys()):
@@ -661,7 +667,7 @@ class InvalidateHostStateStage(BaseStage):
                 state.pop(key, None)
                 removed = True
         if removed:
-            engine.db.update_state("last_known_good", state, "latest")
+            await off_loop(engine.db.update_state, "last_known_good", state, "latest")
             return StageResult(
                 True,
                 f"Cleared '{self.host_name}' from last_known_good; host rollout will redeploy its services.",
@@ -782,18 +788,19 @@ class DetectDriftStage(BaseStage):
     async def run(self, engine, context: dict) -> StageResult:
         log.info("Comparing current desired state against last known good state...")
         
-        current_desired_state = self._load_current_state_from_git(engine)
+        # Every controller YAML is parsed here — off the loop, like the drift diff.
+        current_desired_state = await off_loop(self._load_current_state_from_git, engine)
         if not current_desired_state:
             return StageResult(False, "Could not parse current desired state from Git.")
 
         # Save state to context so PersistStateStage can save it to the DB later
         context["current_desired_state"] = current_desired_state
 
-        last_known_good_record = engine.db.get_state("last_known_good")
+        last_known_good_record = await off_loop(engine.db.get_state, "last_known_good")
         # `data` can be stored as null → coerce to {} so drift parsing never sees None.
         last_known_good_state = (last_known_good_record.get("data") if last_known_good_record else {}) or {}
 
-        diff = DeepDiff(last_known_good_state, current_desired_state, ignore_order=True)
+        diff = await off_loop(DeepDiff, last_known_good_state, current_desired_state, ignore_order=True)
 
         if not diff:
             log.info("✅ No drift detected. Infrastructure is up to date.")
@@ -863,7 +870,7 @@ class PersistStateStage(BaseStage):
         new_state = context.get("current_desired_state")
         if new_state:
             # Use a placeholder 'latest' for commit hash for now
-            engine.db.update_state("last_known_good", new_state, "latest")
+            await off_loop(engine.db.update_state, "last_known_good", new_state, "latest")
         return StageResult(True, "State persisted.")
 
 # ============================================================================
@@ -1228,6 +1235,85 @@ class DeploymentEngine:
             return checked(kind)
         return self.config.ansible_docker_image if kind == "ansible" else self.config.terraform_docker_image
 
+    # -- writes that never run on the event loop (review C3 / audit OC-08) ------------
+    @staticmethod
+    def _merge_progress(waiting: dict, new: dict) -> dict:
+        """Two progress updates in a row, as one: the newer value of each field
+        wins, a field the newer update leaves out keeps the older value."""
+        merged = dict(waiting)
+        merged.update({k: v for k, v in new.items() if v is not None and v != ""})
+        return merged
+
+    def _write_progress(self, job_id, values: dict):
+        extra = {"exec_state": values["exec_state"]} if values.get("exec_state") is not None else {}
+        return self.db.update_progress(job_id, values.get("progress"), values.get("current_step"), **extra)
+
+    @property
+    def _progress(self) -> CoalescedWriter:
+        """Progress/step writer of the running jobs: off the loop, one write in
+        flight per job, newest wins (see offloop.CoalescedWriter)."""
+        writer = self.__dict__.get("_progress_writer")
+        if writer is None:
+            writer = self.__dict__["_progress_writer"] = CoalescedWriter(
+                self._write_progress, merge=self._merge_progress, name="progress")
+        return writer
+
+    @property
+    def _runner_snapshots(self) -> CoalescedWriter:
+        """Runner snapshot writer (``JobQueue.set_runners``), same rules."""
+        writer = self.__dict__.get("_runner_snapshot_writer")
+        if writer is None:
+            writer = self.__dict__["_runner_snapshot_writer"] = CoalescedWriter(
+                lambda job_id, snapshot: self.queue.set_runners(job_id, snapshot), name="runners")
+        return writer
+
+    def push_progress(self, job_id, progress=None, current_step=None, *, exec_state=None) -> None:
+        """Record progress / the current step of a running job. Never blocks:
+        the database write happens in the plugin's thread pool, and while one is
+        in flight later calls are folded into a single waiting write. A step per
+        Ansible TASK line used to be a synchronous UPDATE on the event loop —
+        with a dead connection each one froze the instance until the socket
+        timeout (prod 2026-11-11)."""
+        if job_id in (None, -1):
+            return
+        self._progress.push(job_id, {"progress": progress, "current_step": current_step, "exec_state": exec_state})
+
+    async def flush_progress(self, job_id, timeout: float | None = 5.0) -> bool:
+        """Wait (bounded) until the progress of ``job_id`` is in the database."""
+        return await self._progress.flush(job_id, timeout)
+
+    def write_progress_now(self, job_id, progress=None, current_step=None, **kwargs) -> bool:
+        """Synchronous (call through ``off_loop``): write this step after the
+        write in flight; whatever was still waiting is superseded by it."""
+        writer = self._progress
+        with writer.exclusive(job_id):
+            writer.discard(job_id)
+            return bool(self.db.update_progress(job_id, progress, current_step, **kwargs))
+
+    def close_job_row(self, job_id, status: str, *, step: str | None = None, progress=None,
+                      end_override: bool = True) -> bool:
+        """Synchronous (call through ``off_loop``): the terminal write of a job
+        this process executes — last progress first, then the status, as ONE
+        ordered unit. It holds the job's progress lock, so it runs after the
+        progress write in flight and no later one can follow: a terminal write
+        is never overtaken by a late progress write. Returns ``update_job``'s
+        result (False: closed/taken over elsewhere, or the database is away —
+        see ``JobDatabase.unwritten_terminal``).
+
+        This is also where the bounded retry of the terminal write sleeps
+        (review C5, up to 7.5 s): in a pool thread, never on the event loop.
+        """
+        writer = self._progress
+        with writer.exclusive(job_id):
+            values = self._merge_progress(writer.take(job_id) or {}, {"progress": progress, "current_step": step})
+            if any(v is not None for v in values.values()):
+                self._write_progress(job_id, values)
+            done = bool(self.db.update_job(job_id=job_id, status=status))
+            writer.seal(job_id)
+        if end_override:
+            self.end_override_for(job_id)
+        return done
+
     def get_default_ansible_stages(self, pipeline_type: str = "connectivity"):
         if pipeline_type == "rollout":
             return [AsyncBulkRolloutStage(inventory_path="global/ansible/inventory.yml", limit="all")]
@@ -1399,10 +1485,12 @@ class DeploymentEngine:
 
     async def emit_monitoring_inventory_sync(self):
         try:
-            inventory = self._load_generated_inventory()
+            # Parsing the generated inventory takes about a second (635 KB of
+            # YAML), building the payload reads every service.yml: off the loop.
+            inventory = await off_loop(self._load_generated_inventory)
             if not inventory:
                 return
-            payload = self._build_monitoring_inventory_payload(inventory)
+            payload = await off_loop(self._build_monitoring_inventory_payload, inventory)
             await self._post_monitoring_inventory(payload)
         except Exception as exc:
             log.error(f"MONITORING: Failed to post inventory sync: {exc}")
@@ -1665,11 +1753,11 @@ class DeploymentEngine:
         Both degrade gracefully when the target plugin is absent.
         """
         try:
-            inventory = await asyncio.to_thread(self._load_generated_inventory)
-            hosts = self._build_inventory_hosts(inventory) if inventory else []
+            inventory = await off_loop(self._load_generated_inventory)
+            hosts = await off_loop(self._build_inventory_hosts, inventory) if inventory else []
             if not hosts:
                 return
-            services = self._build_inventory_services(inventory)
+            services = await off_loop(self._build_inventory_services, inventory)
             await self._attach_ci_ids(hosts, services)
             self.ctx.emit("iac:inventory_updated", {"hosts": hosts, "services": services})
             self._register_servers(hosts)
@@ -1707,14 +1795,14 @@ class DeploymentEngine:
             if not controller_root.is_dir():
                 log.debug("MAINTENANCE: no iac_controller checkout — nothing to publish.")
                 return False
-            items = await asyncio.to_thread(
+            items = await off_loop(
                 mres.resolve_all, controller_root, [self.config.services_dir],
                 dict(getattr(self, "_ci_map", None) or {}),
             )
-            defaults = await asyncio.to_thread(mres.default_switches, controller_root)
+            defaults = await off_loop(mres.default_switches, controller_root)
             now = mw.utcnow()
             snapshot = {"items": items, "defaults": defaults, "published_at": mw.iso(now)}
-            await asyncio.to_thread(self.db.update_state, self.MAINTENANCE_SNAPSHOT, snapshot, "")
+            await off_loop(self.db.update_state, self.MAINTENANCE_SNAPSHOT, snapshot, "")
             if items and getattr(self, "_registry_ok", None) is False:
                 log.info(
                     f"MAINTENANCE: Entity Registry unavailable — {len(items)} item(s) resolved "
@@ -1843,7 +1931,7 @@ class DeploymentEngine:
         async def _running():
             nonlocal running_jobs
             if running_jobs is None:
-                running_jobs = await asyncio.to_thread(self.db.get_jobs_by_status, "RUNNING")
+                running_jobs = await off_loop(self.db.get_jobs_by_status, "RUNNING")
             return running_jobs
 
         # Prevent concurrent bulk rollouts and duplicate single_service runs for the same service.
@@ -1867,15 +1955,15 @@ class DeploymentEngine:
                     if not incoming_limit or incoming_limit == "all":
                         # Global (no-limit) rollout: block if ANY rollout is in flight.
                         log.warning("ENGINE: A rollout is already in progress — global rollout blocked.")
-                        return await asyncio.to_thread(self._skip_claimed, job_id, "a rollout is already in progress", True)
+                        return await off_loop(self._skip_claimed, job_id, "a rollout is already in progress", True)
                     # Host-scoped rollout: block if the SAME host is already rolling out.
                     if rollout_key in active_rollout_types:
                         log.warning(f"ENGINE: Rollout for host '{incoming_limit}' is already running — duplicate blocked.")
-                        return await asyncio.to_thread(self._skip_claimed, job_id, f"rollout for '{incoming_limit}' already running", True)
+                        return await off_loop(self._skip_claimed, job_id, f"rollout for '{incoming_limit}' already running", True)
                     # Also block if a global (no-limit) rollout is in flight to avoid conflicts.
                     if "rollout:all" in active_rollout_types or "rollout" in active_rollout_types:
                         log.warning(f"ENGINE: Global rollout in progress — host rollout for '{incoming_limit}' blocked.")
-                        return await asyncio.to_thread(self._skip_claimed, job_id, "global rollout in progress", True)
+                        return await off_loop(self._skip_claimed, job_id, "global rollout in progress", True)
                 self._active_rollout_keys.add(rollout_key)
             if pipeline_type == "single_service":
                 service_name = str(payload.get("service_name") or "").strip().lower()
@@ -1885,7 +1973,7 @@ class DeploymentEngine:
                     if single_key in self._active_single_service_keys:
                         log.warning(f"ENGINE: Duplicate single_service pipeline ignored for '{service_name}' (in-memory lock).")
                         self._notify("Pipeline Ignored", f"A deployment for {service_name} is already being started.", "warning")
-                        return await asyncio.to_thread(self._skip_claimed, job_id, f"deployment for {service_name} already starting", True)
+                        return await off_loop(self._skip_claimed, job_id, f"deployment for {service_name} already starting", True)
 
                     active_service_jobs = [
                         j for j in await _running()
@@ -1894,7 +1982,7 @@ class DeploymentEngine:
                     if active_service_jobs:
                         log.warning(f"ENGINE: Duplicate single_service pipeline ignored for '{service_name}'.")
                         self._notify("Pipeline Ignored", f"A deployment for {service_name} is already running.", "warning")
-                        return await asyncio.to_thread(self._skip_claimed, job_id, f"deployment for {service_name} already running", True)
+                        return await off_loop(self._skip_claimed, job_id, f"deployment for {service_name} already running", True)
 
                     self._active_single_service_keys.add(single_key)
             if pipeline_type in ("host_provision", "bootstrap_compliance", "init_host", "compliance", "state_check"):
@@ -1907,13 +1995,13 @@ class DeploymentEngine:
                 if not host_name:
                     log.warning(f"ENGINE: {pipeline_type} ignored (missing host_name).")
                     self._notify("Pipeline Ignored", f"{pipeline_type} requires host_name.", "warning")
-                    return await asyncio.to_thread(self._skip_claimed, job_id, f"{pipeline_type} requires host_name")
+                    return await off_loop(self._skip_claimed, job_id, f"{pipeline_type} requires host_name")
                 payload["host_name"] = host_name
                 terraform_key = f"{pipeline_type}:{host_name}"
                 if terraform_key in self._active_terraform_host_keys:
                     log.warning(f"ENGINE: Duplicate {pipeline_type} ignored for '{host_name}' (in-memory lock).")
                     self._notify("Pipeline Ignored", f"A {pipeline_type} run for {host_name} is already being started.", "warning")
-                    return await asyncio.to_thread(self._skip_claimed, job_id, f"{pipeline_type} for {host_name} already starting", True)
+                    return await off_loop(self._skip_claimed, job_id, f"{pipeline_type} for {host_name} already starting", True)
 
                 active_tf_jobs = [
                     j for j in await _running()
@@ -1922,7 +2010,7 @@ class DeploymentEngine:
                 if active_tf_jobs:
                     log.warning(f"ENGINE: Duplicate {pipeline_type} ignored for '{host_name}'.")
                     self._notify("Pipeline Ignored", f"A {pipeline_type} run for {host_name} is already running.", "warning")
-                    return await asyncio.to_thread(self._skip_claimed, job_id, f"{pipeline_type} for {host_name} already running", True)
+                    return await off_loop(self._skip_claimed, job_id, f"{pipeline_type} for {host_name} already running", True)
                 self._active_terraform_host_keys.add(terraform_key)
             if pipeline_type in ("infra_plan", "infra_apply"):
                 active_infra_jobs = [
@@ -1932,7 +2020,7 @@ class DeploymentEngine:
                 if active_infra_jobs:
                     log.warning("ENGINE: An infrastructure plan/apply is already in progress.")
                     self._notify("Pipeline Ignored", "An infrastructure plan/apply is already running.", "warning")
-                    return await asyncio.to_thread(self._skip_claimed, job_id, "an infrastructure plan/apply is already running", True)
+                    return await off_loop(self._skip_claimed, job_id, "an infrastructure plan/apply is already running", True)
 
         # Every key reserved above is released in this finally — also when the
         # pipeline set-up raises before its own try/finally is reached (job row,
@@ -1967,9 +2055,9 @@ class DeploymentEngine:
         if job_id:
             # Claimed from the queue: the row exists (RUNNING, owned by this instance).
             current_job_id = job_id
-            self.db.update_progress(current_job_id, progress=0, current_step="Pending Start")
+            self.push_progress(current_job_id, progress=0, current_step="Pending Start")
         else:
-            current_job_id = self.db.create_job(db_type)
+            current_job_id = await off_loop(self.db.create_job, db_type)
 
         # FILE LOGGING SETUP. Tag this execution context with the job id so the
         # bridge persists only this job's records (concurrent pipelines share the
@@ -2054,7 +2142,8 @@ class DeploymentEngine:
         pipeline = [StatePrepareStage(prefix)]
 
         # Type-specific stages (polymorphic strategy replaces the if/elif ladder).
-        pipeline.extend(strategy.build_stages(self, payload, context))
+        # Off the loop: building them reads the service catalog / tfvars files.
+        pipeline.extend(await off_loop(strategy.build_stages, self, payload, context))
 
         try:
             # host_provision organizes stages into named tasks with tracking.
@@ -2080,7 +2169,7 @@ class DeploymentEngine:
             log.info("[SYSTEM] Pipeline completed successfully.")
             final_status = "SUCCESS"
             self.state["last_deployment"] = final_status
-            self.db.update_progress(
+            self.push_progress(
                 current_job_id, progress=100,
                 current_step="Completed (Dry-Run, nothing changed)" if dry_run else "Completed Successfully",
             )
@@ -2139,7 +2228,9 @@ class DeploymentEngine:
                 why = getattr(self, "detaching", None) or "stopping"
                 log.warning(f"[SYSTEM] Runner is {why} — pipeline detached at {where}; running containers "
                             "are left alone. The next runner start re-attaches or closes the job.")
-                self.db.update_progress(
+                # Written by the progress writer's own task (the core cancels this
+                # one); IaCService.shutdown waits for it (flush_for_shutdown).
+                self.push_progress(
                     current_job_id, progress=None,
                     current_step=f"Runner reloading — detached at {where}; containers keep running")
             raise
@@ -2150,8 +2241,8 @@ class DeploymentEngine:
             log.info(f"[SYSTEM] Deployment scheduled for {mw.iso(parked_exc.not_before)} ({parked_exc.reason})")
             # The row is SCHEDULED now and its claim released — this describes a
             # row we gave up on purpose, hence the one unfenced progress write.
-            self.db.update_progress(current_job_id, progress=0,
-                                    current_step=f"Scheduled for {mw.iso(parked_exc.not_before)}", fenced=False)
+            await off_loop(self.write_progress_now, current_job_id, 0,
+                           f"Scheduled for {mw.iso(parked_exc.not_before)}", fenced=False)
             self.ctx.notify(
                 "deployment_started",
                 payload={
@@ -2179,7 +2270,7 @@ class DeploymentEngine:
             log.debug(f"Exception traceback:\n{traceback.format_exc()}")
             final_status = "FAILED"
             self.state["last_deployment"] = final_status
-            self.db.update_progress(current_job_id, progress=None, current_step="Failed")
+            self.push_progress(current_job_id, progress=None, current_step="Failed")
             
             # Upsert the sticky bell entry in-place with the failure result.
             if pipeline_type == "single_service":
@@ -2224,7 +2315,10 @@ class DeploymentEngine:
                 # used to overwrite each other's final status through it). A parked job
                 # is already SCHEDULED — writing a terminal status would un-park it; a
                 # detached job is still running in its containers.
-                if not self.db.update_job(job_id=current_job_id, status=final_status):
+                # Off the loop — the write retries with pauses when the connection
+                # is lost (up to 7.5 s) — and in order: the last progress first,
+                # then the status, then the maintenance override (close_job_row).
+                if not await off_loop(self.close_job_row, current_job_id, final_status):
                     if current_job_id in getattr(self.db, "unwritten_terminal", {}):
                         # The database did not take the write (review C5) — it is
                         # kept and stored by the worker once the database is back.
@@ -2236,12 +2330,11 @@ class DeploymentEngine:
                         # instance, a newer incarnation. Its state stands.
                         log.warning(f"[SYSTEM] Job #{current_job_id}: result {final_status} NOT written — "
                                     "the job was already closed or taken over elsewhere.")
-                self.end_override_for(current_job_id)
             self._sync_runners(current_job_id, force=True)
             await self._close_log_writer(current_job_id)
             if not detached:
                 # A detached job's playbook may still read its inventory snapshot.
-                self._cleanup_inventory_snapshot(current_job_id)
+                await off_loop(self._cleanup_inventory_snapshot, current_job_id)
             self.__dict__.setdefault("_job_modes", {}).pop(current_job_id, None)
             self.__dict__.setdefault("_job_stage", {}).pop(current_job_id, None)
             self.__dict__.setdefault("_abort_requested", set()).discard(current_job_id)
@@ -2260,7 +2353,7 @@ class DeploymentEngine:
         """Why ``job_id`` cannot be reported as completed after a runner restart:
         its bulk rollout still lists services that were never deployed."""
         try:
-            pending = await asyncio.to_thread(self.db.get_pending_tasks, job_id)
+            pending = await off_loop(self.db.get_pending_tasks, job_id)
         except Exception as exc:
             # Unknown is not "complete": never turn an unreadable row into SUCCESS.
             return f"Interrupted by a runner restart (pending services unreadable: {exc}) — re-trigger the pipeline"
@@ -2289,7 +2382,7 @@ class DeploymentEngine:
         if loader is None:
             return False
         try:
-            payload = await asyncio.to_thread(loader, job_id)
+            payload = await off_loop(loader, job_id)
         except Exception as exc:
             raise RuntimeError(
                 f"Cannot determine the mode (dry-run or real) of job #{job_id}: {exc} — refusing to execute."
@@ -2347,7 +2440,7 @@ class DeploymentEngine:
         (and every job rejected for another reason) is closed as ABORTED with the
         reason, as before.
 
-        Synchronous database work: call it through ``asyncio.to_thread``.
+        Synchronous database work: call it through ``off_loop``.
         """
         if not job_id:
             return None
@@ -2422,7 +2515,7 @@ class DeploymentEngine:
             return values
 
         try:
-            self._redactor(job_id).add_many(await asyncio.to_thread(_collect))
+            self._redactor(job_id).add_many(await off_loop(_collect))
         except Exception as exc:
             log.debug(f"redactor for job #{job_id} not primed from Vault: {exc}")
 
@@ -2430,7 +2523,7 @@ class DeploymentEngine:
         """Add the credential-like values of the job's generated inventory (service
         ``config.secrets``, host vars such as ansible_password / vault_vars) — what
         ends up in rendered env files and therefore in a ``--diff``. Sync (YAML
-        parse): call through ``asyncio.to_thread``."""
+        parse): call through ``off_loop``."""
         try:
             snapshot = self._job_inventory_snapshot_dir(job_id) / "global" / "ansible" / "inventory.yml"
             shared = self.base_git_dir / "inventory_state" / "global" / "ansible" / "inventory.yml"
@@ -2471,8 +2564,10 @@ class DeploymentEngine:
             if isinstance(data, dict) and data.get("job_id") == job_id
         }
         try:
-            self.ctx.create_task(asyncio.to_thread(self.queue.set_runners, job_id, snapshot),
-                                 name=f"iac:runners:{job_id}")
+            # One write in flight per job, the newest snapshot wins: a task per
+            # second per job piled up threads (and pooled connections) for as
+            # long as the database did not answer.
+            self._runner_snapshots.push(job_id, snapshot)
         except Exception as exc:
             log.debug("Runner snapshot not scheduled: %s", exc)
 
@@ -2483,7 +2578,7 @@ class DeploymentEngine:
         try:
             from . import api as _api
 
-            await asyncio.to_thread(_api.publish_repo_snapshots)
+            await off_loop(_api.publish_repo_snapshots)
         except Exception as exc:
             log.debug("Repo snapshot publish skipped: %s", exc)
 
@@ -2501,14 +2596,14 @@ class DeploymentEngine:
                                   redact=lambda line, _jid=job_id: self._redact(_jid, line))
         logging.getLogger("IaC:Engine").addHandler(bridge)
         try:
-            self.db.update_progress(job_id, progress=10, current_step="Syncing core repositories")
+            self.push_progress(job_id, progress=10, current_step="Syncing core repositories")
             log.info("[SYSTEM] Repository sync started.")
             ok = await self.sync_core_repos()
-            self.db.update_progress(job_id, progress=80, current_step="Publishing snapshots")
+            self.push_progress(job_id, progress=80, current_step="Publishing snapshots")
             await self._publish_snapshots()
             final_status = "SUCCESS" if ok else "FAILED"
-            self.db.update_progress(job_id, progress=100 if ok else None,
-                                    current_step="Repositories synced" if ok else "Sync completed with failures")
+            self.push_progress(job_id, progress=100 if ok else None,
+                               current_step="Repositories synced" if ok else "Sync completed with failures")
             log.info(f"[SYSTEM] Repository sync finished: {final_status}.")
         except asyncio.CancelledError:
             # ABORTED only on an operator's abort; otherwise the row stays RUNNING
@@ -2517,14 +2612,14 @@ class DeploymentEngine:
             raise
         except Exception as exc:
             log.error(f"Repository sync job #{job_id} failed: {exc}")
-            self.db.update_progress(job_id, progress=None, current_step=f"Failed: {exc}"[:250])
+            self.push_progress(job_id, progress=None, current_step=f"Failed: {exc}"[:250])
         finally:
             logging.getLogger("IaC:Engine").removeHandler(bridge)
             _job_id_ctxvar.reset(_job_ctx_token)
             self.state["running_jobs"] = max(0, self.state.get("running_jobs", 0) - 1)
             self.state["is_running"] = self.state["running_jobs"] > 0
             if final_status:
-                self.db.update_job(job_id, final_status)
+                await off_loop(self.close_job_row, job_id, final_status, end_override=False)
             self.__dict__.setdefault("_abort_requested", set()).discard(job_id)
             await self._close_log_writer(job_id)
 
@@ -2539,7 +2634,7 @@ class DeploymentEngine:
         pipeline had reached its last stage."""
         name = str(getattr(stage, "name", "") or stage.__class__.__name__)
         self.__dict__.setdefault("_job_stage", {})[job_id] = (index + 1, total, name)
-        self.db.update_progress(job_id, progress=progress, current_step=step, exec_state={
+        self.push_progress(job_id, progress=progress, current_step=step, exec_state={
             "stage": index + 1, "stages": total, "stage_name": name, "last": index + 1 >= total,
         })
 
@@ -2577,12 +2672,12 @@ class DeploymentEngine:
         try:
             # The rest of the containers' output is masked like the first part was.
             await self._prime_redactor(job_id)
-            await asyncio.to_thread(self._register_inventory_secrets, job_id)
+            await off_loop(self._register_inventory_secrets, job_id)
             watchers = []
             for container in containers:
                 stored = 0
                 if getattr(self, "queue", None) is not None:
-                    stored = await asyncio.to_thread(self.queue.count_task_lines, job_id, container["task_name"])
+                    stored = await off_loop(self.queue.count_task_lines, job_id, container["task_name"])
                 watchers.append(self._watch_detached_runner(
                     container["name"], container["task_name"], job_id,
                     kind=container["kind"], skip_lines=stored))
@@ -2595,7 +2690,7 @@ class DeploymentEngine:
 
             interrupted = await self.interrupted_reason(job_id)
             try:
-                exec_state = await asyncio.to_thread(self.db.get_exec_state, job_id)
+                exec_state = await off_loop(self.db.get_exec_state, job_id)
             except Exception:
                 exec_state = {"stage": "?", "stages": "?", "stage_name": "unknown", "last": False}
             if interrupted:
@@ -2613,8 +2708,8 @@ class DeploymentEngine:
             def _close() -> bool:
                 # One thread call: a cancellation of this task (another reload)
                 # cannot land between "job closed" and "override ended".
-                self.db.update_progress(job_id, 100 if final == "SUCCESS" else None, step[:250])
-                done = self.db.update_job(job_id, final)
+                done = self.close_job_row(job_id, final, step=step[:250],
+                                          progress=100 if final == "SUCCESS" else None, end_override=False)
                 if all_ended and getattr(self, "queue", None) is not None:
                     # Every container was followed to its exit: locks the detached
                     # pipeline kept are free now, not after the takeover grace.
@@ -2623,7 +2718,7 @@ class DeploymentEngine:
                 self.end_override_for(job_id)
                 return done
 
-            closed = await asyncio.to_thread(_close)
+            closed = await off_loop(_close)
             await self._close_log_writer(job_id)
             self._cleanup_inventory_snapshot(job_id)
             self.__dict__.setdefault("_redactors", {}).pop(job_id, None)
@@ -2643,12 +2738,19 @@ class DeploymentEngine:
     async def flush_for_shutdown(self, timeout: float = 3.0) -> None:
         """Persist what is still buffered (job-log writers, runner snapshots)
         before the plugin goes away. Bounded; never raises."""
+        deadline = time.monotonic() + max(0.2, timeout)
         for job_id in list(self._log_writers):
             self._sync_runners(job_id, force=True)
             try:
-                await asyncio.wait_for(self._close_log_writer(job_id), timeout=max(0.2, timeout))
+                await asyncio.wait_for(self._close_log_writer(job_id), timeout=max(0.2, deadline - time.monotonic()))
             except Exception as exc:
                 log.debug(f"shutdown flush for job #{job_id} incomplete: {exc}")
+        # The steps the detached jobs just recorded ("detached at stage i/n") and
+        # the last runner snapshots: the next incarnation and the UI read them.
+        for writer in (self._progress, self._runner_snapshots):
+            for job_id in writer.keys():
+                if not await writer.flush(job_id, timeout=max(0.2, deadline - time.monotonic())):
+                    log.debug(f"shutdown flush for job #{job_id} incomplete (database slow).")
 
     #: ``active_tasks`` statuses that mean "a container of this task may be running".
     _LIVE_TASK_STATUSES = ("pulling_image", "running_ansible", "running_terraform")
@@ -2760,12 +2862,7 @@ class DeploymentEngine:
         killed = await self.stop_job_containers(job_id)
         self._sync_runners(job_id, force=True)
 
-        def _close() -> None:
-            self.db.update_progress(job_id, progress=None, current_step=reason)
-            self.db.update_job(job_id, "ABORTED")
-            self.end_override_for(job_id)
-
-        await asyncio.to_thread(_close)
+        await off_loop(self.close_job_row, job_id, "ABORTED", step=reason)
         return killed
 
     async def _on_git_status(self, payload: dict):
@@ -2788,10 +2885,23 @@ class DeploymentEngine:
                 f"Ignoring uncorrelated git status for repo '{repo_id}' without request_id: {status}"
             )
 
-    async def execute_git_sync(self, role_slug: str) -> bool:
+    def _repo_credentials(self, role_slug: str) -> tuple[dict | None, str | None]:
+        """``(repo config, credential)`` of a core repo — two Vault round trips.
+        Synchronous: call through ``off_loop``. ``(None, None)`` when the repo
+        is not configured; raises on an unreadable configuration."""
         raw_config = self.ctx.get_secret(f"repo_{role_slug}_config")
-        if not raw_config: return False
+        if not raw_config:
+            return None, None
         config = json.loads(raw_config)
+        if not isinstance(config, dict) or not config.get("url"):
+            return (config if isinstance(config, dict) else {}), None
+        # A reference can only resolve to a credential alias — never to
+        # another secret of the plugin (settings_schema.resolve_credential).
+        return config, resolve_credential(self.ctx, config.get("token_key"))
+
+    async def execute_git_sync(self, role_slug: str) -> bool:
+        config, secret_value = await off_loop(self._repo_credentials, role_slug)
+        if config is None: return False
         if not config.get("url"): return True
 
         request_id = f"sync:{role_slug}:{uuid.uuid4().hex[:12]}"
@@ -2803,9 +2913,7 @@ class DeploymentEngine:
             "repo_id": role_slug,
             "url": config.get("url"),
             "auth_type": "ssh" if "git@" in config.get("url") else "token",
-            # A reference can only resolve to a credential alias — never to
-            # another secret of the plugin (settings_schema.resolve_credential).
-            "secret_value": resolve_credential(self.ctx, config.get("token_key")) or ""
+            "secret_value": secret_value or ""
         })
         try:
             result = await asyncio.wait_for(future, timeout=240.0)
@@ -2844,19 +2952,15 @@ class DeploymentEngine:
         future = asyncio.get_event_loop().create_future()
         self.pending_syncs[request_id] = (role_slug, future)
 
-        raw_config = self.ctx.get_secret(f"repo_{role_slug}_config")
         auth_type = "none"
         secret_value = None
-        if raw_config:
-            try:
-                cfg = json.loads(raw_config)
-                url = cfg.get("url", "")
-                token_key = cfg.get("token_key", "")
-                if token_key:
-                    secret_value = resolve_credential(self.ctx, token_key)
-                    auth_type = "ssh" if url.startswith("git@") else "token"
-            except Exception:
-                pass
+        try:
+            cfg, credential = await off_loop(self._repo_credentials, role_slug)
+            if cfg and cfg.get("token_key"):
+                secret_value = credential
+                auth_type = "ssh" if str(cfg.get("url") or "").startswith("git@") else "token"
+        except Exception:
+            pass
 
         self.ctx.emit("git:commit_push", {
             "request_id": request_id,
@@ -2931,10 +3035,12 @@ class DeploymentEngine:
         async with self._shared_state_lock:
             await self._execute_native_generation()
             if job_id:
-                self._snapshot_inventory(job_id)
+                # copytree of the generated tree (still under the lock: nobody
+                # regenerates while it is copied).
+                await off_loop(self._snapshot_inventory, job_id)
         if job_id:
             # What this job will render into env files must never show up in its log.
-            await asyncio.to_thread(self._register_inventory_secrets, job_id)
+            await off_loop(self._register_inventory_secrets, job_id)
 
     def _snapshot_inventory(self, job_id: int):
         src = self.base_git_dir / "inventory_state"
@@ -3019,7 +3125,9 @@ class DeploymentEngine:
                     if "TASK [" in decoded:
                         ansible_task = decoded.split("TASK [")[1].split("]")[0]
                         ansible_progress = min(99.0, ansible_progress + 1.5)  # Increment slightly per task, capping at 99%
-                        self.db.update_progress(job_id, progress=int(ansible_progress), current_step=f"Ansible: {ansible_task}")
+                        # Coalesced and off the loop: a playbook prints these faster
+                        # than a slow database answers (audit OC-08 B2).
+                        self.push_progress(job_id, progress=int(ansible_progress), current_step=f"Ansible: {ansible_task}")
 
                     # 3. LIGHTWEIGHT UI MEMORY (Keep only the last 50 lines for the active popup)
                     if "active_tasks" in self.state and task_name in self.state["active_tasks"]:
@@ -3085,7 +3193,7 @@ class DeploymentEngine:
     async def _await_host_ssh(self, host_name: str, timeout: float = 120.0):
         """Poll TCP/22 on the host until reachable so a freshly-booted guest is
         ready before the bootstrap playbook connects. Non-fatal on timeout."""
-        ip = self._resolve_host_ip(host_name)
+        ip = await off_loop(self._resolve_host_ip, host_name)   # parses the generated inventory
         if not ip:
             log.info(f"No ansible_host for '{host_name}'; skipping SSH readiness wait.")
             return
@@ -3433,10 +3541,15 @@ class DeploymentEngine:
         # lock is held, and then only a leftover of this very job and task.
         c_name = f"iac-tf-j{job_id}-{safe_task_name}"[:120]
 
-        tf_bin = str(self.config.terraform_binary or "tofu").strip()
+        # The binary, the auto-apply switch and the image are settings (Vault):
+        # read together, off the loop. The image check may raise — as before,
+        # before anything is locked or started.
+        tf_bin, auto_apply, tf_image = await off_loop(lambda: (
+            str(self.config.terraform_binary or "tofu").strip(), bool(self.config.auto_apply),
+            self._runner_image("terraform")))
         target_flags = "".join(f" -target='{t}'" for t in (targets or []))
         run_dir = f"/data/storage/git_repos/{run_rel_dir}"
-        do_apply = mode == "apply" and not dry and (force_apply or self.config.auto_apply)
+        do_apply = mode == "apply" and not dry and (force_apply or auto_apply)
         if dry and mode in ("apply", "import"):
             log.warning("[TF] DRY-RUN job: '%s' plans only — no apply, no state import.", host_name or "(env)")
         if mode == "state_list":
@@ -3493,7 +3606,7 @@ class DeploymentEngine:
         # No --rm: a fast-failing tofu run would otherwise vanish before
         # `docker logs -f` drained it and before `docker wait` read the exit code
         # (→ empty output, swallowed error). _watch_detached_runner removes it.
-        cmd += ["--entrypoint", "", self._runner_image("terraform"), "/bin/sh", "-lc", shell_cmd]
+        cmd += ["--entrypoint", "", tf_image, "/bin/sh", "-lc", shell_cmd]
 
         log.info(
             "Executing Terraform in Docker: scope=%s mode=%s apply=%s host=%s",
@@ -3519,7 +3632,7 @@ class DeploymentEngine:
                     tf_host=(host_name if targets else None),
                 )
             if stable_rel_dir and stable_rel_dir != run_rel_dir:
-                await asyncio.to_thread(self._promote_run_dir, run_rel_dir, stable_rel_dir, job_id)
+                await off_loop(self._promote_run_dir, run_rel_dir, stable_rel_dir, job_id)
 
         return success, {
             "successful_hosts": 1 if success else 0,
@@ -3549,7 +3662,7 @@ class DeploymentEngine:
         Waiting is bounded: after ``tf_lock_timeout_seconds`` the job fails with
         a clear message instead of starting a second tofu.
         """
-        timeout = int(getattr(self.config, "tf_lock_timeout_seconds", 1800))
+        timeout = int(await off_loop(lambda: getattr(self.config, "tf_lock_timeout_seconds", 1800)))
         async with self._job_lock(
             key, job_id, timeout=timeout,
             waiting=f"[TF] Waiting for Terraform state '{key}'",
@@ -3601,7 +3714,7 @@ class DeploymentEngine:
         announced = object()
         owner = getattr(self.ctx, "instance_id", None)
         while True:
-            acquired, holder = await asyncio.to_thread(queue.acquire_lock, key, job_id, owner if isinstance(owner, str) else None)
+            acquired, holder = await off_loop(queue.acquire_lock, key, job_id, owner if isinstance(owner, str) else None)
             if acquired:
                 break
             if time.monotonic() >= deadline:
@@ -3609,7 +3722,7 @@ class DeploymentEngine:
             if holder != announced:
                 announced = holder
                 log.info(f"{waiting} (in use by job #{holder})…")
-                self.db.update_progress(job_id, progress=None, current_step=f"{step} (job #{holder})")
+                self.push_progress(job_id, progress=None, current_step=f"{step} (job #{holder})")
             await asyncio.sleep(self._TF_LOCK_POLL_SECONDS)
         keep = False
         try:
@@ -3619,7 +3732,7 @@ class DeploymentEngine:
             raise
         finally:
             if not keep:
-                await asyncio.to_thread(queue.release_lock, key, job_id)
+                await off_loop(queue.release_lock, key, job_id)
 
     async def _spawn_terraform_container(self, c_name: str, cmd: list[str]) -> None:
         """``docker run -d`` for a Terraform runner. Called with the state lock and
@@ -3763,7 +3876,7 @@ class DeploymentEngine:
         if not host_name:
             return False, {"successful_hosts": 0, "failed_hosts": 1}
 
-        ctx = self._find_terraform_context_for_host(host_name)
+        ctx = await off_loop(self._find_terraform_context_for_host, host_name)
         infra_repo = self.base_git_dir / "infra_engine"
         render_script = infra_repo / "scripts" / "python" / "render_environment.py"
         templates_dir = infra_repo / "terraform-templates"
@@ -3772,7 +3885,8 @@ class DeploymentEngine:
         if not templates_dir.exists():
             raise RuntimeError(f"Missing templates dir: {templates_dir}")
 
-        secrets_payload, missing = self._build_terraform_secrets_payload(ctx)
+        # About a dozen Vault reads plus the controller YAML: off the loop.
+        secrets_payload, missing = await off_loop(self._build_terraform_secrets_payload, ctx)
         if missing:
             raise RuntimeError(
                 "Missing Terraform secret(s): " + ", ".join(sorted(set(missing)))
@@ -3916,7 +4030,7 @@ class DeploymentEngine:
     ) -> tuple[bool, dict]:
         """Render and run OpenTofu for an entire environment (no -target)."""
         env_name = env_ctx["env_name"]
-        ctx = self._find_terraform_context_for_host(env_ctx["representative_host"])
+        ctx = await off_loop(self._find_terraform_context_for_host, env_ctx["representative_host"])
 
         infra_repo = self.base_git_dir / "infra_engine"
         render_script = infra_repo / "scripts" / "python" / "render_environment.py"
@@ -3926,7 +4040,7 @@ class DeploymentEngine:
         if not templates_dir.exists():
             raise RuntimeError(f"Missing templates dir: {templates_dir}")
 
-        secrets_payload, missing = self._build_terraform_secrets_payload(ctx)
+        secrets_payload, missing = await off_loop(self._build_terraform_secrets_payload, ctx)
         if missing:
             raise RuntimeError(
                 "Missing Terraform secret(s): " + ", ".join(sorted(set(missing)))
@@ -3993,7 +4107,7 @@ class DeploymentEngine:
         Terraform environment."""
         # Read once for the bookkeeping below; execute_terraform_docker enforces it.
         dry = await self._job_is_dry_run(job_id)
-        environments = self._iter_terraform_environments()
+        environments = await off_loop(self._iter_terraform_environments)
         if not environments:
             log.warning("No Terraform environments with containers found; nothing to %s.", mode)
             return True, {"successful_hosts": 0, "failed_hosts": 0, "environments": 0}
@@ -4065,7 +4179,7 @@ class DeploymentEngine:
         if overall_ok:
             if mode == "plan":
                 if pending_envs:
-                    self.db.update_state("pending_infra_plan", {
+                    await off_loop(self.db.update_state, "pending_infra_plan", {
                         "job_id": job_id,
                         "planned_at": datetime.now(timezone.utc).isoformat(),
                         "envs": pending_envs,
@@ -4075,10 +4189,10 @@ class DeploymentEngine:
                         len(pending_envs),
                     )
                 else:
-                    self.db.update_state("pending_infra_plan", {}, "latest")
+                    await off_loop(self.db.update_state, "pending_infra_plan", {}, "latest")
             elif mode == "apply" and not dry:
                 # A dry-run "apply" applied nothing: the reviewed plan stays pending.
-                self.db.update_state("pending_infra_plan", {}, "latest")
+                await off_loop(self.db.update_state, "pending_infra_plan", {}, "latest")
 
         return overall_ok, {
             "successful_hosts": succeeded,
@@ -4117,7 +4231,10 @@ class DeploymentEngine:
         }
         self._sync_runners(job_id, force=True)
 
-        reg_url, reg_user, reg_token = self.ctx.get_secret("ansible_registry_url"), self.ctx.get_secret("ansible_registry_user"), self.ctx.get_secret("ansible_registry_token")
+        # Four Vault round trips per playbook run — off the loop (audit OC-08 B3).
+        reg_url, reg_user, reg_token, ssh_key = await off_loop(lambda: (
+            self.ctx.get_secret("ansible_registry_url"), self.ctx.get_secret("ansible_registry_user"),
+            self.ctx.get_secret("ansible_registry_token"), self.ctx.get_secret(ssh_key_secret)))
         if reg_url and reg_user and reg_token and registry_host(reg_url) not in allowed_registry_hosts():
             # The registry token is only ever sent to a registry of the runner
             # image allowlist, whatever the stored URL says.
@@ -4127,7 +4244,6 @@ class DeploymentEngine:
             proc = await asyncio.create_subprocess_exec("docker", "login", reg_url, "-u", reg_user, "--password-stdin", stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
             await proc.communicate(input=reg_token.encode('utf-8'))
 
-        ssh_key = self.ctx.get_secret(ssh_key_secret)
         if not ssh_key:
             log.error(f"Ansible run aborted: secret '{ssh_key_secret}' is not set in Vault.")
             return False, {"successful_hosts": 0, "failed_hosts": 0}
@@ -4175,6 +4291,11 @@ class DeploymentEngine:
             if extra_roles_paths:
                 ansible_roles_path += ":" + ":".join(str(p) for p in extra_roles_paths)
 
+            # Image and diff mode are settings (Vault). The image check may raise
+            # — inside this try, so the task ends as "error" as before.
+            ansible_image, diff_mode = await off_loop(lambda: (
+                self._runner_image("ansible"), getattr(self.config, "ansible_diff_mode", "dry_run")))
+
             cmd = [
                 "docker", "run", "-d", "--name", c_name, "--pull", "always",
                 "--label", f"iac_job_id={job_id}", "--label", f"iac_task_name={task_name}",
@@ -4184,7 +4305,7 @@ class DeploymentEngine:
                 "-e", "ANSIBLE_HOST_KEY_CHECKING=False", "-e", "PYTHONUNBUFFERED=1", "-e", "ANSIBLE_NOCOLOR=1", "-e", "ANSIBLE_DEPRECATION_WARNINGS=0", "-e", "ANSIBLE_INTERPRETER_PYTHON=auto_silent",
                 "-e", f"ANSIBLE_ROLES_PATH={ansible_roles_path}", "-e", "PYTHONPATH=/data/storage/git_repos/aac_factory/scripts",
                 "--entrypoint", "",
-                self._runner_image("ansible"),
+                ansible_image,
                 "/bin/sh", "-c", 
                 "mkdir -p /root/.ssh && cp \"$1\" /root/.ssh/id_rsa && chmod 600 /root/.ssh/id_rsa && shift && exec \"$@\"", 
                 "--", f"/data/storage/services/.iac_keys/{key_filename}",
@@ -4194,7 +4315,6 @@ class DeploymentEngine:
             # --diff prints the rendered content of every templated file — the
             # service's stack.env with its secrets included — into the job log
             # (audit OS-07). Default: only for dry-runs; never for real deploys.
-            diff_mode = getattr(self.config, "ansible_diff_mode", "dry_run")
             if diff_mode == "always" or (diff_mode == "dry_run" and check_mode):
                 cmd.append("--diff")
             if limit: cmd.extend(["--limit", limit])
@@ -4337,7 +4457,8 @@ class DeploymentEngine:
                 
                 # Insert task record into database
                 try:
-                    self.db.insert_job_task(
+                    await off_loop(
+                        self.db.insert_job_task,
                         job_id=job_id,
                         task_num=task.task_num,
                         task_name=task.task_name,

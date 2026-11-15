@@ -38,6 +38,7 @@ from .settings_schema import (
 from .queue import DuplicateJob as _DuplicateJob, SubmitResult
 from .job_payload import ENT_APPROVE, ENT_TRIGGER, InvalidJobPayload
 from . import maintenance_resolver as _mres
+from .offloop import off_loop
 from .public_projection import public_catalog_entry, public_scalar
 
 # Internal references to be set by init_api
@@ -173,7 +174,7 @@ async def _expected_webhook_token(*, force: bool = False) -> str | None:
     if callable(reader) and asyncio.iscoroutinefunction(reader):
         value = await reader("gitlab_webhook_token")
     else:
-        value = await asyncio.to_thread(_ctx.get_secret, "gitlab_webhook_token")
+        value = await off_loop(_ctx.get_secret, "gitlab_webhook_token")
     value = value if isinstance(value, str) and value else None
     _token_cache.update(value=value, at=time.monotonic(), loaded=True)
     return value
@@ -676,7 +677,7 @@ async def do_health():
             "runner_online": bool(_service.runner_online()) if _service else True,
         }
 
-    value = await asyncio.to_thread(_probe)
+    value = await off_loop(_probe)
     _health_cache.update(at=time.monotonic(), value=value)
     return value
 
@@ -735,7 +736,7 @@ async def do_sync_webhooks(x_gitlab_token: str | None):
     await _require_gitlab_token(x_gitlab_token)
     from .gitlab_webhooks import sync_group_webhooks_from_ctx, WebhookConfigError
     try:
-        result = await asyncio.to_thread(sync_group_webhooks_from_ctx, _ctx)
+        result = await off_loop(sync_group_webhooks_from_ctx, _ctx)
     except WebhookConfigError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
@@ -854,7 +855,7 @@ async def do_get_service_status(service_name: str, since_epoch: int = 0, accept:
     normalized_service = str(service_name or "").strip().lower()
     pipeline_type = f"single_service:{normalized_service}"
     # Polled every 10 s by each running CI job — never on the event loop.
-    job = await asyncio.to_thread(_engine.db.get_latest_job_for_pipeline_type, pipeline_type, since_epoch)
+    job = await off_loop(_engine.db.get_latest_job_for_pipeline_type, pipeline_type, since_epoch)
     if not job:
         return {
             "status": "pending",
@@ -893,7 +894,7 @@ async def do_list_schedules():
     """Parked (SCHEDULED) deploys waiting for their maintenance window."""
     if not _service:
         raise HTTPException(status_code=503, detail="Orchestrator not initialized")
-    rows = await asyncio.to_thread(_service.queue.scheduled_jobs)
+    rows = await off_loop(_service.queue.scheduled_jobs)
     for r in rows:
         r["not_before"] = _iso(r.get("not_before"))
         r["start_time"] = _iso(r.get("start_time"))
@@ -905,7 +906,7 @@ async def do_run_schedule_now(job_id: int):
     The maintenance override is announced when the job actually runs."""
     if not _service:
         raise HTTPException(status_code=503, detail="Orchestrator not initialized")
-    ok = await asyncio.to_thread(_service.promote_scheduled, int(job_id))
+    ok = await off_loop(_service.promote_scheduled, int(job_id))
     if not ok:
         raise HTTPException(status_code=404, detail=f"Job #{job_id} is not a scheduled deployment")
     return {"status": "ok", "job_id": int(job_id), "message": f"Scheduled job #{job_id} queued to run now"}
@@ -915,7 +916,7 @@ async def do_cancel_schedule(job_id: int):
     """Cancel a parked deploy (SCHEDULED → ABORTED)."""
     if not _service:
         raise HTTPException(status_code=503, detail="Orchestrator not initialized")
-    ok = await asyncio.to_thread(_service.queue.abort_scheduled, int(job_id))
+    ok = await off_loop(_service.queue.abort_scheduled, int(job_id))
     if not ok:
         raise HTTPException(status_code=404, detail=f"Job #{job_id} is not a scheduled deployment")
     return {"status": "ok", "job_id": int(job_id), "message": f"Scheduled job #{job_id} cancelled"}
@@ -966,7 +967,7 @@ async def do_maintenance_windows(site: str | None = None, stage: str | None = No
         raise HTTPException(status_code=500, detail="Engine offline")
     from core.api import maintenance as _mw
 
-    snap = await asyncio.to_thread(_maintenance_snapshot)
+    snap = await off_loop(_maintenance_snapshot)
     items = [it for it in (snap.get("items") or []) if isinstance(it, dict)]
     term = str(q or "").strip().lower()
     if site:
@@ -978,7 +979,7 @@ async def do_maintenance_windows(site: str | None = None, stage: str | None = No
     if term:
         items = [it for it in items if term in str(it.get("name") or "").lower()
                  or term in str(it.get("host") or "").lower()]
-    overrides = await asyncio.to_thread(_running_overrides)
+    overrides = await off_loop(_running_overrides)
     now = _mw.utcnow()
     horizon = int(_engine.config.maintenance_schedule_horizon_days)
     out = []
@@ -1003,7 +1004,7 @@ async def do_maintenance_default():
     (decision C — changed in the iac-controller repo, never from here)."""
     if not _engine:
         raise HTTPException(status_code=500, detail="Engine offline")
-    snap = await asyncio.to_thread(_maintenance_snapshot)
+    snap = await off_loop(_maintenance_snapshot)
     return {
         "defaults": [d for d in (snap.get("defaults") or []) if isinstance(d, dict)],
         "published_at": snap.get("published_at"),
@@ -1121,7 +1122,7 @@ async def do_trigger_infra_apply_by_token(x_gitlab_token: str | None):
     """
     if not _ctx or not _engine:
         raise HTTPException(status_code=500, detail="Context offline")
-    enabled = await asyncio.to_thread(lambda: bool(_engine.config.token_infra_apply_enabled))
+    enabled = await off_loop(lambda: bool(_engine.config.token_infra_apply_enabled))
     if not enabled:
         raise HTTPException(
             status_code=404,
@@ -1155,7 +1156,7 @@ async def do_get_pending_plan():
     """Returns the pending infra plan awaiting operator approval (if any)."""
     if not _engine:
         raise HTTPException(status_code=503, detail="Orchestrator not initialized")
-    record = await asyncio.to_thread(_engine.db.get_state, "pending_infra_plan")
+    record = await off_loop(_engine.db.get_state, "pending_infra_plan")
     data = (record or {}).get("data") or {}
     if not data.get("envs"):
         return {"pending": False}
@@ -1171,7 +1172,7 @@ async def do_apply_pending_plan(identity=None):
     """Approves the pending plan: triggers the fleet apply (approve=True)."""
     if not _ctx or not _engine:
         raise HTTPException(status_code=503, detail="Orchestrator not initialized")
-    record = await asyncio.to_thread(_engine.db.get_state, "pending_infra_plan")
+    record = await off_loop(_engine.db.get_state, "pending_infra_plan")
     data = (record or {}).get("data") or {}
     if not data.get("envs"):
         raise HTTPException(status_code=409, detail="No pending infrastructure plan to apply")
@@ -1190,7 +1191,7 @@ async def do_dismiss_pending_plan():
     """Dismisses the pending plan without applying it."""
     if not _engine:
         raise HTTPException(status_code=503, detail="Orchestrator not initialized")
-    await asyncio.to_thread(_engine.db.update_state, "pending_infra_plan", {}, "latest")
+    await off_loop(_engine.db.update_state, "pending_infra_plan", {}, "latest")
     return {"status": "ok"}
 
 
@@ -1220,7 +1221,7 @@ async def do_list_jobs(limit: int = 20):
     if not _engine:
         raise HTTPException(status_code=500, detail="Engine offline")
     limit = max(1, min(int(limit or 20), _JOBS_LIMIT_MAX))
-    jobs = await asyncio.to_thread(_engine.db.get_recent_jobs, limit)
+    jobs = await off_loop(_engine.db.get_recent_jobs, limit)
     return _with_wait_hints(jobs, _service.runner_state()) if _service else jobs
 
 
@@ -1265,11 +1266,11 @@ async def do_job_logs(
     queue = getattr(_service, "queue", None)
     if queue is not None:
         try:
-            has_db_log = await asyncio.to_thread(queue.has_log, job_id)
+            has_db_log = await off_loop(queue.has_log, job_id)
         except Exception:
             has_db_log = False
         if has_db_log:
-            res = await asyncio.to_thread(
+            res = await off_loop(
                 queue.read_log, job_id, offset=offset, tail=max(1, tail or 600), grep=grep, grep_max=_LOG_GREP_MAX,
             )
             return {
@@ -1376,7 +1377,7 @@ async def do_job_log_raw(job_id: int, download: bool = False):
 
     # Shared database log (cluster): stream it in chunks from whichever instance answers.
     queue = getattr(_service, "queue", None)
-    if queue is not None and await asyncio.to_thread(queue.has_log, job_id):
+    if queue is not None and await off_loop(queue.has_log, job_id):
         def _iter():
             for line in queue.iter_log(job_id):
                 yield line + "\n"
@@ -1420,7 +1421,7 @@ async def do_job_runners(job_id: int, include_logs: bool = True):
     queue = getattr(_service, "queue", None)
     if queue is not None:
         try:
-            runners = await asyncio.to_thread(queue.runners_for, job_id)
+            runners = await off_loop(queue.runners_for, job_id)
         except Exception:
             runners = {}
     active = (_engine.state or {}).get("active_tasks", {}) or {}
@@ -1498,7 +1499,7 @@ async def do_abort():
     # 1. Nothing executes a QUEUED job yet — close those rows directly.
     if queue is not None:
         try:
-            aborted.extend(await asyncio.to_thread(queue.abort_queued))
+            aborted.extend(await off_loop(queue.abort_queued))
         except Exception as exc:
             _ctx.log.debug(f"ABORT: abort_queued failed: {exc}")
 
@@ -1506,7 +1507,7 @@ async def do_abort():
     #    containers. Ask every instance (cluster bus; the local bus delivers to this
     #    process too), and close rows whose owner is no longer alive ourselves.
     try:
-        running = await asyncio.to_thread(queue.running_jobs) if queue is not None else [
+        running = await off_loop(queue.running_jobs) if queue is not None else [
             {"id": getattr(j, "id", None), "owner_instance": getattr(j, "owner_instance", None)}
             for j in _engine.db.get_jobs_by_status("RUNNING")
         ]
@@ -1774,7 +1775,7 @@ async def do_terraform_hosts():
         raise HTTPException(status_code=500, detail="Engine offline")
     # Disk scan + job-window read (STATS_JOB_WINDOW rows) are sync — keep them off the loop.
     try:
-        return await asyncio.to_thread(_scan_terraform_hosts)
+        return await off_loop(_scan_terraform_hosts)
     except Exception as exc:
         _ctx and _ctx.log.error(f"API: terraform host scan failed: {exc}")
         raise HTTPException(status_code=500, detail="Terraform host scan failed")
@@ -1789,14 +1790,14 @@ async def do_get_stats():
     from . import stats as _stats
     # Sync DB reads + aggregation run off the event loop (window is 5000 rows now).
     try:
-        jobs = await asyncio.to_thread(_engine.db.get_jobs_for_stats, _stats.STATS_JOB_WINDOW)
+        jobs = await off_loop(_engine.db.get_jobs_for_stats, _stats.STATS_JOB_WINDOW)
     except Exception:
         jobs = []
     try:
-        tasks = await asyncio.to_thread(_engine.db.get_job_tasks_for_stats, _stats.STATS_TASK_WINDOW)
+        tasks = await off_loop(_engine.db.get_job_tasks_for_stats, _stats.STATS_TASK_WINDOW)
     except Exception:
         tasks = []
-    s = await asyncio.to_thread(_stats.compute, jobs, tasks)
+    s = await off_loop(_stats.compute, jobs, tasks)
 
     def _ser_recent(j: dict) -> dict:
         return {
@@ -1967,7 +1968,7 @@ async def _save_settings(values: dict, identity) -> dict:
     """Validated, authorised, all-or-nothing settings write (off the event loop)."""
     mgr = _settings_mgr()
     try:
-        result = await asyncio.to_thread(mgr.save_values, values, allowed_tiers=_allowed_tiers(identity))
+        result = await off_loop(mgr.save_values, values, allowed_tiers=_allowed_tiers(identity))
     except SettingsValidationError as exc:
         raise HTTPException(status_code=422, detail=f"Invalid setting — {exc}")
     except SettingsPermissionError as exc:
@@ -2030,7 +2031,7 @@ async def do_set_secret_slot(key: str, payload: SecretSlotRequest, identity=None
     never echoed; the route requires the credentials permission."""
     mgr = _settings_mgr()
     try:
-        await asyncio.to_thread(mgr.set_secret_slot, key, payload.value)
+        await off_loop(mgr.set_secret_slot, key, payload.value)
     except SettingsValidationError as exc:
         raise HTTPException(status_code=422, detail=f"Invalid setting — {exc}")
     _ctx.log.info(f"SETTINGS: {getattr(identity, 'username', None) or 'internal'} replaced secret slot '{key}'")
@@ -2121,7 +2122,7 @@ async def do_clear_stats(identity=None):
     """Clear job history records (keeps RUNNING jobs intact) and reset last_deployment state."""
     if not _service or not _engine:
         raise HTTPException(status_code=503, detail="Orchestrator not initialized")
-    deleted = await asyncio.to_thread(_engine.db.clear_all_jobs, True)
+    deleted = await off_loop(_engine.db.clear_all_jobs, True)
     if deleted < 0:
         raise HTTPException(status_code=500, detail="Failed to clear statistics (see logs)")
     _ctx.log.warning(f"API: job history cleared by {_actor(identity) or 'internal'} ({deleted} job record(s) and their logs).")
@@ -2133,7 +2134,7 @@ async def do_clear_failed_jobs(identity=None):
     """Delete only failed/errored/aborted job records, leaving successful and running jobs intact."""
     if not _service or not _engine:
         raise HTTPException(status_code=503, detail="Orchestrator not initialized")
-    deleted = await asyncio.to_thread(_engine.db.clear_failed_jobs)
+    deleted = await off_loop(_engine.db.clear_failed_jobs)
     if deleted < 0:
         raise HTTPException(status_code=500, detail="Failed to clear failed jobs (see logs)")
     _ctx.log.warning(f"API: failed job records cleared by {_actor(identity) or 'internal'} ({deleted} record(s) and their logs).")
@@ -2147,7 +2148,7 @@ async def do_sync_repos(identity=None):
     # Runs on a runner instance (the one with the working trees) via the queue, like
     # every other piece of execution; the job shows up in the history as "repo_sync".
     try:
-        job_id = await asyncio.to_thread(_service.enqueue_pipeline, {"pipeline_type": "repo_sync", "manual": True},
+        job_id = await off_loop(_service.enqueue_pipeline, {"pipeline_type": "repo_sync", "manual": True},
                                          requested_by=_actor(identity) or "ui")
     except _DuplicateJob as exc:
         raise HTTPException(status_code=409, detail=f"A repository sync is already queued/running (job #{exc.existing_id})")
@@ -2160,7 +2161,7 @@ async def do_sync_webhooks_authed():
         raise HTTPException(status_code=500, detail="API Context not initialized")
     from .gitlab_webhooks import sync_group_webhooks_from_ctx, WebhookConfigError
     try:
-        result = await asyncio.to_thread(sync_group_webhooks_from_ctx, _ctx)
+        result = await off_loop(sync_group_webhooks_from_ctx, _ctx)
     except WebhookConfigError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
@@ -2208,7 +2209,7 @@ async def _shared_job_stream_snapshot() -> dict:
         return _snapshot_cache["value"]
     task = _snapshot_cache["task"]
     if task is None or task.done():
-        task = asyncio.ensure_future(asyncio.to_thread(_job_stream_snapshot))
+        task = asyncio.ensure_future(off_loop(_job_stream_snapshot))
         _snapshot_cache["task"] = task
     value = await asyncio.shield(task)
     _snapshot_cache.update(at=time.monotonic(), value=value)

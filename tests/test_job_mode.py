@@ -266,7 +266,7 @@ def test_reattached_container_cannot_complete_an_interrupted_rollout():
     container = {"id": "c1", "name": "aac-runner-aac-traefik", "task_name": "aac-traefik", "kind": "ansible",
                  "state": "running", "job_id": 5}
     assert asyncio.run(eng.recover_job(5, [container])) == "FAILED"
-    statuses = [c.args[1] for c in eng.db.update_job.call_args_list]
+    statuses = [c.kwargs.get("status") or c.args[1] for c in eng.db.update_job.call_args_list]
     assert statuses == ["FAILED"]
     assert "not deployed" in eng.db.update_progress.call_args.args[2]
 

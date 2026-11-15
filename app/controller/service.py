@@ -13,6 +13,7 @@ from core.api import db_instance
 from ..model.models import Base
 from ..model.database import JobDatabase
 from .config import IaCConfig
+from .offloop import off_loop
 from .engine import ContainerStateUnknown, DeploymentEngine
 from .queue import JobQueue, JobWorker, DuplicateJob, EnqueueResult, SubmitResult
 from .socket_client import SocketBusClient
@@ -84,8 +85,12 @@ class IaCService:
         self._runner_seen_at: float | None = None
         self._started_at = time.monotonic()
 
-        # Restore the Auto-Apply setting from Vault/Config on boot
-        self.state["auto_apply_enabled"] = self.config.auto_apply
+        # Created by schedule_bootstrap, set when the first database bootstrap of
+        # this load has finished (or was skipped: database not connected yet).
+        self._bootstrapped: asyncio.Event | None = None
+        # The Auto-Apply flag shown by the UI is restored from Vault/config by
+        # bootstrap_async: a Vault round trip has no place in setup() (it runs on
+        # the event loop). Decisions never read this copy — they ask the config.
 
     # ------------------------------------------------------------------
     # Cluster roles
@@ -250,12 +255,15 @@ class IaCService:
         previous incarnation left behind, then start claiming. The worker used to
         start first — and the reconciliation then FAILED the jobs it had just
         claimed. The worker starts in any case, also when reconciling raised."""
+        # The schema (claim/fencing columns) must exist before anything is listed
+        # or claimed; the bootstrap runs off the loop since review C3.
+        await self.wait_bootstrapped()
         try:
             await self.run_startup_reconciliation()
         except Exception as exc:
             log.error(f"IaC Orchestrator: startup reconciliation failed: {exc}")
         try:
-            raw = await asyncio.to_thread(self.ctx.get_secret, "iac_max_parallel_jobs")
+            raw = await off_loop(self.ctx.get_secret, "iac_max_parallel_jobs")
             max_parallel = int(str(raw or "3").strip() or "3")
         except Exception:
             max_parallel = 3
@@ -297,7 +305,7 @@ class IaCService:
             await self.engine.stop_job_containers(job_id)
         # Docker answered and the containers are gone: the job's locks are free
         # for the next job now, not only after the takeover grace (review C2).
-        await asyncio.to_thread(self.queue.release_job_locks, job_id)
+        await off_loop(self.queue.release_job_locks, job_id)
         # Whatever waited for Docker on behalf of this job is settled now.
         if job_id in self._unsettled:
             self._unsettled.discard(job_id)
@@ -313,7 +321,7 @@ class IaCService:
             return True
         except ContainerStateUnknown as exc:
             log.warning(f"IaC Orchestrator: containers of job #{job_id} could not be stopped ({exc}) — retrying.")
-            await asyncio.to_thread(
+            await off_loop(
                 self._job_note, job_id,
                 f"The runner containers of this job could not be stopped: {exc}. They may still be running; "
                 "the stop is retried.")
@@ -334,10 +342,10 @@ class IaCService:
                     last = str(exc)
                     continue
                 log.info(f"IaC Orchestrator: containers of job #{job_id} stopped after {attempt + 1} retr(ies).")
-                await asyncio.to_thread(self._job_note, job_id, "The runner containers of this job were stopped.")
+                await off_loop(self._job_note, job_id, "The runner containers of this job were stopped.")
                 return
             log.error(f"IaC Orchestrator: giving up stopping the containers of job #{job_id}: {last}")
-            await asyncio.to_thread(
+            await off_loop(
                 self._job_note, job_id,
                 f"Giving up: the runner containers of this job could not be stopped ({last}). "
                 "Check Docker on the runner host; a runner restart retries.")
@@ -394,7 +402,7 @@ class IaCService:
             payload = validate_structure(payload)
         except InvalidJobPayload as exc:
             log.error(f"WORKER: job #{job_id} rejected at claim — invalid payload: {exc}")
-            await asyncio.to_thread(self._reject_claimed, job_id, str(exc))
+            await off_loop(self._reject_claimed, job_id, str(exc))
             return
         await self.ensure_runtime_paths()
         await self.engine.run_pipeline(payload, job_id=job_id)
@@ -429,10 +437,13 @@ class IaCService:
             log.warning(f"ENQUEUE: dropped privileged field(s) {dropped} from a "
                         f"'{clean.get('pipeline_type')}' trigger without entitlement.")
         clean = validate_structure(clean)
+        # A trigger that arrives while this load still prepares the tables waits
+        # for that (bounded) instead of failing on a missing column.
+        await self.wait_bootstrapped(timeout=30.0)
         who = requested_by or clean.get("trigger") or ("ui" if clean.get("manual") else "webhook")
         target = clean.get("service_name") or clean.get("host_name") or clean.get("limit") or clean.get("pipeline_type")
         try:
-            res = await asyncio.to_thread(self.enqueue_pipeline_ex, clean, requested_by=who)
+            res = await off_loop(self.enqueue_pipeline_ex, clean, requested_by=who)
         except DuplicateJob as exc:
             reason = exc.reason or "a run for this target is already queued or running"
             log.warning(f"ENQUEUE: trigger for '{target}' NOT queued — {reason} (job #{exc.existing_id}).")
@@ -495,7 +506,7 @@ class IaCService:
         try:
             from . import api as _api
 
-            counts = await asyncio.to_thread(_api.publish_repo_snapshots)
+            counts = await off_loop(_api.publish_repo_snapshots)
             if counts:
                 log.info(f"IaC Orchestrator: repo snapshots published {counts}.")
         except Exception as exc:
@@ -618,8 +629,47 @@ class IaCService:
     # DB bootstrap
     # ------------------------------------------------------------------
 
+    #: How long the runner boot waits for the first bootstrap (the bootstrap lock
+    #: can be contended for up to ~55 s while several instances start together).
+    BOOTSTRAP_WAIT_SECONDS = 120.0
+
+    def schedule_bootstrap(self, base=None) -> None:
+        """``setup()``: start the first bootstrap of this load as a task. From
+        here on the runner boot and the trigger path wait for it."""
+        self._bootstrapped = asyncio.Event()
+        self.ctx.create_task(self.bootstrap_async(base), name="iac:bootstrap_db")
+
+    async def bootstrap_async(self, base=None) -> None:
+        """:meth:`bootstrap_db` off the event loop (audit OC-08 B7): ``create_all``,
+        the column inspection and ``GET_LOCK('lyndrix_bootstrap')`` — up to ~55 s
+        when several instances boot together — used to run inside ``setup()`` and
+        the ``db:connected`` handler, i.e. on the loop. Also restores the
+        Auto-Apply flag for the UI (a Vault read). Never raises."""
+        try:
+            await off_loop(self.bootstrap_db, base)
+            self.state["auto_apply_enabled"] = bool(await off_loop(lambda: self.config.auto_apply))
+        except Exception as exc:
+            log.error(f"IaC Orchestrator: database bootstrap failed: {exc}")
+        finally:
+            if self._bootstrapped is not None:
+                self._bootstrapped.set()
+
+    async def wait_bootstrapped(self, timeout: float | None = None) -> bool:
+        """Wait (bounded) for the first bootstrap of this load. ``False`` on a
+        timeout — the caller goes on and meets the database as it is."""
+        event = getattr(self, "_bootstrapped", None)
+        if event is None or event.is_set():
+            return True
+        try:
+            await asyncio.wait_for(event.wait(), timeout=self.BOOTSTRAP_WAIT_SECONDS if timeout is None else timeout)
+            return True
+        except asyncio.TimeoutError:
+            log.warning("IaC Orchestrator: the database bootstrap has not finished yet — continuing without it.")
+            return False
+
     def bootstrap_db(self, base=None):
-        """Create ORM tables if the DB is connected. Safe to call multiple times."""
+        """Create ORM tables if the DB is connected. Safe to call multiple times.
+        Synchronous (DDL, advisory lock): call it through :meth:`bootstrap_async`."""
         if base is None:
             base = Base
         if not db_instance.is_connected or not db_instance.engine:
@@ -706,12 +756,12 @@ class IaCService:
             return
         me = getattr(self.ctx, "instance_id", None)
         # Listed before anything else happens in this process.
-        previous = await asyncio.to_thread(self.queue.previous_incarnation_jobs, me, self.incarnation)
+        previous = await off_loop(self.queue.previous_incarnation_jobs, me, self.incarnation)
         await self.ensure_runtime_paths()
         await asyncio.sleep(2)  # Give the DB a moment to wake up
         for row in previous:
             job_id = row["id"]
-            token = await asyncio.to_thread(self.queue.adopt, job_id, me, self.incarnation, row["claim_token"])
+            token = await off_loop(self.queue.adopt, job_id, me, self.incarnation, row["claim_token"])
             if token is None:
                 continue  # closed or taken over meanwhile — its containers are leftovers (below)
             self.db.claims[job_id] = token
@@ -726,8 +776,8 @@ class IaCService:
                       f"job(s) {waiting or 'none'} stay RUNNING until Docker answers.")
             step = "Runner restarted — container state unknown (Docker not reachable), retrying"
             for job_id in waiting:
-                await asyncio.to_thread(self._job_note, job_id, f"{step}: {exc}. Nothing is closed or released.")
-                await asyncio.to_thread(self.db.update_progress, job_id, None, step)
+                await off_loop(self._job_note, job_id, f"{step}: {exc}. Nothing is closed or released.")
+                await off_loop(self.db.update_progress, job_id, None, step)
             if waiting:
                 self.engine._notify(
                     "IaC runner — Docker not reachable",
@@ -784,7 +834,7 @@ class IaCService:
             if job_id in self._stop_retries:
                 by_job.pop(job_id, None)
                 continue  # an abort/stop for it is being retried — that path settles it
-            if await asyncio.to_thread(self.queue.job_status, job_id) != "RUNNING":
+            if await off_loop(self.queue.job_status, job_id) != "RUNNING":
                 # Closed elsewhere while we waited for Docker: its containers are leftovers.
                 self._unsettled.discard(job_id)
                 self.db.claims.pop(job_id, None)
@@ -802,20 +852,20 @@ class IaCService:
             reason = await self.engine.interrupted_reason(job_id) or "System Restart (Aborted)"
             self.engine._log_line(job_id, f"[SYSTEM] {reason}.")
             await self.engine._close_log_writer(job_id)
-            await asyncio.to_thread(self.db.update_progress, job_id, None, reason[:250])
-            await asyncio.to_thread(self.db.update_job, job_id, "FAILED")
+            await off_loop(self.db.update_progress, job_id, None, reason[:250])
+            await off_loop(self.db.update_job, job_id, "FAILED")
             # Docker listed no container for it: nothing can still use its locks.
-            await asyncio.to_thread(self.queue.release_job_locks, job_id)
+            await off_loop(self.queue.release_job_locks, job_id)
             self.db.claims.pop(job_id, None)
             self._unsettled.discard(job_id)
-            self.engine.end_override_for(job_id)
+            await off_loop(self.engine.end_override_for, job_id)
             self.state["last_deployment"] = "FAILED"
 
         # Containers whose job is no longer RUNNING: the job was closed while this
         # runner was away (rD §3.4) — stop them instead of letting them finish.
         for job_id in by_job:
             try:
-                status = await asyncio.to_thread(self.queue.job_status, job_id)
+                status = await off_loop(self.queue.job_status, job_id)
             except Exception:
                 continue
             if status != "RUNNING":
@@ -838,11 +888,13 @@ class IaCService:
         without anyone clicking "Webhooks registrieren" in Settings. iac-controller
         CI can additionally hit POST /api/iac/webhook/sync for an immediate run.
         """
-        if str(self.ctx.get_secret("iac_webhook_autosync_enabled") or "true").lower() == "false":
+        enabled, raw_interval = await off_loop(lambda: (
+            self.ctx.get_secret("iac_webhook_autosync_enabled"),
+            self.ctx.get_secret("iac_webhook_sync_interval_seconds") or ""))
+        if str(enabled or "true").lower() == "false":
             self.ctx.log.info("IaC Orchestrator: webhook auto-sync disabled.")
             return
 
-        raw_interval = self.ctx.get_secret("iac_webhook_sync_interval_seconds") or ""
         try:
             interval = max(300, int(str(raw_interval).strip() or "1800"))
         except ValueError:
@@ -851,7 +903,7 @@ class IaCService:
         await asyncio.sleep(30)  # let Vault hydrate and boot settle
         while True:
             try:
-                result = await asyncio.to_thread(sync_group_webhooks_from_ctx, self.ctx)
+                result = await off_loop(sync_group_webhooks_from_ctx, self.ctx)
                 self.ctx.log.info(
                     f"IaC Orchestrator: webhook auto-sync ok "
                     f"(projects={result['projects_total']}, created={result['created']}, "

@@ -7,6 +7,7 @@ from ui.layout import main_layout
 from core.api import ModuleManifest, NotificationEndpoint, PluginHealthStatus, db_instance
 
 from .app.controller.service import IaCService
+from .app.controller.offloop import off_loop, shutdown_pool
 from .app.controller.api import init_api
 from .app.controller import api as _api_module
 from .app.controller.webhook_router import build_webhook_router
@@ -244,19 +245,19 @@ async def health(ctx) -> PluginHealthStatus:
     # Vault holds the auto-apply flag (env fallback). A reachable Vault returns a
     # value; unreachable/unset returns None — informational, never fatal here.
     try:
-        vault_ready = await asyncio.to_thread(
+        vault_ready = await off_loop(
             lambda: ctx.get_secret("iac_auto_apply") is not None
         )
     except Exception:
         vault_ready = False
 
     try:
-        sweep = ((await asyncio.to_thread(_service.db.get_state, "orphan_sweep")) or {}).get("data") or {}
+        sweep = ((await off_loop(_service.db.get_state, "orphan_sweep")) or {}).get("data") or {}
     except Exception:
         sweep = {}
 
     try:
-        recent = await asyncio.to_thread(_service.db.get_recent_jobs, 5)
+        recent = await off_loop(_service.db.get_recent_jobs, 5)
     except Exception as exc:
         return PluginHealthStatus(
             status="error",
@@ -283,7 +284,7 @@ async def health(ctx) -> PluginHealthStatus:
             "webhook_auth_failures": dict(_api_module.webhook_auth_failures),
             # Orphan sweep (lease-held by one instance): visible on every instance.
             "orphan_sweep": {
-                "enabled": bool(await asyncio.to_thread(lambda: _service.config.orphan_sweep_enabled)),
+                "enabled": bool(await off_loop(lambda: _service.config.orphan_sweep_enabled)),
                 "running_here": _service.sweeper.running,
                 "holder": sweep.get("holder"),
                 "last_sweep_at": sweep.get("last_sweep_at"),
@@ -334,12 +335,15 @@ def setup(ctx):
     if stale:
         ctx.log.info(f"IaC Orchestrator: replaced {stale} stale directly mounted route(s).")
 
-    # DB bootstrap
-    _service.bootstrap_db(Base)
+    # DB bootstrap — off the event loop (DDL and the bootstrap advisory lock can
+    # take most of a minute while several instances start together). The runner
+    # boot and the trigger path wait for it (IaCService.wait_bootstrapped).
+    service = _service
+    service.schedule_bootstrap(Base)
 
     @ctx.subscribe('db:connected')
     async def _on_db(_):
-        _service.bootstrap_db(Base)
+        await service.bootstrap_async(Base)
 
     # Event wiring — every trigger (UI, webhook, CI, NiceGUI, the engine's own
     # host-rollout hand-off) emits iac:webhook_verified on the local bus; it is
@@ -439,3 +443,6 @@ async def teardown(ctx):
             await svc.shutdown(reason="plugin reload", budget=12)
         except Exception as exc:
             ctx.log.warning(f"IaC Orchestrator: teardown incomplete: {exc}")
+    # The plugin's thread pool: calls still queued or running finish; whoever
+    # calls off_loop afterwards (a successor load, a late task) gets a new one.
+    shutdown_pool()

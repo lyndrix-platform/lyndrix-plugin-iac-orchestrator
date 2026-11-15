@@ -28,6 +28,7 @@ from sqlalchemy import func as sa_fn, inspect as sa_inspect, select, text, updat
 from core.api import db_instance
 
 from ..model.models import IaCJob, IaCJobLog, IaCLock, Base
+from .offloop import off_loop
 
 log = logging.getLogger("IaC:Queue")
 
@@ -310,7 +311,8 @@ def _is_retryable(exc: Exception) -> bool:
 
 class JobQueue:
     """Database-backed queue + log/runner store. Every method is synchronous and
-    cheap; callers off-load them with ``asyncio.to_thread`` where it matters."""
+    cheap; async callers run them through ``offloop.off_loop`` (the plugin's own
+    thread pool), never on the event loop."""
 
     #: Called with the job id after this queue closed a job on a terminal path it
     #: owns itself (``fail_orphan``, ``mark_failed``), so the engine can end the job's
@@ -1753,12 +1755,12 @@ class JobLogWriter:
             if not self._buf:
                 return
             if self._seq is None:
-                self._seq = await asyncio.to_thread(self.queue.last_seq, self.job_id)
+                self._seq = await off_loop(self.queue.last_seq, self.job_id)
             if not self._buf:
                 return
             lines, self._buf = self._buf[: self.batch * 5], self._buf[self.batch * 5:]
             self._inflight = asyncio.ensure_future(
-                asyncio.to_thread(self.queue.append_log, self.job_id, lines, self._seq))
+                off_loop(self.queue.append_log, self.job_id, lines, self._seq))
             self._seq = await asyncio.shield(self._inflight)
             self._inflight = None
 
@@ -1862,7 +1864,7 @@ class JobWorker:
             try:
                 self.tasks = {j: t for j, t in self.tasks.items() if not t.done()}
                 while len(self.tasks) < self.max_parallel:
-                    claimed = await asyncio.to_thread(self.queue.claim_next, self.ctx.instance_id, self.incarnation)
+                    claimed = await off_loop(self.queue.claim_next, self.ctx.instance_id, self.incarnation)
                     if not claimed:
                         break
                     job_id, payload = claimed
@@ -1915,8 +1917,8 @@ class JobWorker:
         unwritten = self.queue.unwritten_terminal
         for job_id in list(unwritten):
             if self.queue.finish_terminal is not None:
-                await asyncio.to_thread(self.queue.finish_terminal, job_id)
-        rows = await asyncio.to_thread(
+                await off_loop(self.queue.finish_terminal, job_id)
+        rows = await off_loop(
             self.queue.own_unattended, self.ctx.instance_id, self.incarnation,
             self._attended(), 2 * self.heartbeat_seconds,
         )
@@ -1925,11 +1927,11 @@ class JobWorker:
             if job_id in self._attended() or job_id in unwritten:
                 continue
             if not row["has_log"]:
-                if await asyncio.to_thread(self.queue.release, job_id, row["claim_token"],
+                if await off_loop(self.queue.release, job_id, row["claim_token"],
                                            "Re-queued: the claim was lost before the job started"):
                     self.ctx.log.warning(f"WORKER: job #{job_id} was claimed but never started — re-queued.")
                     self.wake()
-            elif await asyncio.to_thread(
+            elif await off_loop(
                     lambda j=job_id, t=row["claim_token"]: self.queue.mark_failed(
                         j, "Runner lost track of the job — re-trigger the pipeline", token=t)):
                 self.ctx.log.warning(f"WORKER: job #{job_id} is RUNNING without an executing task — closed as FAILED.")
@@ -1941,7 +1943,7 @@ class JobWorker:
             if not ids:
                 continue
             try:
-                fenced = await asyncio.to_thread(self.queue.heartbeat, self.ctx.instance_id, ids)
+                fenced = await off_loop(self.queue.heartbeat, self.ctx.instance_id, ids)
             except Exception as exc:
                 self.ctx.log.debug(f"WORKER: heartbeat failed: {exc}")
                 continue

@@ -6,6 +6,7 @@ from core.logger import get_logger
 
 from .base import BaseStage
 from ..utils import StageResult
+from ..app.controller.offloop import off_loop
 from .ansible import AnsiblePlaybookStage, AsyncBulkRolloutStage
 
 log = get_logger("IaC:Engine:Rules")
@@ -92,6 +93,11 @@ class DynamicRuleExecutionStage(BaseStage):
             log.info("Rule action runs as DRY-RUN (--check): auto_apply is off for rule-engine changes.")
             return True
         return False
+
+    @classmethod
+    async def _check_mode(cls, engine, context: dict) -> bool:
+        """:meth:`_ansible_check_mode` off the loop — ``auto_apply`` is a Vault read."""
+        return await off_loop(cls._ansible_check_mode, engine, context)
 
     async def _git(self, engine, *args) -> tuple[int, str]:
         repo = engine.base_git_dir / "inventory_state"
@@ -213,14 +219,15 @@ class DynamicRuleExecutionStage(BaseStage):
         if rc_new != 0:
             return {}
         try:
-            new_inv = yaml.safe_load(new_raw) or {}
+            # The generated inventory is ~635 KB of YAML (about a second to parse).
+            new_inv = await off_loop(yaml.safe_load, new_raw) or {}
         except Exception:
             return {}
         old_inv = {}
         rc_old, old_raw = await self._git(engine, "show", self._old(inventory_file))
         if rc_old == 0:
             try:
-                old_inv = yaml.safe_load(old_raw) or {}
+                old_inv = await off_loop(yaml.safe_load, old_raw) or {}
             except Exception:
                 old_inv = {}
         new_map = self._extract_host_baseline_roles(new_inv)
@@ -240,7 +247,7 @@ class DynamicRuleExecutionStage(BaseStage):
     # --------------------------------------------------------------- actions
     async def _run_legacy_action(self, engine, context, action, changed_services):
         target = action.get("playbook", "")
-        check = self._ansible_check_mode(engine, context)
+        check = await self._check_mode(engine, context)
         if "cd_rollout_service.yml" in target:
             stage = AsyncBulkRolloutStage(
                 inventory_path=action.get("inventory"),
@@ -330,7 +337,7 @@ class DynamicRuleExecutionStage(BaseStage):
             inventory_path=action.get("inventory", "global/ansible/inventory.yml"),
             limit=limit,
             target_services=target_services,
-            check_mode=self._ansible_check_mode(engine, context),
+            check_mode=await self._check_mode(engine, context),
         )
         res = await stage.run(engine, context)
         if target_services:
@@ -365,7 +372,7 @@ class DynamicRuleExecutionStage(BaseStage):
                     inventory_path=inventory,
                     limit=host,
                     extra_vars={"role_to_run": role},
-                    check_mode=self._ansible_check_mode(engine, context),
+                    check_mode=await self._check_mode(engine, context),
                 )
                 res = await stage.run(engine, context)
                 if not res.success:
@@ -395,7 +402,7 @@ class DynamicRuleExecutionStage(BaseStage):
                 playbook_path=playbook,
                 inventory_path=action.get("inventory", "global/ansible/inventory.yml"),
                 limit=self._substitute(action.get("limit", "all"), path_vars),
-                check_mode=self._ansible_check_mode(engine, context),
+                check_mode=await self._check_mode(engine, context),
             )
             return await stage.run(engine, context)
         log.warning(f"Unknown rule action type '{atype}', skipping.")
@@ -406,7 +413,7 @@ class DynamicRuleExecutionStage(BaseStage):
         rules_file_path = engine.base_git_dir / "config_engine" / "pipeline_rules.yml"
         if not rules_file_path.exists():
             log.warning("pipeline_rules.yml not found. Falling back to default hardcoded behavior.")
-            check = self._ansible_check_mode(engine, context)
+            check = await self._check_mode(engine, context)
             for stage in engine.get_default_ansible_stages(self.pipeline_type):
                 if hasattr(stage, "check_mode"):
                     stage.check_mode = check
@@ -414,11 +421,14 @@ class DynamicRuleExecutionStage(BaseStage):
                 if not res.success:
                     return res
             return StageResult(True, "Fallback pipeline executed successfully.")
-        with open(rules_file_path, "r") as f:
-            try:
-                rules_config = yaml.safe_load(f) or {}
-            except yaml.YAMLError as e:
-                return StageResult(False, f"Error parsing pipeline_rules.yml: {e}")
+        def _load_rules() -> dict:
+            with open(rules_file_path, "r") as f:
+                return yaml.safe_load(f) or {}
+
+        try:
+            rules_config = await off_loop(_load_rules)
+        except yaml.YAMLError as e:
+            return StageResult(False, f"Error parsing pipeline_rules.yml: {e}")
 
         if self.pipeline_type == "connectivity":
             actions = rules_config.get("connectivity_test", [])
@@ -459,7 +469,7 @@ class DynamicRuleExecutionStage(BaseStage):
 
     async def _read_marker(self, db) -> dict | None:
         try:
-            return await asyncio.to_thread(db.rules_marker)
+            return await off_loop(db.rules_marker)
         except Exception as exc:
             raise _MarkerUnavailable(str(exc)) from exc
 
@@ -531,7 +541,7 @@ class DynamicRuleExecutionStage(BaseStage):
     @staticmethod
     async def _advance(db, ref: str, job_id) -> None:
         try:
-            await asyncio.to_thread(db.set_rules_marker, ref, job_id=job_id)
+            await off_loop(db.set_rules_marker, ref, job_id=job_id)
         except Exception as exc:
             # The actions ran. Without the marker the next pipeline evaluates the
             # same changes once more (idempotent) — that is not worth failing this job.
@@ -541,7 +551,7 @@ class DynamicRuleExecutionStage(BaseStage):
     @staticmethod
     async def _note_failure(db, base: str, failures: int, error: str, job_id) -> None:
         try:
-            await asyncio.to_thread(db.set_rules_marker, base, job_id=job_id, failures=failures + 1,
+            await off_loop(db.set_rules_marker, base, job_id=job_id, failures=failures + 1,
                                     last_error=str(error or ""))
         except Exception as exc:
             log.warning(f"Rule engine: could not record the failed evaluation: {exc}")
@@ -570,7 +580,7 @@ class DynamicRuleExecutionStage(BaseStage):
                 notify("Rule actions skipped", text[:900], "negative", broadcast=True)
             except Exception as exc:
                 log.debug(f"give-up notification not sent: {exc}")
-        await asyncio.to_thread(db.set_rules_marker, own_base, job_id=context.get("job_id"))
+        await off_loop(db.set_rules_marker, own_base, job_id=context.get("job_id"))
         return own_base
 
     async def _run_own_commit(self, engine, context: dict, rules_config: dict) -> StageResult:

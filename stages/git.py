@@ -8,6 +8,7 @@ from core.logger import get_logger
 
 from .base import BaseStage
 from ..utils import StageResult
+from ..app.controller.offloop import off_loop
 
 log = get_logger("IaC:Engine:Git")
 
@@ -61,7 +62,7 @@ class PublishInventoryStateStage(BaseStage):
             job_id=context.get("job_id"),
             pipeline=str(context.get("db_type") or payload.get("pipeline_type") or ""),
             trigger="Manual" if payload.get("manual") else "Webhook",
-            token=engine.repo_token("inventory_state"),
+            token=await off_loop(engine.repo_token, "inventory_state"),   # Vault
         )
         context["inventory_state_commit_status"] = result.status
         if result.files:
@@ -85,7 +86,7 @@ class PublishInventoryStateStage(BaseStage):
         if not callable(setter):
             return
         try:
-            if await asyncio.to_thread(setter, sha, job_id=job_id, only_if_absent=True):
+            if await off_loop(setter, sha, job_id=job_id, only_if_absent=True):
                 log.info(f"Rule engine: marker initialised at inventory_state@{sha[:12]} "
                          "(everything published before counts as evaluated).")
         except Exception as exc:
@@ -114,36 +115,9 @@ class CloneServiceRepoStage(BaseStage):
         target_dir = services_dir / self.service_name
         if target_dir.resolve().parent != services_dir.resolve():
             return StageResult(False, f"Refusing to sync '{self.service_name}': path escapes the services directory.")
-        repo_url = None
-        if not repo_url:
-            catalog_file = engine.base_git_dir / "iac_controller" / "environments" / "global" / "02_service_catalog.yml"
-            if catalog_file.exists():
-                try:
-                    with open(catalog_file, 'r') as f:
-                        catalog_data = yaml.safe_load(f) or {}
-                        catalog = catalog_data.get("service_catalog", {})
-                        git_mgmt = catalog.get("remote_git_management", {})
-                        services_list = catalog.get("services", [])
-                        matched_svc = next((s for s in services_list if s.get("name") == self.service_name), None)
-                        if matched_svc and git_mgmt.get("active"):
-                            base_url = git_mgmt.get("remote_git_repository_toplevel", "").rstrip("/")
-                            repo_name = matched_svc.get("repository_name", matched_svc.get("name"))
-                            if base_url:
-                                repo_url = f"{base_url}/{repo_name}.git"
-                except Exception as e:
-                    log.warning(f"Failed to parse source service_catalog: {e}")
-        if not repo_url:
-            repo_url = f"https://gitlab.int.fam-feser.de/aac-application-definitions/{self.service_name}.git"
-        raw_svc_config = engine.ctx.get_secret("repo_service_repos_config")
-        svc_token = None
-        if raw_svc_config:
-            try:
-                svc_config = json.loads(raw_svc_config)
-                token_key = svc_config.get("token_key")
-                if token_key:
-                    from ..app.controller.settings_schema import resolve_credential
-                    svc_token = resolve_credential(engine.ctx, token_key)
-            except Exception: pass
+        # Catalog YAML and three Vault round trips per service — a bulk sync does
+        # this for every service of the catalog. Off the loop (audit OC-08 B3/B6).
+        repo_url, svc_token, ssh_key = await off_loop(self._resolve_source, engine)
         auth_env = os.environ.copy()
         # Supply the HTTPS token per-invocation via an HTTP auth header instead of
         # embedding it in the remote URL. Baking the token into the origin URL (the
@@ -157,7 +131,6 @@ class CloneServiceRepoStage(BaseStage):
             auth_env["GIT_CONFIG_COUNT"] = "1"
             auth_env["GIT_CONFIG_KEY_0"] = "http.extraHeader"
             auth_env["GIT_CONFIG_VALUE_0"] = f"Authorization: Basic {auth}"
-        ssh_key = engine.ctx.get_secret("ansible_ssh_key")
         if ssh_key:
             key_path = engine.config.security_dir / "ansible_id_rsa"
             os.makedirs(os.path.dirname(key_path), exist_ok=True)
@@ -222,6 +195,49 @@ class CloneServiceRepoStage(BaseStage):
             log.error(f"Git error for {self.service_name}: {e}{stale}")
             return StageResult(False, f"Service repo sync failed for {self.service_name}: {e}{stale}")
 
+    def _resolve_source(self, engine) -> tuple[str, str | None, str | None]:
+        """``(repo url, https token, ssh key)`` for this service. Synchronous
+        (YAML parse + Vault): call through ``off_loop``."""
+        repo_url = None
+        catalog_file = engine.base_git_dir / "iac_controller" / "environments" / "global" / "02_service_catalog.yml"
+        if catalog_file.exists():
+            try:
+                with open(catalog_file, 'r') as f:
+                    catalog_data = yaml.safe_load(f) or {}
+                    catalog = catalog_data.get("service_catalog", {})
+                    git_mgmt = catalog.get("remote_git_management", {})
+                    services_list = catalog.get("services", [])
+                    matched_svc = next((s for s in services_list if s.get("name") == self.service_name), None)
+                    if matched_svc and git_mgmt.get("active"):
+                        base_url = git_mgmt.get("remote_git_repository_toplevel", "").rstrip("/")
+                        repo_name = matched_svc.get("repository_name", matched_svc.get("name"))
+                        if base_url:
+                            repo_url = f"{base_url}/{repo_name}.git"
+            except Exception as e:
+                log.warning(f"Failed to parse source service_catalog: {e}")
+        if not repo_url:
+            repo_url = f"https://gitlab.int.fam-feser.de/aac-application-definitions/{self.service_name}.git"
+        raw_svc_config = engine.ctx.get_secret("repo_service_repos_config")
+        svc_token = None
+        if raw_svc_config:
+            try:
+                svc_config = json.loads(raw_svc_config)
+                token_key = svc_config.get("token_key")
+                if token_key:
+                    from ..app.controller.settings_schema import resolve_credential
+                    svc_token = resolve_credential(engine.ctx, token_key)
+            except Exception: pass
+        return repo_url, svc_token, engine.ctx.get_secret("ansible_ssh_key")
+
+
+def _catalog_services(catalog_file) -> tuple[list, dict]:
+    """``(services, remote_git_management)`` of the service catalog (sync YAML parse)."""
+    with open(catalog_file, 'r') as f:
+        catalog_data = yaml.safe_load(f) or {}
+    catalog = catalog_data.get("service_catalog", {})
+    return catalog.get("services", []), catalog.get("remote_git_management", {})
+
+
 class SyncAllServicesStage(BaseStage):
     def __init__(self):
         super().__init__("Bulk Sync Service Repositories")
@@ -231,11 +247,7 @@ class SyncAllServicesStage(BaseStage):
         if not catalog_file.exists():
             return StageResult(False, f"Source service_catalog.yml missing at {catalog_file}")
         try:
-            with open(catalog_file, 'r') as f:
-                catalog_data = yaml.safe_load(f) or {}
-                catalog = catalog_data.get("service_catalog", {})
-                services = catalog.get("services", [])
-                git_mgmt = catalog.get("remote_git_management", {})
+            services, git_mgmt = await off_loop(_catalog_services, catalog_file)
         except Exception as e:
             return StageResult(False, f"Raw catalog parse failed: {e}")
         if not services:

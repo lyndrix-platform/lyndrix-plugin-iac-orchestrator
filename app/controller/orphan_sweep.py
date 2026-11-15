@@ -32,6 +32,8 @@ import logging
 import os
 from datetime import datetime, timezone
 
+from .offloop import off_loop
+
 log = logging.getLogger("IaC:OrphanSweep")
 
 STATE_KEY = "orphan_sweep"
@@ -142,13 +144,13 @@ class OrphanSweeper:
         return max(2 * _lease_ttl(), int(getattr(self.config, "orphan_sweep_grace_seconds", 90)))
 
     async def sweep_once(self) -> list[int]:
-        enabled = await asyncio.to_thread(lambda: bool(getattr(self.config, "orphan_sweep_enabled", True)))
+        enabled = await off_loop(lambda: bool(getattr(self.config, "orphan_sweep_enabled", True)))
         if not enabled:
             return []
-        grace = await asyncio.to_thread(self.grace_seconds)
-        container_grace = max(grace, int(await asyncio.to_thread(
+        grace = await off_loop(self.grace_seconds)
+        container_grace = max(grace, int(await off_loop(
             lambda: getattr(self.config, "orphan_sweep_container_grace_seconds", 1800))))
-        candidates = await asyncio.to_thread(self.queue.sweep_candidates)
+        candidates = await off_loop(self.queue.sweep_candidates)
         failed: list[int] = []
         for row in candidates:
             hb_age, log_age = row["hb_age"], row["log_age"]
@@ -160,12 +162,12 @@ class OrphanSweeper:
             if row["has_container"] and hb_age < container_grace:
                 # (c) a container may still be running on the runner's host: give
                 # the runner time to come back and re-attach.
-                await asyncio.to_thread(self.queue.note_step, row["id"], row["claim_token"], WAITING_STEP)
+                await off_loop(self.queue.note_step, row["id"], row["claim_token"], WAITING_STEP)
                 continue
             hb = row["heartbeat_utc"]
             stamp = hb.replace(tzinfo=timezone.utc).isoformat(timespec="seconds") if isinstance(hb, datetime) else "unknown"
             reason = f"runner_lost: {row['owner_instance']} last heartbeat {stamp}"
-            if await asyncio.to_thread(self.queue.fail_orphan, row["id"], row["claim_token"], reason, grace):
+            if await off_loop(self.queue.fail_orphan, row["id"], row["claim_token"], reason, grace):
                 failed.append(row["id"])
                 self.failed_total += 1
                 log.warning("Orphan sweep: job #%s closed as FAILED (%s).", row["id"], reason)
@@ -174,7 +176,7 @@ class OrphanSweeper:
                         self.notify(row["id"], reason, row)
                     except Exception as exc:
                         log.debug("orphan notification failed: %s", exc)
-        await asyncio.to_thread(self._record, failed)
+        await off_loop(self._record, failed)
         return failed
 
     def _record(self, failed: list[int]) -> None:

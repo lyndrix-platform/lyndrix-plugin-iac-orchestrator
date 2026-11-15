@@ -24,6 +24,7 @@ from fastapi import APIRouter, Depends, Request
 from core.api import ApiIdentity, require_permission
 
 from .controller import api as _api
+from .controller.offloop import off_loop
 
 PLUGIN_ID = "lyndrix.plugin.iac_orchestrator"
 
@@ -61,7 +62,7 @@ def build_plugin_router(service) -> APIRouter:
         from pathlib import Path
 
         path = Path(__file__).resolve().parents[1] / "ai" / "INSTRUCTIONS.md"
-        text = await asyncio.to_thread(lambda: path.read_text(encoding="utf-8") if path.is_file() else "")
+        text = await off_loop(lambda: path.read_text(encoding="utf-8") if path.is_file() else "")
         return {"plugin_id": PLUGIN_ID, "version": PLUGIN_VERSION, "format": "markdown", "markdown": text}
 
     @router.get("/jobs")
