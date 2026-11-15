@@ -197,6 +197,12 @@ manifest = ModuleManifest(
 )
 
 _service: IaCService | None = None
+# The service of every plugin load that is not torn down yet, keyed by the
+# context of that load. teardown() stops the service ITS setup() created: on a
+# core that runs the async teardown as a task (< 1.12) the successor's setup()
+# may already have replaced ``_service`` — tearing "the current service" down
+# then stopped the new load's worker, sweeper and webhook sync.
+_services: dict[int, IaCService] = {}
 # Token of the directly mounted routes per plugin load, keyed by the context of
 # that load: an async teardown may run after the next setup() (core < 1.12) and
 # must remove ITS routes, not the successor's (review R7).
@@ -235,19 +241,21 @@ async def health(ctx) -> PluginHealthStatus:
     """
     start = time.perf_counter()
 
-    if _service is None or getattr(_service, "engine", None) is None:
+    # One reference for the whole probe: a reload may replace the global between awaits.
+    svc = _service
+    if svc is None or getattr(svc, "engine", None) is None:
         return PluginHealthStatus(status="error", details={"reason": "not_initialized"})
 
     if not db_instance.is_connected:
         return PluginHealthStatus(status="error", details={"reason": "db_unavailable"})
 
-    state = getattr(_service, "state", None) or {}
+    state = getattr(svc, "state", None) or {}
     active_workers = len(state.get("active_tasks", {}) or {})
     last_deployment = state.get("last_deployment")
     # online | restarting | absent | unknown. Only a runner that is really gone
     # degrades the plugin: a restarting runner (core rollout) or a view that is
     # not built yet must not turn every instance's health red.
-    runner_state = _service.runner_state()
+    runner_state = svc.runner_state()
     runner_online = runner_state == "online"
 
     # Vault holds the auto-apply flag (env fallback). A reachable Vault returns a
@@ -260,12 +268,12 @@ async def health(ctx) -> PluginHealthStatus:
         vault_ready = False
 
     try:
-        sweep = ((await off_loop(_service.db.get_state, "orphan_sweep")) or {}).get("data") or {}
+        sweep = ((await off_loop(svc.db.get_state, "orphan_sweep")) or {}).get("data") or {}
     except Exception:
         sweep = {}
 
     try:
-        recent = await off_loop(_service.db.get_recent_jobs, 5)
+        recent = await off_loop(svc.db.get_recent_jobs, 5)
     except Exception as exc:
         return PluginHealthStatus(
             status="error",
@@ -284,7 +292,7 @@ async def health(ctx) -> PluginHealthStatus:
             "active_workers": active_workers,
             "last_deployment": last_deployment,
             "recent_jobs": len(recent or []),
-            "is_runner": _service.is_runner,
+            "is_runner": svc.is_runner,
             "runner_online": runner_online,
             "runner_state": runner_state,
             # Rejected calls on the token routes of this instance — a rotated
@@ -292,8 +300,8 @@ async def health(ctx) -> PluginHealthStatus:
             "webhook_auth_failures": dict(_api_module.webhook_auth_failures),
             # Orphan sweep (lease-held by one instance): visible on every instance.
             "orphan_sweep": {
-                "enabled": bool(await off_loop(lambda: _service.config.orphan_sweep_enabled)),
-                "running_here": _service.sweeper.running,
+                "enabled": bool(await off_loop(lambda: svc.config.orphan_sweep_enabled)),
+                "running_here": svc.sweeper.running,
                 "holder": sweep.get("holder"),
                 "last_sweep_at": sweep.get("last_sweep_at"),
                 "orphans_failed_total": sweep.get("orphans_failed_total", 0),
@@ -312,7 +320,9 @@ def setup(ctx):
     global _service, _mount_token
     ctx.log.info("IaC Orchestrator: Executing async setup sequence...")
 
-    _service = IaCService(ctx)
+    # ``service`` — this load's own object. Every handler below closes over it,
+    # never over the module global (which a later load replaces).
+    service = _service = _services[id(ctx)] = IaCService(ctx)
 
     # API wiring
     init_api(ctx, _service)
@@ -348,7 +358,6 @@ def setup(ctx):
     # DB bootstrap — off the event loop (DDL and the bootstrap advisory lock can
     # take most of a minute while several instances start together). The runner
     # boot and the trigger path wait for it (IaCService.wait_bootstrapped).
-    service = _service
     service.schedule_bootstrap(Base)
 
     @ctx.subscribe('db:connected')
@@ -362,28 +371,28 @@ def setup(ctx):
     async def _on_webhook(payload):
         if (payload or {}).get("_origin"):
             return  # relayed copy — the origin instance already queued it
-        await _service.enqueue_from_event(payload or {})
+        await service.enqueue_from_event(payload or {})
 
     # A peer queued a job → poke this instance's worker (runner instances only).
     @ctx.subscribe('iac:job_queued')
     async def _on_job_queued(payload):
-        if _service.worker is not None:
-            _service.worker.wake()
+        if service.worker is not None:
+            service.worker.wake()
 
     # Abort requested on any instance → the owning runner cancels + kills containers.
     @ctx.subscribe('iac:job_abort_requested')
     async def _on_abort(payload):
-        await _service.on_abort_requested(payload or {})
+        await service.on_abort_requested(payload or {})
 
     # Execution plane (runner role): worker, startup reconciliation, the
     # repo-derived publishes (they read the git working trees of this host).
-    if _service.is_runner:
+    if service.is_runner:
         # Reconcile what a previous incarnation left behind, THEN start claiming.
-        ctx.create_task(_service.run_runner_boot(), name="iac:runner_boot")
+        ctx.create_task(service.run_runner_boot(), name="iac:runner_boot")
         # One ordered chain (maintenance windows, 1.6): registry ci_ids → monitoring
         # sync with ci_ids → maintenance:windows_published. Same order as NativeGenerateStage.
-        ctx.create_task(_service.publish_inventory_chain(), name="iac:inventory_publish")
-        ctx.create_task(_service.publish_snapshots_on_boot(), name="iac:snapshots_publish")
+        ctx.create_task(service.publish_inventory_chain(), name="iac:inventory_publish")
+        ctx.create_task(service.publish_snapshots_on_boot(), name="iac:snapshots_publish")
     else:
         ctx.log.info("IaC Orchestrator: control plane only on this instance (no 'runner' role).")
 
@@ -391,17 +400,17 @@ def setup(ctx):
     # GitLab API, not the working trees). Older cores without leases: run it here.
     on_lease = getattr(ctx, "on_lease", None)
     if callable(on_lease):
-        on_lease("iac:webhook_sync", acquired=_service.start_webhook_sync, lost=_service.stop_webhook_sync)
+        on_lease("iac:webhook_sync", acquired=service.start_webhook_sync, lost=service.stop_webhook_sync)
     else:
-        _service.start_webhook_sync()
+        service.start_webhook_sync()
 
     # Orphan sweep (rD §3): one instance under a lease — a control-plane instance
     # when there is one, so a hung or dead runner is noticed by somebody else.
-    _service.review_sweep_lease()
+    service.review_sweep_lease()
     try:
         @ctx.subscribe("cluster:instance_lost")
         async def _on_instance_lost(_payload):
-            _service.sweeper.poke()     # a peer is gone: sweep now, not at the next tick
+            service.sweeper.poke()      # a peer is gone: sweep now, not at the next tick
     except Exception as exc:            # topic unknown to an older core
         ctx.log.debug(f"IaC Orchestrator: cluster:instance_lost not subscribed: {exc}")
 
@@ -412,20 +421,19 @@ def setup(ctx):
         async def _on_draining(payload):
             if (payload or {}).get("_origin"):
                 return  # a peer is draining, not this instance
-            if _service is not None:
-                await _service.shutdown(reason="instance draining", budget=8)
+            await service.shutdown(reason="instance draining", budget=8)
     except Exception as exc:
         ctx.log.debug(f"IaC Orchestrator: system:draining not subscribed: {exc}")
 
     # Cluster: tell the operator when no runner is online (jobs would only queue)
     # and keep the sweep lease on the right kind of instance.
-    ctx.create_task(_service.watch_runner_presence(), name="iac:runner_watch")
+    ctx.create_task(service.watch_runner_presence(), name="iac:runner_watch")
 
     # UI route
     @ui.page('/iac')
     @main_layout('IaC Orchestrator')
     async def _dashboard_page():
-        await render_dashboard(ctx, _service)
+        await render_dashboard(ctx, service)
 
 
 async def teardown(ctx):
@@ -434,7 +442,16 @@ async def teardown(ctx):
     its leases; older cores run it as a task next to dispose(). Either way a job
     in flight is DETACHED, never closed — see IaCService.shutdown."""
     global _service
-    svc, _service = _service, None
+    # The service of THIS load (by its context). A context the registry does not
+    # know: the oldest load still registered — a teardown belongs to an earlier
+    # load, never to one that was set up after it.
+    svc = _services.pop(id(ctx), None)
+    if svc is None and _services:
+        svc = _services.pop(next(iter(_services)))
+    if svc is None:
+        svc = _service
+    if _service is svc:
+        _service = None                 # nothing took over: the plugin is off
     # First: stop answering. The registry unmounts its own routes; the directly
     # mounted ones (/api/iac/*, stream) are ours to remove — a disabled plugin
     # must not keep accepting webhooks and CI triggers. Only the routes THIS load
@@ -453,6 +470,7 @@ async def teardown(ctx):
             await svc.shutdown(reason="plugin reload", budget=12)
         except Exception as exc:
             ctx.log.warning(f"IaC Orchestrator: teardown incomplete: {exc}")
-    # The plugin's thread pool: calls still queued or running finish; whoever
-    # calls off_loop afterwards (a successor load, a late task) gets a new one.
-    shutdown_pool()
+    # The plugin's thread pool — unless a successor load is using it already.
+    # Calls still queued or running finish; a late caller gets a new pool.
+    if _service is None:
+        shutdown_pool()

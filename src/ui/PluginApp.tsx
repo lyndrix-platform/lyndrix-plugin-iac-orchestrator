@@ -1750,7 +1750,17 @@ function Dashboard() {
       confirmLabel: t('dashboard.abortConfirmLabel', { defaultValue: 'Abort' }),
       onConfirm: () => {
         iacApi.abort()
-          .then((r) => toast(t('dashboard.aborted', { defaultValue: 'Execution aborted ({{count}} job(s)).', count: (r.aborted_jobs as number[] | undefined)?.length ?? 0 })))
+          .then((r) => {
+            toast(t('dashboard.aborted', { defaultValue: 'Execution aborted ({{count}} job(s)).', count: (r.aborted_jobs as number[] | undefined)?.length ?? 0 }))
+            // Docker on the runner did not answer: these jobs are NOT stopped yet (the runner retries).
+            const unstopped = (r.unstopped_jobs as number[] | undefined) ?? []
+            if (unstopped.length) {
+              toast(t('dashboard.abortUnstopped', {
+                defaultValue: 'Docker on the runner did not answer: the containers of {{jobs}} could not be stopped yet. The abort is retried; until then these jobs stay RUNNING.',
+                jobs: unstopped.map((j) => `#${j}`).join(', '),
+              }), 'err')
+            }
+          })
           .catch((e) => toast(e instanceof Error ? e.message : t('dashboard.abortError', { defaultValue: 'Abort fehlgeschlagen' }), 'err'))
       },
     })

@@ -246,6 +246,7 @@
     "aborted_one": "Execution aborted ({{count}} job).",
     "aborted_other": "Execution aborted ({{count}} jobs).",
     "abortError": "Abort failed.",
+    "abortUnstopped": "Docker on the runner did not answer: the containers of {{jobs}} could not be stopped yet. The abort is retried; until then these jobs stay RUNNING.",
     "settings": "Settings"
   },
   "maintenance": {

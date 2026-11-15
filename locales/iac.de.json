@@ -246,6 +246,7 @@
     "aborted_one": "Ausführung abgebrochen ({{count}} Job).",
     "aborted_other": "Ausführung abgebrochen ({{count}} Jobs).",
     "abortError": "Abbruch fehlgeschlagen.",
+    "abortUnstopped": "Docker auf dem Runner hat nicht geantwortet: Die Container von {{jobs}} konnten noch nicht gestoppt werden. Der Abbruch wird wiederholt; bis dahin bleiben diese Jobs RUNNING.",
     "settings": "Einstellungen"
   },
   "maintenance": {

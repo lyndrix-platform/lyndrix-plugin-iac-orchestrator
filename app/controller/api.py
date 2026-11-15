@@ -1482,6 +1482,28 @@ async def do_run_pipeline(payload: PipelineRequest, identity=None):
     )
 
 
+def _close_aborted_row(job_id: int) -> None:
+    """ABORTED for a RUNNING job nobody executes any more (sync: thread)."""
+    if _engine.db.update_job(job_id, "ABORTED"):
+        _engine.db.update_progress(job_id, progress=None, current_step="Aborted by User")
+    _engine.end_override_for(job_id)  # maintenance override of a dead runner's job
+
+
+def _forget_stopped_tasks(state: dict, stopped_job_ids) -> None:
+    """Remove the in-memory runner tasks of ``stopped_job_ids`` (and entries that
+    belong to no job) from ``state["active_tasks"]``; everything else stays."""
+    stopped = {int(j) for j in stopped_job_ids}
+    tasks = state.get("active_tasks")
+    if not isinstance(tasks, dict):
+        tasks = state["active_tasks"] = {}
+    for name in list(tasks):
+        task = tasks[name]
+        job_id = task.get("job_id") if isinstance(task, dict) else None
+        if not job_id or job_id == -1 or job_id in stopped:
+            tasks.pop(name, None)
+    state["is_running"] = bool(tasks) or int(state.get("running_jobs") or 0) > 0
+
+
 async def do_abort():
     """Abort the running execution: kill runner containers, mark RUNNING jobs ABORTED.
 
@@ -1538,10 +1560,8 @@ async def do_abort():
                 continue
             if local or not owner or (alive is not None and owner not in alive):
                 # Conditional on the row still being RUNNING: a job its owner
-                # finished meanwhile keeps its result.
-                if _engine.db.update_job(job_id, "ABORTED"):
-                    _engine.db.update_progress(job_id, progress=None, current_step="Aborted by User")
-                _engine.end_override_for(job_id)  # maintenance override of a dead runner's job
+                # finished meanwhile keeps its result. Off the loop (database).
+                await off_loop(_close_aborted_row, job_id)
         aborted.extend(j for j in running_ids if j not in unstopped)
     else:
         unstopped = set()
@@ -1562,8 +1582,13 @@ async def do_abort():
         except Exception as exc:
             _ctx.log.debug(f"ABORT: notification failed: {exc}")
 
-    state["is_running"] = False
-    state["active_tasks"] = {}
+    # Forget the tasks of the jobs that were stopped — and only those. This used
+    # to be ``state["active_tasks"] = {}``: on the runner that also dropped the
+    # tasks of jobs whose containers could NOT be stopped (and of a job that
+    # started meanwhile). Those tasks are what keeps such a job attended and
+    # heartbeated; without them the worker closed it as "lost track" while its
+    # containers were still running.
+    _forget_stopped_tasks(state, aborted)
     result: dict = {"status": "ok", "aborted_jobs": aborted}
     if unstopped:
         # Additive field: Docker on the runner did not answer, the abort is retried.
