@@ -134,6 +134,8 @@ _HOST_SCOPED = ("host_provision", "bootstrap_compliance", "init_host", "complian
 # Errors MariaDB raises when two runners race for the same row under snapshot
 # isolation / locking — the claim simply retries.
 _RETRY_SQLSTATE_CODES = ("1020", "1205", "1213")
+#: Attempts of one enqueue when the database answers with one of the codes above.
+_ENQUEUE_ATTEMPTS = 4
 
 
 def _naive(value):
@@ -309,6 +311,20 @@ def _is_retryable(exc: Exception) -> bool:
     return any(code in msg for code in _RETRY_SQLSTATE_CODES)
 
 
+def _is_retryable_db_error(exc: Exception) -> bool:
+    """:func:`_is_retryable` for callers that retry a whole decision: only a
+    driver error counts, and its numeric code when the driver gives one — a
+    message that merely contains "1213" (a job id, a name) must not."""
+    from sqlalchemy.exc import DBAPIError
+
+    if not isinstance(exc, DBAPIError):
+        return False
+    args = getattr(getattr(exc, "orig", None), "args", None) or ()
+    if args and isinstance(args[0], int):
+        return str(args[0]) in _RETRY_SQLSTATE_CODES
+    return _is_retryable(exc)
+
+
 class JobQueue:
     """Database-backed queue + log/runner store. Every method is synchronous and
     cheap; async callers run them through ``offloop.off_loop`` (the plugin's own
@@ -454,7 +470,29 @@ class JobQueue:
         # is ever stored (audit OS-09). Raises InvalidJobPayload.
         from .job_payload import validate_structure
 
-        payload = validate_structure(payload)
+        validated = validate_structure(payload)
+        # Concurrent triggers for one target, the claim and the runner's writes
+        # meet on the same rows: MariaDB answers a lost race with 1213 (deadlock),
+        # 1205 (lock wait) or 1020 (snapshot isolation). Each of the steps below
+        # is one complete transaction that such an error rolls back, so the whole
+        # decision is simply taken again — a trigger that was told "accepted"
+        # must not be lost to a retryable error (review C7).
+        for attempt in range(_ENQUEUE_ATTEMPTS):
+            try:
+                # A fresh copy per attempt: a branch may add ``force``/``followup_of``.
+                return self._enqueue_once(dict(validated), requested_by)
+            except DuplicateJob:
+                raise
+            except Exception as exc:
+                if attempt + 1 >= _ENQUEUE_ATTEMPTS or not _is_retryable_db_error(exc):
+                    raise
+                log.warning("QUEUE: enqueue hit a retryable database error (%s) — attempt %s of %s.",
+                            exc, attempt + 2, _ENQUEUE_ATTEMPTS)
+                time.sleep(0.05 * (attempt + 1))
+        raise RuntimeError("unreachable")  # pragma: no cover
+
+    def _enqueue_once(self, payload: dict, requested_by: str | None) -> EnqueueResult:
+        """One attempt of :meth:`enqueue_ex` on a validated payload."""
         key = dedupe_key_for(payload)
         who = f" by {requested_by}" if requested_by else ""
         with self._queue_lock():
@@ -1297,14 +1335,13 @@ class JobQueue:
         OR the job holds a lock (review C2): the snapshot is written
         fire-and-forget and can be stale or lost, while a ``tf:``/``rules`` lock
         is only held around the protected work and released by the job itself.
-        ``log_age`` is ``None`` for a job without log lines. Rows without a UTC
+        ``log_age`` (database clock, UTC) is ``None`` for a job without log lines. Rows without a UTC
         heartbeat (claimed by a plugin version before the sweep) are skipped."""
         session = self._session()
         if not session:
             return []
         try:
             db_utc = session.execute(select(self._utc_now(session))).scalar()
-            db_local = session.execute(select(sa_fn.now())).scalar()
             rows = session.execute(
                 select(IaCJob.id, IaCJob.owner_instance, IaCJob.owner_incarnation, IaCJob.claim_token,
                        IaCJob.heartbeat_utc, IaCJob.runners, IaCJob.current_step, IaCJob.claimed_utc)
@@ -1329,7 +1366,12 @@ class JobQueue:
                     "id": int(job_id), "owner_instance": owner, "owner_incarnation": incarnation,
                     "claim_token": token, "heartbeat_utc": hb,
                     "hb_age": _seconds_between(db_utc, hb),
-                    "log_age": _seconds_between(db_local, last_log) if last_log is not None else None,
+                    # Log lines carry the database clock in UTC (append_log): aged with
+                    # the same clock, a DST switch cannot make an old line look fresh or a
+                    # fresh one old. Lines of a plugin version that stored local time read
+                    # as "newer" east of UTC — the job is then judged by its heartbeat a
+                    # little later, never earlier (west of UTC the heartbeat rule holds).
+                    "log_age": _seconds_between(db_utc, last_log) if last_log is not None else None,
                     "runtime": _seconds_between(db_utc, claimed_utc) if claimed_utc is not None else None,
                     "has_container": has_container, "holds_lock": holds_lock, "current_step": step,
                 })
@@ -1587,25 +1629,47 @@ class JobQueue:
 
     # -------------------------------------------------------------------- logs
     def append_log(self, job_id: int, lines: list[str], start_seq: int) -> int:
-        """Append ``lines`` with consecutive ``seq`` numbers; returns the next seq."""
+        """Append ``lines`` with consecutive ``seq`` numbers; returns the next seq
+        — ``start_seq`` unchanged when nothing was written (no database, or the
+        write failed: all or nothing). The lines are stamped with the DATABASE
+        clock in UTC, the clock the orphan sweep ages them with."""
         if not lines or job_id in (None, -1):
             return start_seq
         session = self._session()
         if not session:
             return start_seq
         try:
+            stamp = session.execute(select(self._utc_now(session))).scalar()
             seq = start_seq
             objs = []
             for ln in lines:
-                objs.append(IaCJobLog(job_id=job_id, seq=seq, line=ln))
+                objs.append(IaCJobLog(job_id=job_id, seq=seq, line=ln, ts=stamp))
                 seq += 1
             session.add_all(objs)
             session.commit()
             return seq
         except Exception as exc:
             session.rollback()
-            log.debug("QUEUE: append_log failed: %s", exc)
+            log.warning("QUEUE: %s log line(s) of job #%s not written: %s", len(lines), job_id, exc)
             return start_seq
+        finally:
+            session.close()
+
+    def log_batch_landed(self, job_id: int, start_seq: int, lines: list[str]) -> bool:
+        """Is the batch ``lines`` stored from ``start_seq`` on? For a writer whose
+        COMMIT failed on the client: the server may have applied it."""
+        if not lines:
+            return True
+        session = self._session()
+        if not session:
+            return False
+        try:
+            stored = session.execute(
+                select(IaCJobLog.line)
+                .where(IaCJobLog.job_id == job_id, IaCJobLog.seq == start_seq + len(lines) - 1)
+                .order_by(IaCJobLog.id.desc()).limit(1)
+            ).scalar()
+            return stored is not None and stored == lines[-1]
         finally:
             session.close()
 
@@ -1735,7 +1799,27 @@ class JobLogWriter:
     ``append`` is synchronous and cheap (called from a logging handler and from
     the container log reader); ``run`` flushes every ``interval`` seconds off
     the event loop; ``close`` flushes the rest.
+
+    A batch the database did not take is NOT dropped (review C7): it goes back
+    to the front of the buffer and is written again (with a growing pause) once
+    the database answers. The buffer is bounded — when it is full the OLDEST
+    lines go, and the place where they are missing is marked in the log with a
+    ``[SYSTEM] [WARNING] … log line(s) are missing here`` line as soon as
+    something can be written again. What is still unwritten when the job ends
+    is tried a few more times in the background.
     """
+
+    #: Lines kept while the database does not take them (roughly a few MB).
+    MAX_BUFFERED_LINES = 20000
+    #: Longest pause between two attempts while writes fail.
+    MAX_RETRY_PAUSE = 10.0
+    #: ``close``: attempts (with short pauses) before the rest is left to the
+    #: background flush — the job's end must not wait for the database for long.
+    CLOSE_ATTEMPTS = 3
+    CLOSE_RETRY_PAUSE = 0.5
+    #: Background flush after ``close``: every 20 s for about ten minutes.
+    LATE_FLUSH_SECONDS = 20.0
+    LATE_FLUSH_ATTEMPTS = 30
 
     def __init__(self, queue: JobQueue, job_id: int, *, interval: float = 0.5, batch: int = 200):
         self.queue = queue
@@ -1746,55 +1830,125 @@ class JobLogWriter:
         self._seq: int | None = None
         self._closed = False
         self._task: asyncio.Task | None = None
+        self._late_task: asyncio.Task | None = None
+        self._create_task = None
         self._wake = asyncio.Event()
         self._lock = asyncio.Lock()
         # The database write of the batch in flight. It runs in a thread and is
         # not stopped by a cancellation of whoever awaits it — the next flush
         # waits for it and continues with ITS sequence number.
         self._inflight: asyncio.Future | None = None
+        # (lines of the batch in flight, lines it replaces a gap for, its first seq)
+        self._batch: tuple[list[str], int, int] | None = None
+        # Lines that had to be dropped because the buffer was full, not yet marked.
+        self._dropped = 0
+        #: Lines lost for good (marked in the log) — for tests and diagnostics.
+        self.lost_total = 0
+        self._failures = 0
 
     def append(self, line: str) -> None:
         if self._closed:
             return
         self._buf.append(line)
+        self._trim()
+
+    def _trim(self) -> None:
+        overflow = len(self._buf) - self.MAX_BUFFERED_LINES
+        if overflow > 0:
+            del self._buf[:overflow]            # the oldest: the newest say what the job does now
+            self._dropped += overflow
+
+    @property
+    def pending(self) -> int:
+        """Lines not stored yet (buffered or in the batch in flight)."""
+        return len(self._buf) + (len(self._batch[0]) if self._batch else 0)
 
     def start(self, create_task) -> None:
+        self._create_task = create_task
         if self._task is None:
             self._task = create_task(self.run(), name=f"iac:joblog:{self.job_id}")
 
-    async def _flush(self) -> None:
+    def _gap_line(self, count: int) -> str:
+        return (f"[SYSTEM] [WARNING] {count} log line(s) are missing here: the database did not accept them and "
+                f"the buffer was full. The log file on the runner host (job_{self.job_id}.log) is complete.")
+
+    async def _settle(self) -> bool:
+        """Wait for the write in flight and account for its outcome. True when
+        the batch is stored."""
+        future, batch = self._inflight, self._batch
+        lines, gap, start = batch if batch else ([], 0, self._seq or 0)
+        written = ([self._gap_line(gap)] if gap else []) + lines
+        try:
+            next_seq = await asyncio.shield(future)
+            stored = next_seq != start or not written
+        except asyncio.CancelledError:
+            raise                               # still in flight: the next flush settles it
+        except Exception as exc:
+            log.warning("Job log of #%s: write failed: %s", self.job_id, exc)
+            next_seq, stored = start, False
+        self._inflight = self._batch = None
+        if not stored:
+            # ``append_log`` is all-or-nothing, but a COMMIT whose acknowledgement
+            # got lost may have been applied: look before writing it twice.
+            try:
+                if await off_loop(self.queue.log_batch_landed, self.job_id, start, written):
+                    next_seq, stored = start + len(written), True
+            except Exception:
+                pass
+        if stored:
+            if self._failures:
+                log.info("Job log of #%s: the database accepts lines again.", self.job_id)
+            self._failures = 0
+            self._seq = next_seq
+            self.lost_total += gap
+            return True
+        # Not written: back to the front, in order; the sequence is read again.
+        self._buf[:0] = lines
+        self._dropped += gap
+        self._trim()
+        self._seq = None
+        self._failures += 1
+        if self._failures == 1:
+            log.warning("Job log of #%s: %s line(s) not stored — kept and retried.", self.job_id, len(self._buf))
+        return False
+
+    async def _flush(self) -> bool:
         """Write the next batch. Safe against cancellation at any await: a batch
         is taken from the buffer only when its write starts, and a write that
         was still running when its flush got cancelled (plugin reload, close
         racing the timer) is awaited before more lines get sequence numbers —
         otherwise two batches were numbered from the same start and the job log
-        came out reordered."""
+        came out reordered. Returns False when the database did not take the
+        batch (it is back in the buffer)."""
         async with self._lock:
-            if self._inflight is not None:
-                try:
-                    self._seq = await asyncio.shield(self._inflight)
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    self._seq = None
-                self._inflight = None
-            if not self._buf:
-                return
+            if self._inflight is not None and not await self._settle():
+                return False
+            if not self._buf and not self._dropped:
+                return True
             if self._seq is None:
-                self._seq = await off_loop(self.queue.last_seq, self.job_id)
-            if not self._buf:
-                return
+                try:
+                    self._seq = await off_loop(self.queue.last_seq, self.job_id)
+                except Exception as exc:
+                    self._failures += 1
+                    log.debug("Job log of #%s: sequence not readable: %s", self.job_id, exc)
+                    return False
+            if not self._buf and not self._dropped:
+                return True
             lines, self._buf = self._buf[: self.batch * 5], self._buf[self.batch * 5:]
+            gap, self._dropped = self._dropped, 0
+            written = ([self._gap_line(gap)] if gap else []) + lines
+            self._batch = (lines, gap, self._seq)
             self._inflight = asyncio.ensure_future(
-                off_loop(self.queue.append_log, self.job_id, lines, self._seq))
-            self._seq = await asyncio.shield(self._inflight)
-            self._inflight = None
+                off_loop(self.queue.append_log, self.job_id, written, self._seq))
+            return await self._settle()
 
     async def run(self) -> None:
         try:
             while not self._closed:
+                pause = self.interval if not self._failures else min(
+                    self.MAX_RETRY_PAUSE, self.interval * (2 ** min(self._failures, 6)))
                 try:
-                    await asyncio.wait_for(self._wake.wait(), timeout=self.interval)
+                    await asyncio.wait_for(self._wake.wait(), timeout=pause)
                 except asyncio.TimeoutError:
                     pass
                 await self._flush()
@@ -1803,7 +1957,8 @@ class JobLogWriter:
 
     async def close(self) -> None:
         """Flush what is buffered and stop. The timer task is asked to finish,
-        not cancelled mid-write."""
+        not cancelled mid-write. Bounded: when the database does not take the
+        rest, a background task keeps trying and the caller goes on."""
         self._closed = True
         self._wake.set()
         if self._task:
@@ -1811,8 +1966,34 @@ class JobLogWriter:
                 await self._task
             except (asyncio.CancelledError, Exception):
                 pass
-        while self._buf or self._inflight is not None:
-            await self._flush()
+        failed = 0
+        while self._buf or self._dropped or self._inflight is not None:
+            if await self._flush():
+                continue
+            failed += 1
+            if failed >= self.CLOSE_ATTEMPTS:
+                break
+            await asyncio.sleep(self.CLOSE_RETRY_PAUSE * failed)
+        if self._buf or self._dropped:
+            log.error("Job log of #%s: %s line(s) could not be stored when the job ended (database unreachable) "
+                      "— retrying in the background; the log file on the runner host is complete.",
+                      self.job_id, len(self._buf) + self._dropped)
+            if self._create_task is not None and self._late_task is None:
+                try:
+                    self._late_task = self._create_task(self._late_flush(), name=f"iac:joblog_late:{self.job_id}")
+                except Exception as exc:
+                    log.debug("Job log of #%s: background flush not started: %s", self.job_id, exc)
+
+    async def _late_flush(self) -> None:
+        """Store what ``close`` could not, once the database is back."""
+        for _ in range(self.LATE_FLUSH_ATTEMPTS):
+            await asyncio.sleep(self.LATE_FLUSH_SECONDS)
+            while await self._flush():
+                if not (self._buf or self._dropped or self._inflight is not None):
+                    log.warning("Job log of #%s: the remaining lines were stored late.", self.job_id)
+                    return
+        log.error("Job log of #%s: giving up — %s line(s) are not in the database (see the log file on the "
+                  "runner host).", self.job_id, len(self._buf) + self._dropped)
 
 
 class JobWorker:
