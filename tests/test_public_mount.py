@@ -29,9 +29,9 @@ def _app():
     return app
 
 
-def _mount(app):
+def _mount(app, token=None):
     return mount_direct_routes(app, PLUGIN_ID, [build_webhook_router(None), build_stream_router(None)],
-                               reorder=move_routes_before_catchall)
+                               reorder=move_routes_before_catchall, token=token)
 
 
 def test_reload_never_duplicates_and_the_newest_handlers_answer():
@@ -75,7 +75,8 @@ def test_entrypoint_teardown_unmounts_before_it_shuts_down(monkeypatch):
     from iac_plugin import entrypoint
 
     app = _app()
-    _mount(app)
+    _mount(app, token="load-1")
+    monkeypatch.setattr(entrypoint, "_mount_token", "load-1")
     monkeypatch.setitem(sys.modules, "main", types.SimpleNamespace(app=app))
     order = []
 
@@ -87,3 +88,71 @@ def test_entrypoint_teardown_unmounts_before_it_shuts_down(monkeypatch):
     asyncio.run(entrypoint.teardown(MagicMock()))
     assert order == [("shutdown", False)]                  # routes were gone before the service stopped
     assert entrypoint._service is None
+
+
+# --- review R7: a late teardown removes only the routes of ITS load ---------------------------------
+
+def _public(app):
+    return {r.path: r.endpoint for r in app.router.routes if getattr(r, "path", "").startswith("/api/iac")}
+
+
+def test_unmount_with_a_token_spares_the_routes_of_another_load():
+    app = _app()
+    _mount(app, token="failed-version")
+    _mount(app, token="restored-version")                  # replaces the stale copies, tags its own
+    restored = _public(app)
+    assert unmount_direct_routes(app, PLUGIN_ID, token="failed-version") == 0
+    assert _public(app) == restored                        # same handlers, nothing removed
+    assert _paths(app).count(f"/api/plugins/{PLUGIN_ID}/stream/jobs") == 1
+    assert unmount_direct_routes(app, PLUGIN_ID, token="restored-version") == len(restored) + 2
+    assert not _public(app)
+
+
+def test_token_unmount_leaves_untagged_routes_of_an_older_version_alone():
+    app = _app()
+    app.include_router(build_webhook_router(None))         # a version that does not tag (<= 1.6.1 style)
+    assert unmount_direct_routes(app, PLUGIN_ID, token="someone-else") == 0
+    assert "/api/iac/health" in _paths(app)
+    assert unmount_direct_routes(app, PLUGIN_ID) > 0       # a fresh mount still replaces them
+
+
+def test_late_teardown_of_the_failed_version_keeps_the_restored_routes(monkeypatch):
+    """Core 1.11.1 auto-revert: unload(failed) schedules its async teardown as a
+    task, load(restored) mounts synchronously, THEN the old teardown runs."""
+    import sys
+    import types
+
+    from iac_plugin import entrypoint
+
+    app = _app()
+    monkeypatch.setitem(sys.modules, "main", types.SimpleNamespace(app=app))
+    failed_ctx, restored_ctx = MagicMock(), MagicMock()
+    monkeypatch.setattr(entrypoint, "_mount_tokens", {id(failed_ctx): "failed", id(restored_ctx): "restored"})
+    monkeypatch.setattr(entrypoint, "_mount_token", "restored")   # same module object: the global moved on
+    monkeypatch.setattr(entrypoint, "_service", None)
+    _mount(app, token="failed")
+    pending_teardown = entrypoint.teardown(failed_ctx)     # created at unload, not started yet
+    _mount(app, token="restored")
+    restored = _public(app)
+    asyncio.run(pending_teardown)
+    assert restored and _public(app) == restored           # CI and webhooks keep their handlers
+    failed_ctx.log.info.assert_called_with("IaC Orchestrator: removed 0 directly mounted route(s).")
+
+    asyncio.run(entrypoint.teardown(restored_ctx))         # a real disable still stops answering
+    assert not _public(app) and entrypoint._mount_tokens == {}
+
+
+def test_teardown_without_a_mount_of_its_own_removes_nothing(monkeypatch):
+    import sys
+    import types
+
+    from iac_plugin import entrypoint
+
+    app = _app()
+    _mount(app, token="other-load")
+    monkeypatch.setitem(sys.modules, "main", types.SimpleNamespace(app=app))
+    monkeypatch.setattr(entrypoint, "_mount_tokens", {})
+    monkeypatch.setattr(entrypoint, "_mount_token", None)  # setup() failed before it mounted
+    monkeypatch.setattr(entrypoint, "_service", None)
+    asyncio.run(entrypoint.teardown(MagicMock()))
+    assert "/api/iac/health" in _paths(app)

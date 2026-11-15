@@ -1,5 +1,6 @@
 import asyncio
 import time
+import uuid
 
 from nicegui import ui
 from ui.layout import main_layout
@@ -187,6 +188,11 @@ manifest = ModuleManifest(
 )
 
 _service: IaCService | None = None
+# Token of the directly mounted routes per plugin load, keyed by the context of
+# that load: an async teardown may run after the next setup() (core < 1.12) and
+# must remove ITS routes, not the successor's (review R7).
+_mount_tokens: dict[int, str] = {}
+_mount_token: str | None = None   # the latest mount — fallback when teardown gets another ctx object
 
 
 # ==========================================
@@ -292,7 +298,7 @@ async def health(ctx) -> PluginHealthStatus:
 # 5. PLUGIN BOOT SEQUENCE
 # ==========================================
 def setup(ctx):
-    global _service
+    global _service, _mount_token
     ctx.log.info("IaC Orchestrator: Executing async setup sequence...")
 
     _service = IaCService(ctx)
@@ -319,10 +325,11 @@ def setup(ctx):
     #   an Authorization header; the handlers validate a ?ticket=/?token=.
     # public_mount removes the copies an earlier incarnation left behind first
     # and teardown() removes ours again (audit OS-15 / OC-17).
+    _mount_token = _mount_tokens[id(ctx)] = uuid.uuid4().hex
     stale = mount_direct_routes(
         fastapi_app, manifest.id,
         [build_webhook_router(_service), build_stream_router(_service)],
-        reorder=move_routes_before_catchall,
+        reorder=move_routes_before_catchall, token=_mount_token,
     )
     if stale:
         ctx.log.info(f"IaC Orchestrator: replaced {stale} stale directly mounted route(s).")
@@ -416,11 +423,14 @@ async def teardown(ctx):
     svc, _service = _service, None
     # First: stop answering. The registry unmounts its own routes; the directly
     # mounted ones (/api/iac/*, stream) are ours to remove — a disabled plugin
-    # must not keep accepting webhooks and CI triggers.
+    # must not keep accepting webhooks and CI triggers. Only the routes THIS load
+    # mounted: on core < 1.12 this coroutine runs as a task, in the auto-revert
+    # path after the restored version has already mounted its own (review R7).
     try:
         from main import app as fastapi_app
 
-        removed = unmount_direct_routes(fastapi_app, manifest.id)
+        token = _mount_tokens.pop(id(ctx), None) or _mount_token
+        removed = unmount_direct_routes(fastapi_app, manifest.id, token=token) if token else 0
         ctx.log.info(f"IaC Orchestrator: removed {removed} directly mounted route(s).")
     except Exception as exc:
         ctx.log.warning(f"IaC Orchestrator: could not remove the public routes: {exc}")
