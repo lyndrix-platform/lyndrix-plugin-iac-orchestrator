@@ -177,3 +177,62 @@ def test_credential_env_never_puts_token_in_url():
     env = sp.credential_env("glpat-secret")
     assert env["GIT_CONFIG_KEY_0"] == "http.extraHeader"
     assert "glpat-secret" not in env["GIT_CONFIG_VALUE_0"]   # base64 only
+
+
+# --- index.lock: never delete a live one (audit OC-14) ---------------------------------
+
+def _generate(work):
+    (work / "onprem" / "prod" / "inventory.yml").write_text("all: {hosts: {docker-a: {}}}\n")
+
+
+def test_fresh_index_lock_of_another_git_process_survives_the_publish(repos, monkeypatch):
+    """The checkout is shared with other instances; the lock of a git process that
+    is still writing used to be deleted unconditionally."""
+    remote, _seed, work = repos
+    monkeypatch.setattr(sp, "INDEX_LOCK_WAIT_SECONDS", 0.3)
+    _generate(work)
+    head = git(work, "rev-parse", "HEAD")
+    lock = work / ".git" / "index.lock"
+    lock.write_text("")                                    # a concurrent git command holds the index
+    res = publish(work)
+    assert not res.ok and res.status == sp.COMMIT_FAILED
+    assert "NOT removed" in res.detail and "index.lock" in res.detail
+    assert lock.exists()                                   # untouched
+    assert git(work, "rev-parse", "HEAD") == head          # nothing was committed or pushed
+    assert git(remote, "rev-parse", "main") == head
+
+
+def test_young_index_lock_is_waited_for(repos, monkeypatch):
+    _remote, _seed, work = repos
+    monkeypatch.setattr(sp, "INDEX_LOCK_WAIT_SECONDS", 5.0)
+    _generate(work)
+    lock = work / ".git" / "index.lock"
+    lock.write_text("")
+
+    async def scenario():
+        async def other_git_finishes():
+            await asyncio.sleep(0.6)
+            lock.unlink()
+
+        task = asyncio.ensure_future(other_git_finishes())
+        res = await sp.publish_inventory_state(work, controller_sha=CTRL_SHA, job_id=1, pipeline="infra_plan",
+                                               trigger="Webhook", token=None)
+        await task
+        return res
+
+    res = asyncio.run(scenario())
+    assert res.ok and res.status == sp.PUSHED and res.files == ["onprem/prod/inventory.yml"]
+
+
+def test_stale_index_lock_of_a_dead_git_process_is_removed(repos):
+    import os
+    import time
+
+    _remote, _seed, work = repos
+    _generate(work)
+    lock = work / ".git" / "index.lock"
+    lock.write_text("")
+    old = time.time() - sp.INDEX_LOCK_STALE_SECONDS - 5
+    os.utime(lock, (old, old))                             # the runner was killed mid-command a while ago
+    res = publish(work)
+    assert res.ok and res.status == sp.PUSHED and not lock.exists()

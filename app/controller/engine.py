@@ -2288,15 +2288,26 @@ class DeploymentEngine:
         return dry
 
     async def sync_core_repos(self):
-        """Periodic/Startup task to keep core repositories up to date."""
+        """Pull the core repositories (``repo_sync`` job).
+
+        Under the state lock (audit OC-14): a sync resets the working trees to
+        their remotes. Outside the lock it could run between a pipeline's
+        generation and its publish — the generated inventory was wiped, the
+        publish said "no changes" and the rule engine had nothing to act on.
+        Must not be called with the lock held (the pipeline prefix syncs the
+        repositories itself, see StatePrepareStage).
+        """
         log.info("[SYSTEM] Initiating background sync for core repositories...")
-        
-        all_success = True
-        for repo in ["iac_controller", "inventory_state", "config_engine", "aac_factory"]:
-            success = await self.execute_git_sync(repo)
-            if not success:
-                log.warning(f"Failed to sync {repo} during background operation.")
-                all_success = False
+        lock = getattr(self, "_state_publish_lock", None)
+        if lock is not None and lock.locked():
+            log.info("[SYSTEM] A pipeline is preparing state (sync · generate · publish) — waiting for it.")
+        async with (lock if lock is not None else contextlib.AsyncExitStack()):
+            all_success = True
+            for repo in ["iac_controller", "inventory_state", "config_engine", "aac_factory"]:
+                success = await self.execute_git_sync(repo)
+                if not success:
+                    log.warning(f"Failed to sync {repo} during background operation.")
+                    all_success = False
         if not all_success:
             log.warning("[SYSTEM] Core repository sync completed with failures. Check logs.")
         return all_success

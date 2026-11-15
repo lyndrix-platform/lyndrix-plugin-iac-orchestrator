@@ -205,7 +205,12 @@ def render_settings_ui(ctx, service):
                                 ui.notify(f"Sync command sent for {slug}. Check logs.", type="info")
 
                             with ui.row().classes('w-full justify-end mt-2 gap-4'):
-                                ui.button('Test Sync', on_click=trigger_test, icon='sync', color='warning').props('unelevated rounded size=sm outline')
+                                # A test sync resets that repository's working tree on the shared
+                                # checkout — not while a pipeline may be using it (audit OC-14).
+                                # TODO(agent): run the test against a scratch clone instead of the live checkout.
+                                ui.button('Test Sync', on_click=trigger_test, icon='sync', color='warning').props('unelevated rounded size=sm outline') \
+                                    .bind_enabled_from(service.state, 'is_running', backward=lambda x: not x) \
+                                    .tooltip('Syncs this repository now. Disabled while a pipeline is running.')
                                 ui.button('Save Role', on_click=lambda r=role, u=url_input, t=token_select: save_repo_config(r['slug'], u.value, t.value), icon='save', color='secondary').props('unelevated rounded size=sm')
 
         # --- [SECTION 3: NATIVE ANSIBLE CONFIG] ---
@@ -466,12 +471,16 @@ def render_settings_ui(ctx, service):
                             '(IaC Controller, Inventory State, Config Engine, AaC Factory). '
                             'Runs automatically on every deployment.'
                         ).classes(UIStyles.TEXT_MUTED + ' text-xs max-w-lg')
-                    ui.button(
-                        'Resync Repositories', icon='sync',
-                        on_click=lambda: ctx.create_task(
-                            service.engine.sync_core_repos(), name='iac:sync_core_repos'
-                        ),
-                    ).props('unelevated rounded size=sm color=blue-6') \
+                    def resync_repositories():
+                        # As a repo_sync JOB on the runner, like the React UI does — not
+                        # in this process: the instance that serves the page shares the
+                        # checkout directory with the runner, and a sync from here reset
+                        # the working trees under a running pipeline (audit OC-14).
+                        service.submit_from_ui({"pipeline_type": "repo_sync", "manual": True})
+                        ui.notify("Repository sync queued — see the job history.", type="info")
+
+                    ui.button('Resync Repositories', icon='sync', on_click=resync_repositories) \
+                     .props('unelevated rounded size=sm color=blue-6') \
                      .bind_enabled_from(service.state, 'is_running', backward=lambda x: not x)
 
                 ui.separator().classes('bg-[var(--lx-border-soft)] my-1')
