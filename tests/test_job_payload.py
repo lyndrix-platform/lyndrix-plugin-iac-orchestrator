@@ -48,12 +48,23 @@ def test_unknown_types_and_keys():
         jp.validate_structure("not a dict")
     with pytest.raises(jp.InvalidJobPayload):
         jp.validate_structure({"pipeline_type": "single_service"})         # no service
-    clean = jp.validate_structure({"pipeline_type": "single_service", "service_name": "AAC-X", "dry_run": "true",
-                                   "extra_vars": {"x": 1}, "playbook": "evil.yml", "ssh_key_secret": "iac_x",
-                                   "remote_user": "root", "trigger": "ui"})
+    base = {"pipeline_type": "single_service", "service_name": "AAC-X", "dry_run": "true", "trigger": "ui"}
+    clean = jp.validate_structure({**base, "_origin": "core-2"})           # bus transport field: ignored
     assert clean == {"pipeline_type": "single_service", "service_name": "aac-x", "service_branch": "main",
                      "dry_run": True, "trigger": "ui"}
     assert jp.validate_structure(clean) == clean                            # idempotent (claim-time re-check)
+    # A field this version does not know is refused — never dropped: it may be what
+    # LIMITS the job. ``target_hosts`` is the host limit of a newer plugin version;
+    # dropping it would deploy to every host of the service.
+    for extra in ({"target_hosts": ["docker-a"]}, {"extra_vars": {"x": 1}}, {"playbook": "evil.yml"},
+                  {"ssh_key_secret": "iac_x", "remote_user": "root"}, {"check": True}):
+        with pytest.raises(jp.InvalidJobPayload, match="unknown field"):
+            jp.validate_structure({**base, **extra})
+    # the raw GitLab push body is the one form made of foreign fields: only what is derived survives
+    push = jp.validate_structure({"object_kind": "push", "project": {"name": "aac-x"}, "ref": "refs/heads/main",
+                                  "commits": [{"id": "abc"}], "target_hosts": ["x"]})
+    assert push == {"pipeline_type": "single_service", "service_name": "aac-x", "service_branch": "main"}
+    assert set(jp.validate_structure({**{k: None for k in jp.KNOWN_KEYS}, **base})) <= jp.KNOWN_KEYS
 
 
 def test_privileged_flags_only_where_they_mean_something():
@@ -143,7 +154,7 @@ def test_claimed_payload_reaches_the_engine_sanitised(iac_service):
     with queue_mod.db_instance.SessionLocal() as s:
         row = IaCJob(pipeline_type="rollout", status="QUEUED", logs="[]", pending_tasks="[]",
                      payload=json.dumps({"pipeline_type": "rollout", "limit": "docker-dev", "approve": True,
-                                         "force": True, "extra_vars": {"x": 1}}))
+                                         "force": True}))
         s.add(row)
         s.commit()
     seen = []
@@ -155,6 +166,36 @@ def test_claimed_payload_reaches_the_engine_sanitised(iac_service):
     job_id, payload = svc.queue.claim_next("docker-auto-runner")
     asyncio.run(svc.run_claimed(payload, job_id))
     assert seen == [{"pipeline_type": "rollout", "limit": "docker-dev"}]
+
+
+def test_row_with_a_field_this_version_does_not_know_is_never_executed(iac_service):
+    """A row written by a newer plugin version on another instance (rolling upgrade,
+    rollback of the runner): ``target_hosts`` limits a deploy to the hosts that
+    changed. Dropping the unknown field would deploy to every host of the service."""
+    svc = iac_service
+    with queue_mod.db_instance.SessionLocal() as s:
+        row = IaCJob(pipeline_type="single_service:aac-x", status="QUEUED", logs="[]", pending_tasks="[]",
+                     dedupe_key="single_service:aac-x",
+                     payload=json.dumps({"pipeline_type": "single_service", "service_name": "aac-x",
+                                         "service_branch": "main", "trigger": "controller-diff",
+                                         "target_hosts": ["docker-a"]}))
+        s.add(row)
+        s.commit()
+    seen = []
+
+    async def run_pipeline(payload, job_id=None):
+        seen.append(payload)
+
+    svc.engine.run_pipeline = run_pipeline
+    job_id, payload = svc.queue.claim_next("docker-auto-runner")
+    asyncio.run(svc.run_claimed(payload, job_id))
+    assert seen == []                                            # NOT run without its host limit
+    row = _rows()[0]
+    assert row.status == "FAILED" and "unknown field" in row.current_step and "target_hosts" in row.current_step
+    # the same at the front door: this version cannot queue such a job either
+    with pytest.raises(jp.InvalidJobPayload, match="target_hosts"):
+        svc.queue.enqueue({"pipeline_type": "single_service", "service_name": "aac-y", "target_hosts": ["docker-a"]})
+    assert len(_rows()) == 1
 
 
 # --- point of use ---------------------------------------------------------------------------

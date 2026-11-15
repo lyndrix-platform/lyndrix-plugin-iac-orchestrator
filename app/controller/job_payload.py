@@ -9,7 +9,11 @@ from a database row any instance can write. None of that is trusted:
 * :func:`validate_structure` — allow-listed pipeline types and keys, strict name
   tokens (no path separators, no ``..``, nothing that starts like an option),
   typed flags. Runs for **every** row at enqueue (``JobQueue.enqueue_ex``) and
-  again when a runner claims the job.
+  again when a runner claims the job. A field this version does not know is
+  REFUSED, not dropped: it may be what limits the job (a host list, a mode) —
+  written by a newer plugin version on another instance, or by a trigger that
+  was added without teaching this module. Dropping it would run the job wider
+  than its trigger asked for.
 * :func:`strip_unentitled` — ``approve`` (plan → apply), ``force`` (ignore the
   maintenance window) and ``trigger`` (decides whether the deploy policy applies)
   are honoured only from code paths that are entitled to set them. Everything
@@ -53,6 +57,10 @@ _BOOL_KEYS = ("dry_run", "manual", "adopt_existing", "skip_bootstrap", "skip_ser
 _LABEL_KEYS = ("trigger", "source")
 _INT_KEYS = ("plan_job_id", "source_pipeline_id", "followup_of")
 _SHA_KEYS = ("plan_controller_sha",)
+#: Every field a job payload may carry. Anything else is refused (see the module
+#: docstring) — except ``_``-prefixed transport fields of the bus (``_origin``).
+KNOWN_KEYS = frozenset({"pipeline_type", "target_services", "project_path", "plan_expected",
+                        *_NAME_KEYS, *_BOOL_KEYS, *_LABEL_KEYS, *_INT_KEYS, *_SHA_KEYS})
 
 
 class InvalidJobPayload(ValueError):
@@ -104,8 +112,9 @@ def strip_unentitled(payload: dict, entitlements: Iterable[str] = ()) -> tuple[d
 def validate_structure(payload: Any) -> dict:
     """Normalised, allow-listed copy of ``payload``; raises :class:`InvalidJobPayload`.
 
-    Unknown keys are dropped. Idempotent, so the claim-time re-validation of a
-    stored payload yields the same payload.
+    Unknown fields are refused (never silently dropped — see the module
+    docstring). Idempotent, so the claim-time re-validation of a stored payload
+    yields the same payload.
     """
     from .queue import normalize_payload  # local: queue imports this module
 
@@ -113,8 +122,15 @@ def validate_structure(payload: Any) -> dict:
         raise InvalidJobPayload("payload must be an object")
     # No silent default: an empty or type-less event must not become a job (the
     # only type-less form accepted is the legacy raw GitLab push, normalised below).
-    if not payload.get("pipeline_type") and payload.get("object_kind") != "push":
+    legacy_push = not payload.get("pipeline_type") and payload.get("object_kind") == "push"
+    if not payload.get("pipeline_type") and not legacy_push:
         raise InvalidJobPayload("pipeline_type is required")
+    if not legacy_push:  # a raw GitLab body is all foreign fields; only what is derived from it is kept
+        unknown = sorted(str(k) for k in payload if k not in KNOWN_KEYS and not str(k).startswith("_"))
+        if unknown:
+            raise InvalidJobPayload(
+                f"unknown field(s) {', '.join(repr(k[:40]) for k in unknown[:5])} — refused rather than dropped: "
+                "a field this plugin version does not know may be what limits the job")
     src = normalize_payload(payload)
     ptype = str(src.get("pipeline_type") or "")
     if ptype not in PIPELINE_TYPES:
@@ -177,5 +193,5 @@ def validate_structure(payload: Any) -> dict:
 
 __all__ = [
     "ENT_APPROVE", "ENT_FORCE", "ENT_TRIGGER", "ALL_ENTITLEMENTS", "UNTRUSTED_TRIGGER",
-    "PIPELINE_TYPES", "InvalidJobPayload", "is_safe_name", "strip_unentitled", "validate_structure",
+    "PIPELINE_TYPES", "KNOWN_KEYS", "InvalidJobPayload", "is_safe_name", "strip_unentitled", "validate_structure",
 ]
