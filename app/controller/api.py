@@ -168,7 +168,7 @@ _token_cache: dict = {"value": None, "at": 0.0, "forced_at": 0.0, "loaded": Fals
 # a deprecation warning); once it is set, ONLY that token is accepted for the
 # purpose — not the shared one, not the token of another purpose. Nothing here
 # ever writes, moves or deletes the shared token.
-SHARED_TOKEN_KEY = "gitlab_webhook_token"
+SHARED_SLOT = "gitlab_webhook_token"
 PURPOSE_HOOK = "hook"                    # POST /webhook/gitlab (group hooks: merge request events)
 PURPOSE_SERVICE_CI = "service_ci"        # deploy/service/<svc>/gitlab (+ status)
 PURPOSE_CONTROLLER_CI = "controller_ci"  # infra/plan/gitlab, webhook/sync, test-host, infra/apply/gitlab
@@ -211,7 +211,7 @@ def _read_tokens() -> tuple[str | None, dict]:
         value = _ctx.get_secret(key)
         return value if isinstance(value, str) and value else None
 
-    return read(SHARED_TOKEN_KEY), {purpose: read(key) for purpose, key in PURPOSE_TOKEN_KEYS.items()}
+    return read(SHARED_SLOT), {purpose: read(key) for purpose, key in PURPOSE_TOKEN_KEYS.items()}
 
 
 async def _load_tokens(*, force: bool = False) -> tuple[str | None, dict]:
