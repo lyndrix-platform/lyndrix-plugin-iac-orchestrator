@@ -13,7 +13,7 @@ from core.api import db_instance
 from ..model.models import Base
 from ..model.database import JobDatabase
 from .config import IaCConfig
-from .engine import DeploymentEngine
+from .engine import ContainerStateUnknown, DeploymentEngine
 from .queue import JobQueue, JobWorker, DuplicateJob, EnqueueResult, SubmitResult
 from .socket_client import SocketBusClient
 from .gitlab_webhooks import sync_group_webhooks_from_ctx, WebhookConfigError
@@ -63,6 +63,13 @@ class IaCService:
         # mark_failed) still ends its maintenance override exactly once.
         self.queue.on_terminal = self.engine.end_override_for
         self.worker: JobWorker | None = None
+        # Jobs adopted from a previous incarnation whose containers are not known
+        # yet (Docker did not answer, review C1). They stay RUNNING and are
+        # heartbeated like executing jobs until Docker tells what exists.
+        self._unsettled: set[int] = set()
+        self._reconcile_task: asyncio.Task | None = None
+        # job id -> background retry of a container stop that Docker refused.
+        self._stop_retries: dict[int, asyncio.Task] = {}
         # Orphan sweep (rD §3): started/stopped by the lease, see review_sweep_lease.
         self.sweeper = OrphanSweeper(ctx, self.queue, self.db, self.config, notify=self._notify_orphaned)
         self._sweep_lease_wanted = False
@@ -226,7 +233,7 @@ class IaCService:
                 max_parallel = 3
         self.worker = JobWorker(self.ctx, self.queue, self.run_claimed, max_parallel=max_parallel,
                                 incarnation=self.incarnation,
-                                on_fenced=self._on_fenced, extra_attended=self.engine.attended_job_ids)
+                                on_fenced=self._on_fenced, extra_attended=self.attended_job_ids)
         self.worker.start()
         log.info(f"IaC Orchestrator: job worker started on '{getattr(self.ctx, 'instance_id', 'local')}' "
                  f"(max {max_parallel} parallel).")
@@ -247,10 +254,90 @@ class IaCService:
             max_parallel = 3
         self.start_runner(max_parallel)
 
+    def attended_job_ids(self) -> set[int]:
+        """Jobs this process answers for besides the worker's own tasks: jobs with
+        re-attached containers and adopted jobs still waiting for Docker."""
+        return set(self.engine.attended_job_ids()) | set(self._unsettled)
+
     async def _on_fenced(self, job_id: int) -> None:
         """A job this runner executes was closed or taken over elsewhere: stop its
         containers here. No status write — the row is not ours any more."""
-        await self.engine.stop_job_containers(job_id)
+        await self.stop_containers(job_id)
+
+    # -- container stops that must not be lost (review C1) -------------------------
+    #: Pauses between two attempts to reach Docker again; the last one repeats.
+    DOCKER_RETRY_DELAYS = (5.0, 10.0, 20.0, 40.0, 60.0)
+    #: Retries of a container stop for a job that is closed already (~30 min with
+    #: the delays above); after that the operator is told and the next runner
+    #: start picks the containers up again.
+    CONTAINER_STOP_RETRY_ATTEMPTS = 33
+
+    def _docker_retry_delay(self, attempt: int) -> float:
+        delays = self.DOCKER_RETRY_DELAYS
+        return float(delays[min(max(0, attempt), len(delays) - 1)])
+
+    def _job_note(self, job_id: int, line: str) -> None:
+        """One ``[SYSTEM]`` line straight into the job log (sync — call in a thread)."""
+        try:
+            self.queue.append_log(job_id, [f"[SYSTEM] {line}"], self.queue.last_seq(job_id))
+        except Exception as exc:
+            log.debug(f"job note for #{job_id} not written: {exc}")
+
+    async def _stop_once(self, job_id: int, abort: bool) -> None:
+        if abort:
+            await self.engine.abort_job(job_id)
+        else:
+            await self.engine.stop_job_containers(job_id)
+        # Whatever waited for Docker on behalf of this job is settled now.
+        if job_id in self._unsettled:
+            self._unsettled.discard(job_id)
+            self.db.claims.pop(job_id, None)
+
+    async def stop_containers(self, job_id: int, *, abort: bool = False) -> bool:
+        """Stop the containers of ``job_id`` on this host (``abort``: and close its
+        row as ABORTED). ``False`` when Docker did not answer: nothing is assumed
+        about the containers, the stop is retried in the background (bounded) and
+        the job log says so — a failed stop is never a silent no-op."""
+        try:
+            await self._stop_once(job_id, abort)
+            return True
+        except ContainerStateUnknown as exc:
+            log.warning(f"IaC Orchestrator: containers of job #{job_id} could not be stopped ({exc}) — retrying.")
+            await asyncio.to_thread(
+                self._job_note, job_id,
+                f"The runner containers of this job could not be stopped: {exc}. They may still be running; "
+                "the stop is retried.")
+            task = self._stop_retries.get(job_id)
+            if task is None or task.done():
+                self._stop_retries[job_id] = self.ctx.create_task(
+                    self._retry_container_stop(job_id, abort), name=f"iac:stop_retry:{job_id}")
+            return False
+
+    async def _retry_container_stop(self, job_id: int, abort: bool) -> None:
+        last = "unknown"
+        try:
+            for attempt in range(self.CONTAINER_STOP_RETRY_ATTEMPTS):
+                await asyncio.sleep(self._docker_retry_delay(attempt))
+                try:
+                    await self._stop_once(job_id, abort)
+                except ContainerStateUnknown as exc:
+                    last = str(exc)
+                    continue
+                log.info(f"IaC Orchestrator: containers of job #{job_id} stopped after {attempt + 1} retr(ies).")
+                await asyncio.to_thread(self._job_note, job_id, "The runner containers of this job were stopped.")
+                return
+            log.error(f"IaC Orchestrator: giving up stopping the containers of job #{job_id}: {last}")
+            await asyncio.to_thread(
+                self._job_note, job_id,
+                f"Giving up: the runner containers of this job could not be stopped ({last}). "
+                "Check Docker on the runner host; a runner restart retries.")
+            self.engine._notify(
+                f"Pipeline #{job_id} — containers not stopped",
+                f"Docker on the runner did not answer ({last}). Containers of job #{job_id} may still be running — "
+                "check the runner host.", "negative", notification_id=f"job_{job_id}_containers")
+        finally:
+            if self._stop_retries.get(job_id) is asyncio.current_task():
+                self._stop_retries.pop(job_id, None)
 
     async def stop_runner(self) -> None:
         if self.worker is not None:
@@ -278,6 +365,10 @@ class IaCService:
         self.engine.detaching = reason
         self.stop_webhook_sync()
         self.sweeper.stop()
+        # Jobs still waiting for Docker stay RUNNING for the next incarnation.
+        for task in (self._reconcile_task, *self._stop_retries.values()):
+            if task is not None:
+                task.cancel()
         worker, self.worker = self.worker, None
         if worker is not None:
             await worker.shutdown(max(0.5, deadline - time.monotonic() - 2.0))
@@ -487,11 +578,14 @@ class IaCService:
                 log.debug(f"runner watch: {exc}")
             await asyncio.sleep(interval)
 
-    async def on_abort_requested(self, payload: dict | None = None):
-        """``iac:job_abort_requested`` (local or relayed): abort the jobs this instance runs."""
+    async def on_abort_requested(self, payload: dict | None = None) -> list[int]:
+        """``iac:job_abort_requested`` (local or relayed): abort the jobs this instance runs.
+
+        Returns the ids whose containers could NOT be stopped (Docker did not
+        answer, review C1): their abort is retried in the background and the
+        caller must not report them as stopped."""
         ids = [int(j) for j in ((payload or {}).get("job_ids") or []) if str(j).isdigit()]
-        if not ids:
-            return
+        unstopped: list[int] = []
         for job_id in ids:
             owned = self.worker.owns(job_id) if self.worker else False
             if owned:
@@ -499,14 +593,16 @@ class IaCService:
                 # every other cancellation detaches the job (engine, OC-10).
                 self.engine.request_abort(job_id)
                 await self.worker.cancel(job_id)
-            if owned or any(
+            if owned or job_id in self._unsettled or any(
                 isinstance(t, dict) and t.get("job_id") == job_id
                 for t in (self.state.get("active_tasks") or {}).values()
             ):
                 try:
-                    await self.engine.abort_job(job_id)
+                    if not await self.stop_containers(job_id, abort=True):
+                        unstopped.append(job_id)
                 except Exception as exc:
                     log.warning(f"abort of job #{job_id} failed: {exc}")
+        return unstopped
 
     # ------------------------------------------------------------------
     # DB bootstrap
@@ -589,6 +685,12 @@ class IaCService:
         closes the job; a job without any is closed as FAILED now. Nothing is
         resumed. Containers of jobs that were closed elsewhere while this runner
         was away (orphan sweep, abort) are stopped — their job must not go on.
+
+        All of that needs Docker's answer. While the listing fails or times out
+        (daemon slow after a host reboot, socket gone for a moment) the container
+        situation is UNKNOWN (review C1): the adopted jobs stay RUNNING and
+        heartbeated, nothing is closed and no lock is given up; the listing is
+        retried in the background until Docker answers.
         """
         if not self.is_runner:
             return
@@ -597,29 +699,91 @@ class IaCService:
         previous = await asyncio.to_thread(self.queue.previous_incarnation_jobs, me, self.incarnation)
         await self.ensure_runtime_paths()
         await asyncio.sleep(2)  # Give the DB a moment to wake up
+        for row in previous:
+            job_id = row["id"]
+            token = await asyncio.to_thread(self.queue.adopt, job_id, me, self.incarnation, row["claim_token"])
+            if token is None:
+                continue  # closed or taken over meanwhile — its containers are leftovers (below)
+            self.db.claims[job_id] = token
+            self._unsettled.add(job_id)
+
         log.info("IaC Orchestrator: Checking for surviving Docker runners...")
-        containers: list[dict] = []
         try:
-            containers = await asyncio.wait_for(self.engine._list_job_containers(), timeout=20)
-        except asyncio.TimeoutError:
-            log.warning("IaC Orchestrator: Runner reconciliation timed out after 20s, continuing startup.")
+            containers = await self.engine._list_job_containers()
         except Exception as exc:
-            log.error(f"IaC Orchestrator: Runner reconciliation failed: {exc}")
+            waiting = sorted(self._unsettled)
+            log.error(f"IaC Orchestrator: Runner reconciliation could not list containers ({exc}) — "
+                      f"job(s) {waiting or 'none'} stay RUNNING until Docker answers.")
+            step = "Runner restarted — container state unknown (Docker not reachable), retrying"
+            for job_id in waiting:
+                await asyncio.to_thread(self._job_note, job_id, f"{step}: {exc}. Nothing is closed or released.")
+                await asyncio.to_thread(self.db.update_progress, job_id, None, step)
+            if waiting:
+                self.engine._notify(
+                    "IaC runner — Docker not reachable",
+                    f"The runner restarted but Docker did not answer ({exc}). Job(s) "
+                    f"{', '.join(f'#{j}' for j in waiting)} stay RUNNING until it does.",
+                    "warning", notification_id="iac_reconcile_docker")
+            self._reconcile_task = self.ctx.create_task(
+                self._reconcile_when_docker_answers(), name="iac:reconcile_retry")
+            return
+        try:
+            await self._settle_adopted(containers)
+        except Exception as exc:
+            # A job left in ``_unsettled`` must not stay there unwatched.
+            log.error(f"IaC Orchestrator: Startup reconciliation incomplete ({exc}) — retrying.")
+            self._reconcile_task = self.ctx.create_task(
+                self._reconcile_when_docker_answers(), name="iac:reconcile_retry")
+            return
+        log.info("IaC Orchestrator: Startup reconciliation scan finished.")
+
+    async def _reconcile_when_docker_answers(self) -> None:
+        """Retry the container listing (bounded pauses, at most one per minute)
+        until Docker answers, then settle what start-up could not. Not bounded in
+        total: closing a job without knowing its containers is exactly the
+        defect — the way out is Docker coming back, or an operator's abort."""
+        attempt = 0
+        while True:
+            await asyncio.sleep(self._docker_retry_delay(attempt))
+            attempt += 1
+            try:
+                containers = await self.engine._list_job_containers()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning(f"IaC Orchestrator: Docker still not reachable (attempt {attempt}): {exc}")
+                continue
+            try:
+                await self._settle_adopted(containers)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning(f"IaC Orchestrator: deferred reconciliation failed, retrying: {exc}")
+                continue
+            if not self._unsettled:
+                log.info(f"IaC Orchestrator: deferred startup reconciliation finished after {attempt} attempt(s).")
+                return
+
+    async def _settle_adopted(self, containers: list[dict]) -> None:
+        """Decide the adopted jobs from a container listing Docker really gave."""
         by_job: dict[int, list[dict]] = {}
         for container in containers:
             by_job.setdefault(container["job_id"], []).append(container)
 
-        for row in previous:
-            job_id = row["id"]
-            mine = by_job.pop(job_id, [])
-            token = await asyncio.to_thread(self.queue.adopt, job_id, me, self.incarnation, row["claim_token"])
-            if token is None:
-                by_job[job_id] = mine  # closed or taken over meanwhile — see the leftovers below
+        for job_id in sorted(self._unsettled):
+            if job_id in self._stop_retries:
+                by_job.pop(job_id, None)
+                continue  # an abort/stop for it is being retried — that path settles it
+            if await asyncio.to_thread(self.queue.job_status, job_id) != "RUNNING":
+                # Closed elsewhere while we waited for Docker: its containers are leftovers.
+                self._unsettled.discard(job_id)
+                self.db.claims.pop(job_id, None)
                 continue
-            self.db.claims[job_id] = token
+            mine = by_job.pop(job_id, [])
             if mine:
                 log.info(f"IaC Orchestrator: job #{job_id} — re-attaching to {len(mine)} container(s).")
-                self.engine.register_recovered(job_id, mine)
+                self.engine.register_recovered(job_id, mine)   # attended through its tasks from here on
+                self._unsettled.discard(job_id)
                 self.ctx.create_task(self.engine.recover_job(job_id, mine), name=f"iac:recover:{job_id}")
                 continue
             log.warning(
@@ -631,6 +795,7 @@ class IaCService:
             await asyncio.to_thread(self.db.update_progress, job_id, None, reason[:250])
             await asyncio.to_thread(self.db.update_job, job_id, "FAILED")
             self.db.claims.pop(job_id, None)
+            self._unsettled.discard(job_id)
             self.engine.end_override_for(job_id)
             self.state["last_deployment"] = "FAILED"
 
@@ -643,8 +808,7 @@ class IaCService:
                 continue
             if status != "RUNNING":
                 log.warning(f"IaC Orchestrator: job #{job_id} is {status or 'gone'} but has containers here — stopping them.")
-                await self.engine.stop_job_containers(job_id)
-        log.info("IaC Orchestrator: Startup reconciliation scan finished.")
+                await self.stop_containers(job_id)
 
     async def emit_monitoring_inventory_sync(self):
         """Delegate to the engine."""

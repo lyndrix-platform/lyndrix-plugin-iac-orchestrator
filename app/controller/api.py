@@ -1518,7 +1518,9 @@ async def do_abort():
             _ctx.emit("iac:job_abort_requested", {"job_ids": running_ids}, cluster=True)
         except TypeError:
             _ctx.emit("iac:job_abort_requested", {"job_ids": running_ids})
-        await _service.on_abort_requested({"job_ids": running_ids})
+        # Jobs whose containers Docker would not stop (review C1): their abort is
+        # being retried by the runner — the row stays as it is until then.
+        unstopped = set(await _service.on_abort_requested({"job_ids": running_ids}) or [])
         alive = None
         instances = getattr(_ctx, "cluster_instances", None)
         if instances:
@@ -1531,13 +1533,17 @@ async def do_abort():
             owner = r.get("owner_instance")
             local = any(isinstance(t, dict) and t.get("job_id") == job_id
                         for t in (state.get("active_tasks") or {}).values())
+            if job_id in unstopped:
+                continue
             if local or not owner or (alive is not None and owner not in alive):
                 # Conditional on the row still being RUNNING: a job its owner
                 # finished meanwhile keeps its result.
                 if _engine.db.update_job(job_id, "ABORTED"):
                     _engine.db.update_progress(job_id, progress=None, current_step="Aborted by User")
                 _engine.end_override_for(job_id)  # maintenance override of a dead runner's job
-        aborted.extend(running_ids)
+        aborted.extend(j for j in running_ids if j not in unstopped)
+    else:
+        unstopped = set()
 
     if aborted:
         try:
@@ -1557,7 +1563,11 @@ async def do_abort():
 
     state["is_running"] = False
     state["active_tasks"] = {}
-    return {"status": "ok", "aborted_jobs": aborted}
+    result: dict = {"status": "ok", "aborted_jobs": aborted}
+    if unstopped:
+        # Additive field: Docker on the runner did not answer, the abort is retried.
+        result["unstopped_jobs"] = sorted(unstopped)
+    return result
 
 
 # ── Infrastructure inventory (assignments + terraform hosts) ─────────────────

@@ -159,6 +159,11 @@ class PipelineTask:
             return int((self.end_time - self.start_time) * 1000)
         return 0
 
+class ContainerStateUnknown(RuntimeError):
+    """Docker did not answer (listing failed or timed out, removal failed): which
+    runner containers exist on this host is UNKNOWN — never "none" (review C1)."""
+
+
 class JobParked(Exception):
     """Raised by :class:`MaintenancePolicyStage` after it parked the job as SCHEDULED:
     ``run_pipeline`` stops without a terminal status (the row is already SCHEDULED)."""
@@ -2645,23 +2650,49 @@ class DeploymentEngine:
     #: Seconds a Terraform container gets to finish its current state write on abort.
     _TF_STOP_GRACE_SECONDS = 30
 
+    #: Seconds one ``docker ps`` / ``docker rm`` may take before it counts as failed.
+    _DOCKER_QUERY_TIMEOUT_SECONDS = 20.0
+
+    async def _docker(self, *args: str, timeout: float | None = None) -> tuple[int, bytes, bytes]:
+        """Run ``docker <args>`` off the event loop: ``(returncode, stdout, stderr)``.
+        A call that does not answer in time is killed and raises
+        :class:`ContainerStateUnknown` — a hanging daemon is not an answer."""
+        proc = await asyncio.create_subprocess_exec(
+            "docker", *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        try:
+            out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except asyncio.TimeoutError:
+            with contextlib.suppress(Exception):
+                proc.kill()
+            raise ContainerStateUnknown(f"'docker {args[0]}' did not answer within {int(timeout or 0)}s") from None
+        return int(proc.returncode or 0), out or b"", err or b""
+
     async def _list_job_containers(self, job_id: int | None = None) -> list[dict]:
         """Runner containers on this host by label (all states): ``[{id, name,
         state, job_id, task_name, kind}]``. Both kinds — Ansible and Terraform —
         carry ``iac_job_id``; ``kind`` falls back to the name prefix for
-        containers started by an older plugin version."""
+        containers started by an older plugin version.
+
+        ``[]`` means "Docker answered: there are none". A listing that failed or
+        timed out raises :class:`ContainerStateUnknown` (review C1): it used to
+        look like "no containers", which closed jobs whose tofu/ansible container
+        was still running and made their state lock takeable.
+        """
         if not shutil.which("docker"):
+            # No docker CLI on this instance: it cannot have started a runner
+            # container either (control-plane pods) — that IS an answer.
             return []
         label = f"label=iac_job_id={job_id}" if job_id is not None else "label=iac_job_id"
         fmt = ('{{.ID}}\t{{.Names}}\t{{.State}}\t{{.Label "iac_job_id"}}\t'
                '{{.Label "iac_task_name"}}\t{{.Label "iac_kind"}}')
-        ps = await asyncio.create_subprocess_exec(
-            "docker", "ps", "-a", "--filter", label, "--format", fmt,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
-        )
-        out, _ = await ps.communicate()
+        code, out, err = await self._docker("ps", "-a", "--filter", label, "--format", fmt,
+                                            timeout=self._DOCKER_QUERY_TIMEOUT_SECONDS)
+        if code != 0:
+            detail = err.decode(errors="replace").strip().splitlines()
+            raise ContainerStateUnknown(
+                f"'docker ps' failed with exit code {code}: {(detail[-1] if detail else 'no error output')[:200]}")
         containers = []
-        for line in (out or b"").decode(errors="replace").splitlines():
+        for line in out.decode(errors="replace").splitlines():
             parts = line.split("\t")
             if len(parts) < 4 or not parts[0].strip():
                 continue
@@ -2681,42 +2712,46 @@ class DeploymentEngine:
         label — Terraform containers too, audit OC-02). A running Terraform
         container is stopped with a grace period first so tofu can finish writing
         its state; everything is removed afterwards. No status write — callers
-        decide what the job's row becomes. Returns the number of containers."""
-        count = 0
-        try:
-            containers = await self._list_job_containers(job_id)
-            tf_running = [c["id"] for c in containers if c["kind"] == "terraform" and c["state"] == "running"]
-            if tf_running:
-                stop = await asyncio.create_subprocess_exec(
-                    "docker", "stop", "-t", str(self._TF_STOP_GRACE_SECONDS), *tf_running,
-                    stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
-                )
-                await stop.wait()
-            ids = [c["id"] for c in containers]
-            if ids:
-                rm = await asyncio.create_subprocess_exec(
-                    "docker", "rm", "-f", *ids,
-                    stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
-                )
-                if await rm.wait() != 0:
-                    log.warning(f"stop_job_containers: could not remove every container of job #{job_id}.")
-                count = len(ids)
-        except Exception as exc:
-            log.warning(f"stop_job_containers: container cleanup for job #{job_id} failed: {exc}")
+        decide what the job's row becomes. Returns the number of containers.
+
+        Raises :class:`ContainerStateUnknown` when Docker did not answer the
+        listing or did not remove the containers (review C1): "could not look"
+        must never read as "nothing to stop" — the caller retries and reports.
+        """
+        containers = await self._list_job_containers(job_id)
+        tf_running = [c["id"] for c in containers if c["kind"] == "terraform" and c["state"] == "running"]
+        if tf_running:
+            # Its result does not matter: the forced removal below is what counts.
+            with contextlib.suppress(ContainerStateUnknown):
+                await self._docker("stop", "-t", str(self._TF_STOP_GRACE_SECONDS), *tf_running,
+                                   timeout=self._TF_STOP_GRACE_SECONDS + self._DOCKER_QUERY_TIMEOUT_SECONDS)
+        ids = [c["id"] for c in containers]
+        if ids:
+            code, _out, err = await self._docker("rm", "-f", *ids, timeout=self._DOCKER_QUERY_TIMEOUT_SECONDS)
+            if code != 0:
+                detail = err.decode(errors="replace").strip().splitlines()
+                raise ContainerStateUnknown(
+                    f"'docker rm' for job #{job_id} failed with exit code {code}: "
+                    f"{(detail[-1] if detail else 'no error output')[:200]}")
         for data in list((self.state.get("active_tasks") or {}).values()):
             if isinstance(data, dict) and data.get("job_id") == job_id:
                 data["status"] = "aborted"
-        return count
+        return len(ids)
 
     async def abort_job(self, job_id: int, *, reason: str = "Aborted by User") -> int:
         """Kill this host's runner containers of ``job_id`` and close its row as ABORTED
         (a no-op when the row is no longer RUNNING/ours). Returns the number of
-        containers removed."""
+        containers removed. Raises :class:`ContainerStateUnknown` — before any
+        row write — when the containers could not be stopped."""
         killed = await self.stop_job_containers(job_id)
         self._sync_runners(job_id, force=True)
-        self.db.update_progress(job_id, progress=None, current_step=reason)
-        self.db.update_job(job_id, "ABORTED")
-        self.end_override_for(job_id)
+
+        def _close() -> None:
+            self.db.update_progress(job_id, progress=None, current_step=reason)
+            self.db.update_job(job_id, "ABORTED")
+            self.end_override_for(job_id)
+
+        await asyncio.to_thread(_close)
         return killed
 
     async def _on_git_status(self, payload: dict):
