@@ -25,6 +25,7 @@ from .public_projection import public_names, public_scalar, public_terraform, pu
 from .config import allowed_registry_hosts, registry_host
 from .settings_schema import resolve_credential
 from .offloop import CoalescedWriter, off_loop
+from . import plan_binding
 from .runner_output import RunnerOutputParser
 from .redaction import SecretRedactor, secret_values_of
 from ...stages.git import (
@@ -534,6 +535,8 @@ class InfraPlanStage(BaseStage):
             mode="plan",
             job_id=context.get("job_id", 0),
             force_apply=False,
+            # What this plan was made from — an approval is bound to it (OS-12).
+            controller_sha=await engine.pinned_controller_sha(context),
         )
         envs = data.get("environments", 0) if isinstance(data, dict) else 0
         pending = data.get("pending_envs", 0) if isinstance(data, dict) else 0
@@ -560,11 +563,35 @@ class InfraApplyStage(BaseStage):
     async def run(self, engine, context: dict) -> StageResult:
         payload = context.get("payload") or {}
         force_apply = bool(payload.get("approve"))
+        job_id = context.get("job_id", 0)
+        head = await engine.pinned_controller_sha(context)
+        reviewed = None
+        if plan_binding.is_approval(payload):
+            # The approval of a reviewed plan (audit OS-12): apply THAT plan or
+            # nothing. An explicit "Deploy Infra" carries no plan and is not bound.
+            expected, sha = payload.get("plan_expected"), str(payload.get("plan_controller_sha") or "")
+            if not isinstance(expected, dict) or not expected or not sha:
+                return StageResult(False, "This approval does not say which plan was reviewed (it was queued by an "
+                                          "older plugin version or UI) — NOTHING was applied. Run Check Env and "
+                                          "approve the new plan.")
+            if not head or head.lower() != sha.lower():
+                log.error(f"[TF] Approved plan was made at iac-controller@{sha[:12]}, the controller is at "
+                          f"{(head or 'unknown')[:12]} now — nothing is applied; planning again for a new review.")
+                await engine.execute_terraform_infra(mode="plan", job_id=job_id, force_apply=False,
+                                                     controller_sha=head)
+                return StageResult(False, f"The iac-controller moved from {sha[:12]} to {(head or 'unknown')[:12]} "
+                                          "since the plan was reviewed — NOTHING was applied. A fresh plan was "
+                                          f"created by this job (#{job_id}); review and approve it.")
+            reviewed = {"controller_sha": sha, "expected": dict(expected)}
         success, data = await engine.execute_terraform_infra(
             mode="apply",
-            job_id=context.get("job_id", 0),
+            job_id=job_id,
             force_apply=force_apply,
+            reviewed=reviewed,
+            controller_sha=head,
         )
+        if isinstance(data, dict) and data.get("refused"):
+            return StageResult(False, str(data["refused"]), data=data)
         # Hand the freshly created hosts to the follow-up bootstrap stage.
         if isinstance(data, dict):
             context["created_hosts"] = list(data.get("created_hosts") or [])
@@ -3567,10 +3594,23 @@ class DeploymentEngine:
             self._runner_image("terraform")))
         target_flags = "".join(f" -target='{t}'" for t in (targets or []))
         run_dir = f"/data/storage/git_repos/{run_rel_dir}"
-        do_apply = mode == "apply" and not dry and (force_apply or auto_apply)
+        do_apply = mode in ("apply", "apply_saved") and not dry and (force_apply or auto_apply)
+        if mode == "apply_saved" and not do_apply:
+            # Applying a saved plan is never downgraded to "plan and show": the
+            # caller decided to apply exactly that file, or nothing runs.
+            raise RuntimeError("[TF] A saved plan is only applied with an approval and never in a dry-run job.")
         if dry and mode in ("apply", "import"):
             log.warning("[TF] DRY-RUN job: '%s' plans only — no apply, no state import.", host_name or "(env)")
-        if mode == "state_list":
+        if mode == "plan_save":
+            # Read-only: compute the plan and keep it as ``tfplan`` in the run dir —
+            # the approved-plan flow compares it with the reviewed plan and then
+            # applies exactly this file (mode ``apply_saved``).
+            action_cmd = f"STEP=plan; {tf_bin} plan -input=false -no-color -out=tfplan{target_flags}"
+        elif mode == "apply_saved":
+            # No new plan: the file the comparison was made on. tofu refuses it
+            # ("Saved plan is stale") when the state changed since it was written.
+            action_cmd = f"STEP=apply; {tf_bin} apply -input=false -no-color -auto-approve tfplan"
+        elif mode == "state_list":
             # Read-only: list the resources tracked in state. Never plans or applies.
             action_cmd = f"{tf_bin} state list -no-color"
         elif mode in ("plan", "import"):
@@ -4048,6 +4088,19 @@ class DeploymentEngine:
     ) -> tuple[bool, dict]:
         """Render and run OpenTofu for an entire environment (no -target)."""
         env_name = env_ctx["env_name"]
+        # ``plan_save`` and ``apply_saved`` are the two halves of an approved apply:
+        # they share the run dir of the job's apply ("<env>__apply__j<job>").
+        dir_mode = "apply" if mode in ("plan_save", "apply_saved") else mode
+        stable_rel_dir = f"inventory_state/.terraform_runs/{env_name}__{dir_mode}"
+        run_rel_dir = f"{stable_rel_dir}__j{job_id}" if job_id and job_id > 0 else stable_rel_dir
+        if mode == "apply_saved":
+            if not (self.base_git_dir / run_rel_dir / "tfplan").is_file():
+                raise RuntimeError(f"[TF] No saved plan for environment '{env_name}' in this job — nothing applied.")
+            return await self.execute_terraform_docker(
+                run_rel_dir=run_rel_dir, host_name=f"env:{env_name}", targets=None, mode="apply_saved",
+                force_apply=force_apply, task_name=f"Terraform Apply: {env_name}", job_id=job_id,
+                state_key=f"tf:{env_name}", stable_rel_dir=stable_rel_dir,
+            )
         ctx = await off_loop(self._find_terraform_context_for_host, env_ctx["representative_host"])
 
         infra_repo = self.base_git_dir / "infra_engine"
@@ -4065,8 +4118,6 @@ class DeploymentEngine:
             )
         self._register_terraform_secrets(job_id, secrets_payload)
 
-        stable_rel_dir = f"inventory_state/.terraform_runs/{env_name}__{mode}"
-        run_rel_dir = f"{stable_rel_dir}__j{job_id}" if job_id and job_id > 0 else stable_rel_dir
         run_dir = self.base_git_dir / run_rel_dir
         if run_dir.exists():
             shutil.rmtree(run_dir)
@@ -4105,7 +4156,7 @@ class DeploymentEngine:
             except OSError:
                 pass
 
-        verb = "Plan" if mode == "plan" else "Apply"
+        verb = {"plan": "Plan", "plan_save": "Plan (approved)"}.get(mode, "Apply")
         return await self.execute_terraform_docker(
             run_rel_dir=run_rel_dir,
             host_name=f"env:{env_name}",
@@ -4115,20 +4166,156 @@ class DeploymentEngine:
             task_name=f"Terraform {verb}: {env_name}",
             job_id=job_id,
             state_key=f"tf:{env_name}",
-            stable_rel_dir=stable_rel_dir,
+            # The saved plan stays in the job's run dir until it was applied.
+            stable_rel_dir=None if mode == "plan_save" else stable_rel_dir,
         )
 
+    async def pinned_controller_sha(self, context: dict | None = None) -> str:
+        """The iac-controller commit this pipeline generated its state from: the
+        one pinned in the pipeline prefix (state lock held), else the working
+        tree's HEAD right now. ``""`` when unknown."""
+        pinned = str((context or {}).get("iac_controller_sha") or "")
+        if pinned:
+            return pinned
+        try:
+            return str(await self.repo_head_sha("iac_controller") or "")
+        except Exception as exc:
+            log.warning(f"[TF] iac-controller commit not readable: {exc}")
+            return ""
+
+    async def _store_pending_plan(self, job_id: int, pending_envs: dict, controller_sha: str | None) -> None:
+        """Persist the plan awaiting approval together with what an approval is
+        bound to: the controller commit and a fingerprint per environment."""
+        await off_loop(self.db.update_state, "pending_infra_plan", {
+            "job_id": job_id,
+            "planned_at": datetime.now(timezone.utc).isoformat(),
+            "controller_sha": str(controller_sha or ""),
+            "envs": plan_binding.with_fingerprints(pending_envs),
+        }, "latest")
+
+    def _discard_saved_plans(self, environments: list[dict], job_id: int) -> None:
+        """Remove this job's run dirs of an approved apply that was not carried out
+        (they hold a plan file that must not be applied later). Sync: thread."""
+        if not job_id or job_id <= 0:
+            return          # without a job id the run dir is the shared stable one
+        for env_ctx in environments:
+            run_dir = self.base_git_dir / f"inventory_state/.terraform_runs/{env_ctx['env_name']}__apply__j{job_id}"
+            shutil.rmtree(run_dir, ignore_errors=True)
+
+    async def _apply_reviewed_plan(self, environments: list[dict], job_id: int, reviewed: dict,
+                                   controller_sha: str | None, dry: bool) -> tuple[bool, dict]:
+        """Apply the plan an operator reviewed — or nothing (audit OS-12).
+
+        1. Plan every environment again, read-only, and keep each plan as a file.
+        2. Compare the fingerprints with the reviewed ones. Any difference (an
+           environment gained or lost changes, other counts, other hosts): nothing
+           is applied, the fresh plan becomes the new pending plan.
+        3. Apply exactly the saved plan files. tofu refuses a file whose state
+           changed since step 1, so nothing but the compared plan can be applied.
+        """
+        envs_total = len(environments)
+        result = {"successful_hosts": 0, "failed_hosts": 0, "skipped": 0, "environments": envs_total,
+                  "created_hosts": [], "pending_envs": 0}
+        fresh: dict[str, dict] = {}
+        planned: list[dict] = []
+        for env_ctx in environments:
+            env = env_ctx["env_name"]
+            log.info("Infra apply (approved plan): planning environment '%s' (%d host(s))", env, env_ctx["host_count"])
+            try:
+                ok, stats = await self.execute_terraform_environment(env_ctx, "plan_save", job_id)
+            except RuntimeError as exc:
+                msg = str(exc)
+                if "Missing Terraform secret" in msg or "render failed" in msg.lower():
+                    # Not configured: it was skipped when the plan was reviewed, too.
+                    log.warning("Infra apply: skipping unconfigured env '%s' (%s).", env, msg)
+                    result["skipped"] += 1
+                    continue
+                ok, stats = False, {"error": msg}
+            except Exception as exc:  # noqa: BLE001
+                ok, stats = False, {"error": str(exc)}
+            if not ok:
+                detail = f": {stats['error']}" if isinstance(stats, dict) and stats.get("error") else ""
+                log.error("Infra apply: the plan of env '%s' failed%s — nothing is applied.", env, detail)
+                result.update(failed_hosts=1, refused=(
+                    f"The plan of environment '{env}' could not be computed{detail} — it cannot be compared with "
+                    "the reviewed plan, so NOTHING was applied. The reviewed plan stays pending."))
+                await off_loop(self._discard_saved_plans, environments, job_id)
+                return False, result
+            planned.append(env_ctx)
+            if isinstance(stats, dict) and stats.get("plan_summary"):
+                fresh[env] = {"summary": stats.get("plan_summary"),
+                              "hosts_to_create": stats.get("hosts_to_create") or [],
+                              "hosts_to_destroy": stats.get("hosts_to_destroy") or []}
+
+        diffs = plan_binding.differences(reviewed.get("expected"), plan_binding.fingerprints(fresh))
+        if diffs:
+            for line in diffs:
+                log.error(f"[TF] Plan differs from the reviewed plan — {line}")
+            if fresh:
+                await self._store_pending_plan(job_id, fresh, controller_sha)
+            else:
+                await off_loop(self.db.update_state, "pending_infra_plan", {}, "latest")
+            result.update(pending_envs=len(fresh), refused=(
+                "The plan is not the one that was reviewed — NOTHING was applied. " + "; ".join(diffs)[:600]
+                + (f". The fresh plan (job #{job_id}) awaits review." if fresh else
+                   ". There is nothing left to apply.")))
+            await off_loop(self._discard_saved_plans, environments, job_id)
+            return False, result
+        log.info("[TF] The plan matches the reviewed plan (%d environment(s) with changes).", len(fresh))
+        if dry:
+            log.warning("[TF] DRY-RUN job: the approved plan was verified, nothing is applied.")
+            result["pending_envs"] = len(fresh)
+            await off_loop(self._discard_saved_plans, environments, job_id)
+            return True, result
+
+        overall_ok = True
+        for env_ctx in planned:
+            env = env_ctx["env_name"]
+            if env not in fresh:
+                log.info("Infra apply: environment '%s' has no changes — nothing to apply.", env)
+                result["successful_hosts"] += 1
+                await off_loop(self._discard_saved_plans, [env_ctx], job_id)
+                continue
+            try:
+                ok, stats = await self.execute_terraform_environment(env_ctx, "apply_saved", job_id, force_apply=True)
+            except Exception as exc:  # noqa: BLE001
+                log.error("Infra apply failed for env '%s': %s", env, exc)
+                ok, stats = False, {}
+            for host in (stats.get("created_hosts") or []) if isinstance(stats, dict) else []:
+                if host not in result["created_hosts"]:
+                    result["created_hosts"].append(host)
+            if ok:
+                result["successful_hosts"] += 1
+            else:
+                result["failed_hosts"] += 1
+                overall_ok = False
+        log.info("Infra apply summary: %d ok, %d failed, %d skipped (of %d env).",
+                 result["successful_hosts"], result["failed_hosts"], result["skipped"], envs_total)
+        if overall_ok:
+            await off_loop(self.db.update_state, "pending_infra_plan", {}, "latest")
+        return overall_ok, result
+
     async def execute_terraform_infra(
-        self, mode: str, job_id: int, force_apply: bool = False
+        self, mode: str, job_id: int, force_apply: bool = False, *,
+        reviewed: dict | None = None, controller_sha: str | None = None,
     ) -> tuple[bool, dict]:
         """Run a whole-infrastructure plan or apply across every non-empty
-        Terraform environment."""
+        Terraform environment.
+
+        ``controller_sha``: the iac-controller commit the state was generated
+        from — stored with a pending plan. ``reviewed`` (``mode="apply"``): the
+        approval of a pending plan, ``{"controller_sha", "expected": {env:
+        fingerprint}}`` — the apply is then bound to that plan
+        (:meth:`_apply_reviewed_plan`).
+        """
         # Read once for the bookkeeping below; execute_terraform_docker enforces it.
         dry = await self._job_is_dry_run(job_id)
         environments = await off_loop(self._iter_terraform_environments)
         if not environments:
             log.warning("No Terraform environments with containers found; nothing to %s.", mode)
             return True, {"successful_hosts": 0, "failed_hosts": 0, "environments": 0}
+        if mode == "apply" and reviewed is not None:
+            return await self._apply_reviewed_plan(environments, job_id, reviewed, controller_sha, dry)
 
         overall_ok = True
         succeeded = 0
@@ -4197,11 +4384,7 @@ class DeploymentEngine:
         if overall_ok:
             if mode == "plan":
                 if pending_envs:
-                    await off_loop(self.db.update_state, "pending_infra_plan", {
-                        "job_id": job_id,
-                        "planned_at": datetime.now(timezone.utc).isoformat(),
-                        "envs": pending_envs,
-                    }, "latest")
+                    await self._store_pending_plan(job_id, pending_envs, controller_sha)
                     log.info(
                         "Infra plan left %d environment(s) with pending changes — awaiting operator approval.",
                         len(pending_envs),

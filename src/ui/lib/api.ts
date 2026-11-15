@@ -244,6 +244,10 @@ export interface PendingPlanResponse {
   job_id?: number
   planned_at?: string
   envs?: Record<string, PendingPlanEnv>
+  /** iac-controller commit the plan was made from — an approval is bound to it. */
+  controller_sha?: string | null
+  /** false: recorded without that commit (older plugin version) — plan again before approving. */
+  approvable?: boolean
 }
 
 // ─── Maintenance windows (plugin 1.6, core API 1.13) ────────────────────────

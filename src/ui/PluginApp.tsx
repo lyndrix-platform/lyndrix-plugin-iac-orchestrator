@@ -1679,8 +1679,10 @@ function PendingPlanBanner({ statsTick, isRunning, confirm, toast, onLogs }: {
             <Button label={t('pendingPlan.reviewLogs', { defaultValue: 'Review Logs' })} icon="plagiarism" onClick={() => onLogs(plan.job_id as number)} />
           )}
           <Button label={t('pendingPlan.dismiss', { defaultValue: 'Dismiss' })} icon="close" onClick={dismiss} />
-          <Button label={t('pendingPlan.apply', { defaultValue: 'Apply Plan' })} icon="rocket_launch" variant="danger" disabled={isRunning} onClick={applyNow}
-            title={isRunning ? t('pendingPlan.busy', { defaultValue: 'A pipeline is running' }) : t('pendingPlan.applyTitle', { defaultValue: 'Approve and apply this plan fleet-wide' })} />
+          <Button label={t('pendingPlan.apply', { defaultValue: 'Apply Plan' })} icon="rocket_launch" variant="danger" disabled={isRunning || plan.approvable === false} onClick={applyNow}
+            title={plan.approvable === false
+              ? t('pendingPlan.notApprovable', { defaultValue: 'This plan was recorded without the iac-controller commit — run Check Env again, then approve the new plan.' })
+              : isRunning ? t('pendingPlan.busy', { defaultValue: 'A pipeline is running' }) : t('pendingPlan.applyTitle', { defaultValue: 'Approve and apply exactly this plan (it is refused if the controller or the plan changed since)' })} />
         </div>
       </div>
       <div style={{ display: 'grid', gap: 4, marginTop: 8 }}>

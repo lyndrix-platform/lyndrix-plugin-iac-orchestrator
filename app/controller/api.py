@@ -37,6 +37,7 @@ from .settings_schema import (
 )
 from .queue import DuplicateJob as _DuplicateJob, SubmitResult
 from .job_payload import ENT_APPROVE, ENT_TRIGGER, InvalidJobPayload
+from . import plan_binding
 from . import maintenance_resolver as _mres
 from .offloop import off_loop
 from .public_projection import public_catalog_entry, public_scalar
@@ -1165,6 +1166,10 @@ async def do_get_pending_plan():
         "job_id": data.get("job_id"),
         "planned_at": data.get("planned_at"),
         "envs": data.get("envs") or {},
+        # What an approval is bound to (audit OS-12). ``approvable`` is False for a
+        # plan recorded without the controller commit: plan again before approving.
+        "controller_sha": data.get("controller_sha") or None,
+        "approvable": plan_binding.approval_payload(data) is not None,
     }
 
 
@@ -1176,15 +1181,18 @@ async def do_apply_pending_plan(identity=None):
     data = (record or {}).get("data") or {}
     if not data.get("envs"):
         raise HTTPException(status_code=409, detail="No pending infrastructure plan to apply")
-    payload = {
-        "pipeline_type": "infra_apply",
-        "approve": True,
-        "manual": True,
-        "trigger": "pending_plan_approval",
-        "plan_job_id": data.get("job_id"),
-    }
+    # The approval names the plan that was reviewed — controller commit and a
+    # fingerprint per environment. The runner applies that plan or nothing
+    # (audit OS-12: it used to apply whatever the controller was by then).
+    payload = plan_binding.approval_payload(data)
+    if payload is None:
+        raise HTTPException(
+            status_code=409,
+            detail="The pending plan does not record the iac-controller commit it was made from (it was created "
+                   "by an older plugin version) and cannot be approved. Run Check Env again and approve that plan.")
     result = await _submit(payload, ENT_TRIGGER, ENT_APPROVE, actor=_actor(identity))
-    return _trigger_response(result, "Approved — infrastructure deploy queued.", plan_job_id=data.get("job_id"))
+    return _trigger_response(result, "Approved — infrastructure deploy queued.", plan_job_id=data.get("job_id"),
+                             plan_controller_sha=payload["plan_controller_sha"])
 
 
 async def do_dismiss_pending_plan():

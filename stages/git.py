@@ -56,9 +56,15 @@ class PublishInventoryStateStage(BaseStage):
         # very first run records "before" as the marker, so even its own commit is
         # not lost when the pipeline fails before the rule stage.
         before = await head_sha(repo) if (repo / ".git").exists() else ""
+        # The controller commit this state was generated from, pinned while the
+        # state lock is held. A pending infrastructure plan records it, and its
+        # approval is only carried out while it is unchanged (audit OS-12).
+        controller_sha = await engine.repo_head_sha("iac_controller")
+        if controller_sha:
+            context["iac_controller_sha"] = controller_sha
         result = await publish_inventory_state(
             repo,
-            controller_sha=await engine.repo_head_sha("iac_controller"),
+            controller_sha=controller_sha,
             job_id=context.get("job_id"),
             pipeline=str(context.get("db_type") or payload.get("pipeline_type") or ""),
             trigger="Manual" if payload.get("manual") else "Webhook",

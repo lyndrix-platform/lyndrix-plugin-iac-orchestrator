@@ -34,6 +34,7 @@ from ui.theme import UIStyles
 
 from . import components as c
 from .access import ui_submit
+from ..controller import plan_binding
 
 # Provider is bpg/proxmox across all rendered environments (see terraform-templates).
 _TF_PROVIDER = "bpg/proxmox"
@@ -220,13 +221,14 @@ def render_terraform_panel(ctx, service):
         pending = (pending_record.get("data") or {})
         if pending.get("envs"):
             def _apply_pending():
-                _emit({
-                    "pipeline_type": "infra_apply",
-                    "approve": True,
-                    "manual": True,
-                    "trigger": "pending_plan_approval",
-                    "plan_job_id": pending.get("job_id"),
-                })
+                # Bound to the plan shown here (controller commit + fingerprints,
+                # audit OS-12), like the API route.
+                approval = plan_binding.approval_payload(pending)
+                if approval is None:
+                    ui.notify("This plan was recorded without the iac-controller commit and cannot be "
+                              "approved — run Check Env again.", type="negative")
+                    return
+                _emit(approval)
                 ui.notify("Approved — infrastructure deploy queued.", type="positive")
 
             def _dismiss_pending():
