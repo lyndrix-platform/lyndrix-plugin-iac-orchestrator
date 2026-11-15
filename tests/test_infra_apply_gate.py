@@ -11,6 +11,7 @@ from fastapi import HTTPException
 from iac_plugin.app import api as routes_mod
 from iac_plugin.app.controller import api as api_mod
 from iac_plugin.app.controller.config import IaCConfig
+from iac_plugin.app.controller.queue import SubmitResult
 from iac_plugin.app.controller.settings_schema import OrchestratorSettings, SettingsPermissionError
 from tests.test_settings_security import FakeCtx, _route_permissions
 
@@ -33,11 +34,11 @@ def api(monkeypatch):
     monkeypatch.setattr(api_mod, "_engine", SimpleNamespace(config=IaCConfig(ctx)))
     ctx.submitted = []
 
-    async def submit_job(payload, *, entitlements=(), requested_by=None):
+    async def submit_job_ex(payload, *, entitlements=(), requested_by=None):
         ctx.submitted.append((dict(payload), set(entitlements)))
-        return len(ctx.submitted)
+        return SubmitResult(len(ctx.submitted))
 
-    monkeypatch.setattr(api_mod, "_service", SimpleNamespace(state={}, submit_job=submit_job))
+    monkeypatch.setattr(api_mod, "_service", SimpleNamespace(state={}, submit_job_ex=submit_job_ex))
     return ctx
 
 

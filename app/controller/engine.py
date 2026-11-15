@@ -663,21 +663,30 @@ class TriggerHostRolloutStage(BaseStage):
             "source": "host_provision_chain",
             "trigger": "engine",
         }
-        submit = getattr(engine, "submit_job", None)
+        submit = getattr(engine, "submit_job_ex", None)
         if submit is None:
             # Engine used without the service (tests, legacy): the bus path — an
             # untrusted trigger there, which is fine for a plain host rollout.
             engine.ctx.emit("iac:webhook_verified", payload)
             return StageResult(True, f"Host rollout queued for '{self.host_name}' (existing Deploy Host flow).")
         try:
-            job_id = await submit(payload, entitlements=("trigger",))
+            res = await submit(payload, entitlements=("trigger",))
         except Exception as exc:
             return StageResult(False, f"Host rollout for '{self.host_name}' could not be queued: {exc}")
-        if job_id:
-            return StageResult(True, f"Host rollout queued for '{self.host_name}' as job #{job_id}.")
-        log.warning(f"Host rollout for '{self.host_name}' NOT queued: a rollout for this target is already queued or running.")
-        return StageResult(True, f"Host rollout for '{self.host_name}' not queued — a rollout for this target "
-                                 "is already queued or running.")
+        # Report what really happened to the hand-off (audit OC-05): this stage
+        # used to log "queued" also when the trigger had been dropped because a
+        # rollout was queued or running — the new host then got no services.
+        if not res.queued:
+            blocker = f" (job #{res.duplicate_of})" if res.duplicate_of else ""
+            log.warning(f"Host rollout for '{self.host_name}' NOT queued: {res.reason}{blocker}.")
+            return StageResult(True, f"Host rollout for '{self.host_name}' NOT queued — {res.reason}{blocker}. "
+                                     "Deploy the host's services once that job is done.")
+        if res.outcome == "follow_up":
+            return StageResult(True, f"Host rollout for '{self.host_name}' queued as job #{res.job_id}; it starts "
+                                     f"when job #{res.waiting_for} (rollout in progress) is done.")
+        if res.outcome == "coalesced":
+            return StageResult(True, f"Host rollout for '{self.host_name}' is already queued as job #{res.job_id}.")
+        return StageResult(True, f"Host rollout queued for '{self.host_name}' as job #{res.job_id}.")
 
 class DetectDriftStage(BaseStage):
     def __init__(self):
@@ -1829,15 +1838,15 @@ class DeploymentEngine:
                     if not incoming_limit or incoming_limit == "all":
                         # Global (no-limit) rollout: block if ANY rollout is in flight.
                         log.warning("ENGINE: A rollout is already in progress — global rollout blocked.")
-                        return self._skip_claimed(job_id, "a rollout is already in progress")
+                        return await asyncio.to_thread(self._skip_claimed, job_id, "a rollout is already in progress", True)
                     # Host-scoped rollout: block if the SAME host is already rolling out.
                     if rollout_key in active_rollout_types:
                         log.warning(f"ENGINE: Rollout for host '{incoming_limit}' is already running — duplicate blocked.")
-                        return self._skip_claimed(job_id, f"rollout for '{incoming_limit}' already running")
+                        return await asyncio.to_thread(self._skip_claimed, job_id, f"rollout for '{incoming_limit}' already running", True)
                     # Also block if a global (no-limit) rollout is in flight to avoid conflicts.
                     if "rollout:all" in active_rollout_types or "rollout" in active_rollout_types:
                         log.warning(f"ENGINE: Global rollout in progress — host rollout for '{incoming_limit}' blocked.")
-                        return self._skip_claimed(job_id, "global rollout in progress")
+                        return await asyncio.to_thread(self._skip_claimed, job_id, "global rollout in progress", True)
                 self._active_rollout_keys.add(rollout_key)
             if pipeline_type == "single_service":
                 service_name = str(payload.get("service_name") or "").strip().lower()
@@ -1847,7 +1856,7 @@ class DeploymentEngine:
                     if single_key in self._active_single_service_keys:
                         log.warning(f"ENGINE: Duplicate single_service pipeline ignored for '{service_name}' (in-memory lock).")
                         self._notify("Pipeline Ignored", f"A deployment for {service_name} is already being started.", "warning")
-                        return self._skip_claimed(job_id, f"deployment for {service_name} already starting")
+                        return await asyncio.to_thread(self._skip_claimed, job_id, f"deployment for {service_name} already starting", True)
 
                     active_service_jobs = [
                         j for j in await _running()
@@ -1856,7 +1865,7 @@ class DeploymentEngine:
                     if active_service_jobs:
                         log.warning(f"ENGINE: Duplicate single_service pipeline ignored for '{service_name}'.")
                         self._notify("Pipeline Ignored", f"A deployment for {service_name} is already running.", "warning")
-                        return self._skip_claimed(job_id, f"deployment for {service_name} already running")
+                        return await asyncio.to_thread(self._skip_claimed, job_id, f"deployment for {service_name} already running", True)
 
                     self._active_single_service_keys.add(single_key)
             if pipeline_type in ("host_provision", "bootstrap_compliance", "init_host", "compliance", "state_check"):
@@ -1869,13 +1878,13 @@ class DeploymentEngine:
                 if not host_name:
                     log.warning(f"ENGINE: {pipeline_type} ignored (missing host_name).")
                     self._notify("Pipeline Ignored", f"{pipeline_type} requires host_name.", "warning")
-                    return self._skip_claimed(job_id, f"{pipeline_type} requires host_name")
+                    return await asyncio.to_thread(self._skip_claimed, job_id, f"{pipeline_type} requires host_name")
                 payload["host_name"] = host_name
                 terraform_key = f"{pipeline_type}:{host_name}"
                 if terraform_key in self._active_terraform_host_keys:
                     log.warning(f"ENGINE: Duplicate {pipeline_type} ignored for '{host_name}' (in-memory lock).")
                     self._notify("Pipeline Ignored", f"A {pipeline_type} run for {host_name} is already being started.", "warning")
-                    return self._skip_claimed(job_id, f"{pipeline_type} for {host_name} already starting")
+                    return await asyncio.to_thread(self._skip_claimed, job_id, f"{pipeline_type} for {host_name} already starting", True)
 
                 active_tf_jobs = [
                     j for j in await _running()
@@ -1884,7 +1893,7 @@ class DeploymentEngine:
                 if active_tf_jobs:
                     log.warning(f"ENGINE: Duplicate {pipeline_type} ignored for '{host_name}'.")
                     self._notify("Pipeline Ignored", f"A {pipeline_type} run for {host_name} is already running.", "warning")
-                    return self._skip_claimed(job_id, f"{pipeline_type} for {host_name} already running")
+                    return await asyncio.to_thread(self._skip_claimed, job_id, f"{pipeline_type} for {host_name} already running", True)
                 self._active_terraform_host_keys.add(terraform_key)
             if pipeline_type in ("infra_plan", "infra_apply"):
                 active_infra_jobs = [
@@ -1894,13 +1903,14 @@ class DeploymentEngine:
                 if active_infra_jobs:
                     log.warning("ENGINE: An infrastructure plan/apply is already in progress.")
                     self._notify("Pipeline Ignored", "An infrastructure plan/apply is already running.", "warning")
-                    return self._skip_claimed(job_id, "an infrastructure plan/apply is already running")
+                    return await asyncio.to_thread(self._skip_claimed, job_id, "an infrastructure plan/apply is already running", True)
 
         # Every key reserved above is released in this finally — also when the
         # pipeline set-up raises before its own try/finally is reached (job row,
         # strategy, log bridge, notify). A leaked key blocks that target on this
         # instance until the process restarts.
         try:
+            self._guard_bounces.pop(job_id, None)
             await self._execute_dispatched(payload, job_id, pipeline_type)
         finally:
             if single_key:
@@ -2271,12 +2281,42 @@ class DeploymentEngine:
     # Cluster control plane (plugin ≥ 1.4): queue-aware helpers
     # ------------------------------------------------------------------
 
-    def _skip_claimed(self, job_id, reason: str):
-        """The dispatch guard rejected a job the worker already claimed: the row
-        must not stay RUNNING forever — close it as ABORTED with the reason."""
-        if job_id:
-            self.db.update_progress(job_id, progress=None, current_step=f"Skipped: {reason}"[:250])
-            self.db.update_job(job_id, "ABORTED")
+    #: How often the dispatch guard hands one claimed job back to the queue before
+    #: it gives up on it (see _skip_claimed).
+    _MAX_GUARD_BOUNCES = 3
+
+    @property
+    def _guard_bounces(self) -> dict:
+        return self.__dict__.setdefault("_guard_bounce_counts", {})
+
+    def _skip_claimed(self, job_id, reason: str, busy: bool = False):
+        """The dispatch guard rejected a job the worker already claimed. Nothing of
+        the job has run; the row must not stay RUNNING.
+
+        ``busy`` — the target is occupied by another job. The claim skips such a
+        job (``JobQueue.claim_next``), so this is the rare race of two runners
+        claiming conflicting targets in the same moment. The job was accepted and
+        is not dropped (audit OC-05): it goes back to the queue and is claimed
+        again once the target is free. Bounded — a job the guard keeps rejecting
+        (and every job rejected for another reason) is closed as ABORTED with the
+        reason, as before.
+
+        Synchronous database work: call it through ``asyncio.to_thread``.
+        """
+        if not job_id:
+            return None
+        queue = getattr(self, "queue", None)
+        if busy and queue is not None:
+            bounces = self._guard_bounces
+            bounces[job_id] = bounces.get(job_id, 0) + 1
+            if bounces[job_id] <= self._MAX_GUARD_BOUNCES:
+                token = getattr(queue, "claims", {}).get(job_id)
+                if queue.release(job_id, token, f"Queued — waiting: {reason}"[:250]):
+                    log.warning(f"ENGINE: job #{job_id} handed back to the queue ({reason}).")
+                    return None
+            bounces.pop(job_id, None)
+        self.db.update_progress(job_id, progress=None, current_step=f"Skipped: {reason}"[:250])
+        self.db.update_job(job_id, "ABORTED")
         return None
 
     def _log_writer(self, job_id):

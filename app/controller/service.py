@@ -14,7 +14,7 @@ from ..model.models import Base
 from ..model.database import JobDatabase
 from .config import IaCConfig
 from .engine import DeploymentEngine
-from .queue import JobQueue, JobWorker, DuplicateJob
+from .queue import JobQueue, JobWorker, DuplicateJob, EnqueueResult, SubmitResult
 from .socket_client import SocketBusClient
 from .gitlab_webhooks import sync_group_webhooks_from_ctx, WebhookConfigError
 from .job_payload import ALL_ENTITLEMENTS, InvalidJobPayload, strip_unentitled, validate_structure
@@ -58,6 +58,7 @@ class IaCService:
         # The engine's own hand-offs (host rollout after a provision) enter the
         # queue through the same validated door as every other trigger.
         self.engine.submit_job = self.submit_job
+        self.engine.submit_job_ex = self.submit_job_ex
         # Maintenance windows (1.6): a job the queue closes itself (orphan sweep →
         # mark_failed) still ends its maintenance override exactly once.
         self.queue.on_terminal = self.engine.end_override_for
@@ -180,20 +181,29 @@ class IaCService:
         )
 
     def enqueue_pipeline(self, payload: dict, *, requested_by: str | None = None) -> int:
-        """Queue a pipeline for a runner. Raises :class:`DuplicateJob` when the same
-        target is already queued or running. Wakes the runners via the cluster bus.
+        """:meth:`enqueue_pipeline_ex` for callers that only need the job id."""
+        return self.enqueue_pipeline_ex(payload, requested_by=requested_by).job_id
 
-        Maintenance windows (1.6): a SCHEDULED job for the same target absorbs a
-        newer webhook trigger (coalesced — nothing to wake) or is promoted to QUEUED
-        when the trigger must run now (UI deploy / ``force``)."""
+    def enqueue_pipeline_ex(self, payload: dict, *, requested_by: str | None = None) -> EnqueueResult:
+        """Queue a pipeline for a runner and wake the runners via the cluster bus.
+
+        The trigger becomes a new job, a follow-up behind a busy target, or is
+        absorbed by a job for the same target that has not started (queued and
+        identical, or SCHEDULED — coalesced, or promoted when the trigger must run
+        now). Raises :class:`DuplicateJob` when it cannot be queued (see
+        ``JobQueue.enqueue_ex``)."""
         result = self.queue.enqueue_ex(payload, requested_by=requested_by)
         job_id = result.job_id
+        what = payload.get("service_name") or payload.get("pipeline_type")
         if result.coalesced:
-            log.info(f"ENQUEUE: trigger for '{payload.get('service_name') or payload.get('pipeline_type')}' "
-                     f"coalesced into scheduled job #{job_id}.")
-            return job_id
+            # Nothing to wake: the absorbing job is already waiting for a runner
+            # (or for its maintenance window).
+            log.info(f"ENQUEUE: trigger for '{what}' coalesced into job #{job_id}.")
+            return result
         if result.promoted:
             log.info(f"ENQUEUE: scheduled job #{job_id} promoted to run now ({requested_by}).")
+        if result.waiting_for:
+            log.info(f"ENQUEUE: job #{job_id} for '{what}' waits for job #{result.waiting_for} (same target).")
         if job_id > 0:
             try:
                 self.ctx.emit("iac:job_queued", {"job_id": job_id}, cluster=True)
@@ -203,7 +213,7 @@ class IaCService:
                 log.debug(f"iac:job_queued not emitted: {exc}")
             if self.worker is not None:
                 self.worker.wake()
-        return job_id
+        return result
 
     def start_runner(self, max_parallel: int | None = None) -> None:
         """Start the job worker (runner instances only)."""
@@ -298,12 +308,20 @@ class IaCService:
         self.db.update_job(job_id, "FAILED")
 
     async def submit_job(self, payload: dict, *, entitlements=(), requested_by: str | None = None) -> int | None:
+        """:meth:`submit_job_ex` for callers that only need the job id (``None``
+        when the trigger was not queued)."""
+        return (await self.submit_job_ex(payload, entitlements=entitlements, requested_by=requested_by)).job_id
+
+    async def submit_job_ex(self, payload: dict, *, entitlements=(),
+                            requested_by: str | None = None) -> SubmitResult:
         """The one way a trigger becomes a job.
 
         ``entitlements`` names the privileged fields the calling code path may
         set (``job_payload.ENT_*``); everything else is stripped, then the
-        payload is validated. Returns the job id, ``None`` when the same target
-        is already queued/running. Raises :class:`InvalidJobPayload`.
+        payload is validated. Returns what became of the trigger — a new job, a
+        follow-up behind a busy target, merged into an identical queued job, or
+        NOT queued (``outcome == "duplicate"``) — so the caller can tell whoever
+        triggered the truth (audit OC-05). Raises :class:`InvalidJobPayload`.
         """
         clean, dropped = strip_unentitled(payload or {}, entitlements)
         if dropped:
@@ -311,18 +329,37 @@ class IaCService:
                         f"'{clean.get('pipeline_type')}' trigger without entitlement.")
         clean = validate_structure(clean)
         who = requested_by or clean.get("trigger") or ("ui" if clean.get("manual") else "webhook")
+        target = clean.get("service_name") or clean.get("host_name") or clean.get("limit") or clean.get("pipeline_type")
         try:
-            return await asyncio.to_thread(self.enqueue_pipeline, clean, requested_by=who)
+            res = await asyncio.to_thread(self.enqueue_pipeline_ex, clean, requested_by=who)
         except DuplicateJob as exc:
-            target = clean.get("service_name") or clean.get("host_name") or clean.get("limit") or clean.get("pipeline_type")
-            log.warning(f"ENQUEUE: duplicate pipeline ignored for '{target}' (job #{exc.existing_id} active).")
-            try:
-                self.engine._notify("Pipeline Ignored",
-                                    f"A run for {target} is already queued or running (job #{exc.existing_id}).",
-                                    "warning")
-            except Exception:
-                pass
-            return None
+            reason = exc.reason or "a run for this target is already queued or running"
+            log.warning(f"ENQUEUE: trigger for '{target}' NOT queued — {reason} (job #{exc.existing_id}).")
+            self._notify_trigger("Pipeline Ignored",
+                                 f"A run for {target} was not queued: {reason} (job #{exc.existing_id}).", "warning")
+            return SubmitResult(None, "duplicate", duplicate_of=exc.existing_id, reason=reason)
+        if not res.job_id or res.job_id < 0:
+            return SubmitResult(None, "unavailable", reason="the job database is not connected")
+        if res.waiting_for:
+            self._notify_trigger("Pipeline Queued",
+                                 f"The run for {target} is queued as job #{res.job_id}; it starts when job "
+                                 f"#{res.waiting_for} for the same target is done.", "info")
+            return SubmitResult(res.job_id, "follow_up", waiting_for=res.waiting_for)
+        if res.coalesced:
+            if clean.get("manual"):
+                # An operator's click must not vanish without a trace; a CI trigger
+                # learns it from the response.
+                self._notify_trigger("Pipeline Queued",
+                                     f"A run for {target} is already waiting as job #{res.job_id} — nothing was added.",
+                                     "info")
+            return SubmitResult(res.job_id, "coalesced")
+        return SubmitResult(res.job_id, "promoted" if res.promoted else "queued")
+
+    def _notify_trigger(self, title: str, message: str, level: str) -> None:
+        try:
+            self.engine._notify(title, message, level)
+        except Exception as exc:
+            log.debug(f"trigger notification not sent: {exc}")
 
     def submit_from_ui(self, payload: dict) -> None:
         """Trigger from the plugin's own in-process (NiceGUI) pages: sync wrapper
@@ -346,16 +383,6 @@ class IaCService:
             return await self.submit_job(payload or {}, entitlements=())
         except InvalidJobPayload as exc:
             log.warning(f"ENQUEUE: bus trigger rejected — {exc}")
-            return None
-        except DuplicateJob as exc:
-            target = payload.get("service_name") or payload.get("host_name") or payload.get("limit") or payload.get("pipeline_type")
-            log.warning(f"ENQUEUE: duplicate pipeline ignored for '{target}' (job #{exc.existing_id} active).")
-            try:
-                self.engine._notify("Pipeline Ignored",
-                                    f"A run for {target} is already queued or running (job #{exc.existing_id}).",
-                                    "warning")
-            except Exception:
-                pass
             return None
         except Exception as exc:
             log.error(f"ENQUEUE: failed to queue pipeline: {exc}")

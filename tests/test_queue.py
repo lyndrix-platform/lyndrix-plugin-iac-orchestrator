@@ -60,9 +60,10 @@ def test_rollout_conflict_rules():
 def test_enqueue_claim_and_duplicate(q):
     jid = q.enqueue({"pipeline_type": "single_service", "service_name": "Svc-A", "manual": True}, requested_by="ui")
     assert jid > 0
+    # a queued job that does something else (dry-run) is neither merged nor replaced: first wins
     with pytest.raises(DuplicateJob) as exc:
-        q.enqueue({"pipeline_type": "single_service", "service_name": "svc-a"})
-    assert exc.value.existing_id == jid
+        q.enqueue({"pipeline_type": "single_service", "service_name": "svc-a", "dry_run": True})
+    assert exc.value.existing_id == jid and "something else" in exc.value.reason
 
     claimed = q.claim_next("runner-1")
     assert claimed is not None
@@ -76,13 +77,12 @@ def test_enqueue_claim_and_duplicate(q):
         assert row.pipeline_type.startswith("single_service")
         assert row.heartbeat_at is not None
 
-    # still a duplicate while RUNNING, free again once it finished
-    with pytest.raises(DuplicateJob):
-        q.enqueue({"pipeline_type": "single_service", "service_name": "svc-a"})
+    # free again once it finished (the busy-target cases: tests/test_follow_up_jobs.py)
     with queue_mod.db_instance.SessionLocal() as s:
         s.execute(update(IaCJob).where(IaCJob.id == jid).values(status="SUCCESS"))
         s.commit()
-    assert q.enqueue({"pipeline_type": "single_service", "service_name": "svc-a"}) > jid
+    res = q.enqueue_ex({"pipeline_type": "single_service", "service_name": "svc-a"})
+    assert res.job_id > jid and res.waiting_for is None and not res.coalesced
 
 
 def test_claim_is_fifo_and_exclusive(q):
@@ -307,9 +307,14 @@ def test_ui_deploy_promotes_scheduled_job(q):
     assert res.job_id == jid and res.promoted and not res.coalesced
     row = _row(jid)
     assert row.status == "QUEUED" and row.not_before is None and '"force": true' in row.payload
-    # QUEUED now → a further trigger is a duplicate again (first wins, as before)
+    # QUEUED now and it runs at once: a further webhook for the same branch adds
+    # nothing (merged, payload untouched); one for another branch is not merged.
+    before = row.payload
+    merged = q.enqueue_ex(WEBHOOK)
+    assert merged.job_id == jid and merged.coalesced and _row(jid).payload == before
     with pytest.raises(DuplicateJob):
-        q.enqueue(WEBHOOK)
+        q.enqueue({**WEBHOOK, "service_branch": "release-2"})
+    assert _row(jid).payload == before
 
 
 def test_abort_queued_keeps_scheduled_unless_asked(q):

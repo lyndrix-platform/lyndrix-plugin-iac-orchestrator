@@ -35,7 +35,7 @@ from .settings_schema import (
     TIER_CREDENTIALS, TIER_INFRA_APPLY, TIER_OPERATOR, TIER_SETTINGS,
     is_valid_credential_alias,
 )
-from .queue import DuplicateJob as _DuplicateJob
+from .queue import DuplicateJob as _DuplicateJob, SubmitResult
 from .job_payload import ENT_APPROVE, ENT_TRIGGER, InvalidJobPayload
 from . import maintenance_resolver as _mres
 from .public_projection import public_catalog_entry, public_scalar
@@ -105,19 +105,45 @@ def _actor(identity) -> str | None:
     return str(name)[:100] if isinstance(name, str) and name else None
 
 
-async def _submit(payload: dict, *entitlements: str, actor: str | None = None) -> int | None:
+async def _submit(payload: dict, *entitlements: str, actor: str | None = None) -> SubmitResult:
     """Queue a trigger of this API (validated, with the entitlements of the calling
-    route). Returns the job id, ``None`` when the target is already queued/running;
-    an invalid payload is a 400. Triggers no longer travel over the bus: the bus
-    topic ``iac:webhook_verified`` has no sender identity (audit OS-09)."""
+    route) and return what became of it; an invalid payload is a 400. Triggers no
+    longer travel over the bus: the bus topic ``iac:webhook_verified`` has no
+    sender identity (audit OS-09).
+
+    The "webhook verified" notification is sent only for a trigger that was
+    queued — a refused one already produced "Pipeline Ignored"."""
     if not _service:
         raise HTTPException(status_code=503, detail="Orchestrator not initialized")
     try:
         # ``actor`` = authenticated username (recorded with the job, audit OS-13);
         # token/CI triggers are recorded under their trigger name.
-        return await _service.submit_job(payload, entitlements=entitlements, requested_by=actor)
+        result = await _service.submit_job_ex(payload, entitlements=entitlements, requested_by=actor)
     except InvalidJobPayload as exc:
         raise HTTPException(status_code=400, detail=f"Invalid job payload: {exc}")
+    if result.queued:
+        _emit_webhook_verified(payload)
+    return result
+
+
+def _trigger_response(result: SubmitResult, message: str, **extra) -> dict:
+    """Body of a trigger endpoint. It used to say ``accepted`` / "… queued" whatever
+    happened, also for a trigger that was dropped (audit OC-05). Now:
+
+    * ``status``: ``accepted`` when a job will run the trigger; ``duplicate`` (or
+      ``unavailable``) when it was NOT queued. HTTP stays 200 — GitLab disables a
+      hook that answers 4xx and the existing CI template only looks at the code;
+      what happened is in the body;
+    * ``job_id``: the job to poll — also for a trigger merged into a queued job
+      (``outcome: coalesced``) or waiting behind a running one (``follow_up``,
+      ``waiting_for``); ``queued`` false and ``duplicate_of`` when refused.
+    """
+    return {
+        "status": "accepted" if result.queued else result.outcome,
+        "message": result.describe(message),
+        **result.as_dict(),
+        **extra,
+    }
 
 # ── Webhook token check (public routes) ──────────────────────────────────────
 # Runs BEFORE authentication succeeded, for anyone who reaches the port. It used
@@ -689,10 +715,12 @@ async def do_gitlab_webhook(request: Request, x_gitlab_token: str | None):
             )
             return {"status": "accepted", "triggered": False, "reason": event_reason}
 
-        job_id = await _submit(event_payload, ENT_TRIGGER)
-        _emit_webhook_verified(event_payload)
-
-        return {"status": "accepted", "triggered": True, "reason": f"{reason}; {event_reason}", "job_id": job_id}
+        result = await _submit(event_payload, ENT_TRIGGER)
+        # Always 200 for GitLab (a hook that answers 4xx gets disabled); whether a
+        # job runs the event is in ``triggered`` / ``outcome``.
+        return {"status": "accepted", "triggered": result.queued,
+                "reason": f"{reason}; {event_reason}" if result.queued else result.describe(""),
+                **{k: v for k, v in result.as_dict().items() if k != "reason"}}
     except HTTPException:
         raise
     except Exception as e:
@@ -779,11 +807,9 @@ async def do_trigger_service_deployment(service_name: str, payload: DeployReques
     }
     if payload.dry_run:
         event_payload["dry_run"] = True
-    job_id = await _submit(event_payload, ENT_TRIGGER, actor=_actor(identity))
-    _emit_webhook_verified(event_payload)
+    result = await _submit(event_payload, ENT_TRIGGER, actor=_actor(identity))
     kind = "Dry-run (--check)" if payload.dry_run else "Deployment"
-    return {"status": "accepted", "dry_run": bool(payload.dry_run), "job_id": job_id,
-            "message": f"{kind} queued for {normalized_service}"}
+    return _trigger_response(result, f"{kind} queued for {normalized_service}", dry_run=bool(payload.dry_run))
 
 
 def map_service_status(job: dict | None, *, accept: str | None = None) -> dict:
@@ -1027,15 +1053,11 @@ async def do_trigger_test_host_deployment(host_name: str, payload: TestHostDeplo
         "trigger": "manual_test_host",
         "test_host": host,
     }
-    job_id = await _submit(event_payload, ENT_TRIGGER, actor=_actor(identity))
-    _emit_webhook_verified(event_payload)
-    return {
-        "status": "accepted",
-        "job_id": job_id,
-        "message": f"Host provisioning queued for host '{host}'.",
-        "host_name": host,
-        "services": [str(s).strip() for s in (payload.services or []) if str(s).strip()],
-    }
+    result = await _submit(event_payload, ENT_TRIGGER, actor=_actor(identity))
+    return _trigger_response(
+        result, f"Host provisioning queued for host '{host}'.", host_name=host,
+        services=[str(s).strip() for s in (payload.services or []) if str(s).strip()],
+    )
 
 
 async def do_trigger_host_bootstrap(host_name: str, payload: TestHostDeployRequest, identity=None):
@@ -1076,14 +1098,8 @@ async def do_trigger_host_bootstrap(host_name: str, payload: TestHostDeployReque
         "manual": True,
         "trigger": "manual_bootstrap",
     }
-    job_id = await _submit(event_payload, ENT_TRIGGER, actor=_actor(identity))
-    _emit_webhook_verified(event_payload)
-    return {
-        "status": "accepted",
-        "job_id": job_id,
-        "message": f"Compliance bootstrap queued for host '{host}'.",
-        "host_name": host,
-    }
+    result = await _submit(event_payload, ENT_TRIGGER, actor=_actor(identity))
+    return _trigger_response(result, f"Compliance bootstrap queued for host '{host}'.", host_name=host)
 
 
 async def do_trigger_infra_plan(identity=None):
@@ -1091,9 +1107,8 @@ async def do_trigger_infra_plan(identity=None):
     if not _ctx:
         raise HTTPException(status_code=500, detail="Context offline")
     infra_plan_payload = {"pipeline_type": "infra_plan", "manual": True, "trigger": "manual_infra_plan"}
-    job_id = await _submit(infra_plan_payload, ENT_TRIGGER, actor=_actor(identity))
-    _emit_webhook_verified(infra_plan_payload)
-    return {"status": "accepted", "message": "Infrastructure plan (Check Env) queued.", "job_id": job_id}
+    result = await _submit(infra_plan_payload, ENT_TRIGGER, actor=_actor(identity))
+    return _trigger_response(result, "Infrastructure plan (Check Env) queued.")
 
 
 async def do_trigger_infra_apply_by_token(x_gitlab_token: str | None):
@@ -1127,9 +1142,8 @@ async def do_trigger_infra_apply(identity=None):
         "trigger": "manual_infra_apply",
     }
     # Only the two apply routes (permission api:infra_apply) may set ``approve``.
-    job_id = await _submit(infra_apply_payload, ENT_TRIGGER, ENT_APPROVE, actor=_actor(identity))
-    _emit_webhook_verified(infra_apply_payload)
-    return {"status": "accepted", "message": "Infrastructure deploy queued.", "job_id": job_id}
+    result = await _submit(infra_apply_payload, ENT_TRIGGER, ENT_APPROVE, actor=_actor(identity))
+    return _trigger_response(result, "Infrastructure deploy queued.")
 
 
 # ── Pending infra plan (review-and-approve flow) ────────────────────────────
@@ -1168,14 +1182,8 @@ async def do_apply_pending_plan(identity=None):
         "trigger": "pending_plan_approval",
         "plan_job_id": data.get("job_id"),
     }
-    job_id = await _submit(payload, ENT_TRIGGER, ENT_APPROVE, actor=_actor(identity))
-    _emit_webhook_verified(payload)
-    return {
-        "status": "accepted",
-        "job_id": job_id,
-        "message": "Approved — infrastructure deploy queued.",
-        "plan_job_id": data.get("job_id"),
-    }
+    result = await _submit(payload, ENT_TRIGGER, ENT_APPROVE, actor=_actor(identity))
+    return _trigger_response(result, "Approved — infrastructure deploy queued.", plan_job_id=data.get("job_id"))
 
 
 async def do_dismiss_pending_plan():
@@ -1464,19 +1472,13 @@ async def do_run_pipeline(payload: PipelineRequest, identity=None):
     if payload.dry_run:
         event_payload["dry_run"] = True
 
-    job_id = await _submit(event_payload, ENT_TRIGGER, actor=_actor(identity))
-    _emit_webhook_verified(event_payload)
+    result = await _submit(event_payload, ENT_TRIGGER, actor=_actor(identity))
     target = host or limit
     suffix = " (dry-run, --check)" if payload.dry_run else ""
-    return {
-        "status": "accepted",
-        "message": f"Pipeline '{pipeline_type}' queued for '{target}'{suffix}.",
-        "job_id": job_id,
-        "dry_run": bool(payload.dry_run),
-        "pipeline_type": pipeline_type,
-        "limit": limit or None,
-        "host_name": host or None,
-    }
+    return _trigger_response(
+        result, f"Pipeline '{pipeline_type}' queued for '{target}'{suffix}.",
+        dry_run=bool(payload.dry_run), pipeline_type=pipeline_type, limit=limit or None, host_name=host or None,
+    )
 
 
 async def do_abort():

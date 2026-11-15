@@ -14,6 +14,7 @@ from iac_plugin.app.controller import job_payload as jp
 from iac_plugin.app.controller import maintenance_resolver as mres
 from iac_plugin.app.controller import queue as queue_mod
 from iac_plugin.app.controller.engine import TriggerHostRolloutStage
+from iac_plugin.app.controller.queue import SubmitResult
 from iac_plugin.app.model.models import IaCJob
 from iac_plugin.stages import git as git_stage
 
@@ -184,13 +185,13 @@ def test_clone_stage_never_leaves_the_services_dir(tmp_path, monkeypatch):
 def test_api_routes_submit_with_their_own_entitlements(monkeypatch):
     submitted = []
 
-    async def submit_job(payload, *, entitlements=(), requested_by=None):
+    async def submit_job_ex(payload, *, entitlements=(), requested_by=None):
         submitted.append((payload["pipeline_type"], set(entitlements)))
-        return 7
+        return SubmitResult(7)
 
     ctx = MagicMock()
     monkeypatch.setattr(api_mod, "_ctx", ctx)
-    monkeypatch.setattr(api_mod, "_service", SimpleNamespace(submit_job=submit_job))
+    monkeypatch.setattr(api_mod, "_service", SimpleNamespace(submit_job_ex=submit_job_ex))
     assert asyncio.run(api_mod.do_trigger_infra_plan())["job_id"] == 7
     asyncio.run(api_mod.do_trigger_infra_apply())
     asyncio.run(api_mod.do_trigger_service_deployment("aac-x", api_mod.DeployRequest(), trigger="gitlab-ci"))
@@ -203,11 +204,11 @@ def test_api_routes_submit_with_their_own_entitlements(monkeypatch):
 def test_invalid_payload_from_a_route_is_a_400(monkeypatch):
     from fastapi import HTTPException
 
-    async def submit_job(payload, *, entitlements=(), requested_by=None):
+    async def submit_job_ex(payload, *, entitlements=(), requested_by=None):
         raise jp.InvalidJobPayload("invalid limit")
 
     monkeypatch.setattr(api_mod, "_ctx", MagicMock())
-    monkeypatch.setattr(api_mod, "_service", SimpleNamespace(submit_job=submit_job))
+    monkeypatch.setattr(api_mod, "_service", SimpleNamespace(submit_job_ex=submit_job_ex))
     with pytest.raises(HTTPException) as exc:
         asyncio.run(api_mod.do_trigger_infra_plan())
     assert exc.value.status_code == 400
@@ -216,14 +217,26 @@ def test_invalid_payload_from_a_route_is_a_400(monkeypatch):
 def test_engine_hand_off_reports_what_really_happened():
     calls = []
 
+    outcomes = [
+        SubmitResult(31),
+        SubmitResult(32, "follow_up", waiting_for=30),
+        SubmitResult(33, "coalesced"),
+        SubmitResult(None, "duplicate", duplicate_of=29, reason="a queued job for this target does something else"),
+    ]
+
     async def submit(payload, *, entitlements=()):
         calls.append((payload, tuple(entitlements)))
-        return 31 if len(calls) == 1 else None
+        return outcomes[len(calls) - 1]
 
-    engine = SimpleNamespace(submit_job=submit, ctx=MagicMock())
-    first = asyncio.run(TriggerHostRolloutStage("Docker-New").run(engine, {}))
-    second = asyncio.run(TriggerHostRolloutStage("docker-new").run(engine, {}))
+    engine = SimpleNamespace(submit_job_ex=submit, ctx=MagicMock())
+    results = [asyncio.run(TriggerHostRolloutStage(name).run(engine, {}))
+               for name in ("Docker-New", "docker-new", "docker-new", "docker-new")]
     assert calls[0] == ({"pipeline_type": "rollout", "limit": "docker-new", "manual": True,
                          "source": "host_provision_chain", "trigger": "engine"}, ("trigger",))
-    assert "job #31" in first.message and "not queued" in second.message
+    queued, follow_up, coalesced, refused = (r.message for r in results)
+    assert "queued for 'docker-new' as job #31" in queued
+    assert "job #32" in follow_up and "job #30" in follow_up            # waits, is not lost
+    assert "already queued as job #33" in coalesced
+    assert "NOT queued" in refused and "job #29" in refused             # never reported as queued
+    assert all(r.success for r in results)                              # the provision itself went through
     engine.ctx.emit.assert_not_called()

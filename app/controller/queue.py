@@ -18,6 +18,7 @@ import json
 import logging
 import time
 import uuid
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Callable
@@ -37,9 +38,6 @@ STATUS_FAILED = "FAILED"
 # Maintenance windows (plugin 1.6): a deploy the runner parked until its window opens.
 # No owner, no heartbeat — the claim picks it up again once ``not_before`` is reached.
 STATUS_SCHEDULED = "SCHEDULED"
-
-#: Statuses that block a second job with the same dedupe key (``DuplicateJob``).
-_ACTIVE_STATUSES = (STATUS_QUEUED, STATUS_RUNNING)
 
 
 def to_queue_clock(aware: datetime) -> datetime:
@@ -67,14 +65,67 @@ def from_queue_clock(naive: datetime | None) -> datetime | None:
 class EnqueueResult:
     """Outcome of :meth:`JobQueue.enqueue_ex`.
 
-    ``coalesced``: an existing SCHEDULED job for the same target absorbed this trigger
-    (payload replaced, ``start_time`` reset). ``promoted``: the existing SCHEDULED job
-    was moved to QUEUED because this trigger must run now (UI deploy / ``force``).
+    ``coalesced``: an existing job for the same target absorbed this trigger — a
+    SCHEDULED one (payload replaced, ``start_time`` reset) or a QUEUED one that has
+    not started and does exactly the same (nothing replaced). ``promoted``: the
+    existing SCHEDULED job was moved to QUEUED because this trigger must run now
+    (UI deploy / ``force``).
     """
 
     job_id: int
     coalesced: bool = False
     promoted: bool = False
+    #: Follow-up (audit OC-05): the job was queued although its target is busy —
+    #: it is claimed only after this job (RUNNING, or queued ahead of it) is done.
+    waiting_for: int | None = None
+
+
+@dataclass(frozen=True)
+class SubmitResult:
+    """What became of a trigger (``IaCService.submit_job_ex``). Callers report THIS
+    to whoever triggered — never a blanket "accepted" (audit OC-05).
+
+    ``outcome``: ``queued`` (new job) · ``follow_up`` (new job, waits behind
+    ``waiting_for``) · ``coalesced`` (an identical job that has not started absorbed
+    the trigger; ``job_id`` is that job) · ``promoted`` (parked job set to run now)
+    · ``duplicate`` (NOT queued: ``duplicate_of`` stands in the way, see ``reason``)
+    · ``unavailable`` (NOT queued: no database).
+    """
+
+    job_id: int | None
+    outcome: str = "queued"
+    waiting_for: int | None = None
+    duplicate_of: int | None = None
+    reason: str = ""
+
+    @property
+    def queued(self) -> bool:
+        return self.job_id is not None
+
+    def as_dict(self) -> dict:
+        """Response fields every trigger endpoint carries."""
+        out: dict = {"job_id": self.job_id, "queued": self.queued, "outcome": self.outcome}
+        if self.waiting_for is not None:
+            out["waiting_for"] = self.waiting_for
+        if self.duplicate_of is not None:
+            out["duplicate_of"] = self.duplicate_of
+        if self.reason:
+            out["reason"] = self.reason
+        return out
+
+    def describe(self, queued_message: str) -> str:
+        """``queued_message`` when a new job starts as soon as a runner is free;
+        otherwise what actually happened to the trigger."""
+        if self.outcome == "follow_up":
+            return (f"{queued_message.rstrip('.')} as job #{self.job_id} — it starts when job "
+                    f"#{self.waiting_for} for the same target is done.")
+        if self.outcome == "coalesced":
+            return f"Already queued as job #{self.job_id} (not started yet) — this trigger was merged into it."
+        if not self.queued:
+            blocker = f" (job #{self.duplicate_of})" if self.duplicate_of else ""
+            return f"Not queued: {self.reason or 'the target is busy'}{blocker}."
+        return queued_message
+
 
 # Pipeline types that must not run twice for the same target at the same time.
 _HOST_SCOPED = ("host_provision", "bootstrap_compliance", "init_host", "compliance", "state_check", "adopt_host")
@@ -96,12 +147,14 @@ def _seconds_between(later, earlier) -> float | None:
 
 
 class DuplicateJob(Exception):
-    """A job with the same concurrency key is already queued or running."""
+    """The trigger was NOT queued: a job for the same target is active and this
+    trigger can neither be merged into it nor wait behind it (``reason``)."""
 
-    def __init__(self, key: str, existing_id: int | None = None):
-        super().__init__(f"duplicate job for key '{key}'")
+    def __init__(self, key: str, existing_id: int | None = None, reason: str = ""):
+        super().__init__(f"duplicate job for key '{key}'" + (f": {reason}" if reason else ""))
         self.key = key
         self.existing_id = existing_id
+        self.reason = reason
 
 
 def normalize_payload(payload: dict) -> dict:
@@ -153,15 +206,91 @@ def dedupe_key_for(payload: dict) -> str | None:
 
 
 def _conflicts(key: str, active_keys: set[str]) -> bool:
-    """Does ``key`` collide with any active (queued/running) key?"""
-    if key in active_keys:
-        return True
+    """Does ``key`` collide with any of ``active_keys``? (See :func:`_blocker`.)"""
+    return _blocker(key, dict.fromkeys(active_keys, 0)) is not None
+
+
+def _blocker(key: str, held: dict[str, int]) -> int | None:
+    """Id of a job in ``held`` (concurrency key → job id) that ``key`` must not
+    run next to: the same key, and for rollouts a global one against any other
+    (a global rollout blocks on every rollout, a host rollout on a global one)."""
+    if key in held:
+        return held[key]
     if key.startswith("rollout:"):
-        # A global rollout blocks on any rollout; a host rollout blocks on a global one.
         if key == "rollout:all":
-            return any(k.startswith("rollout:") for k in active_keys)
-        return "rollout:all" in active_keys
-    return False
+            ids = [job_id for other, job_id in held.items() if other.startswith("rollout:")]
+            return max(ids) if ids else None
+        return held.get("rollout:all")
+    return None
+
+
+def _key_from_tag(tag: str | None) -> str | None:
+    """Concurrency key of a row that has none (a direct engine call, a row of a
+    plugin version before the queue), derived from its ``pipeline_type`` tag."""
+    tag = str(tag or "").strip().lower()
+    if not tag:
+        return None
+    if tag == "rollout":
+        return "rollout:all"
+    if tag.startswith(("infra_plan", "infra_apply")):
+        return "infra"
+    if tag == "adopt_host":
+        return "adopt_host:scope:all"
+    if tag == "repo_sync" or tag.split(":", 1)[0] in ("rollout", "single_service", *_HOST_SCOPED):
+        return tag
+    return None
+
+
+#: MariaDB advisory lock that serialises enqueue and claim (JobQueue._queue_lock).
+_QUEUE_LOCK = "iac_orchestrator_queue"
+#: Appended to the step of a queued job that absorbed a further, identical trigger.
+_COALESCED_NOTE = " (+ newer trigger)"
+#: How many candidates one claim looks at to find a job whose target is free.
+_CLAIM_SCAN = 200
+
+#: Payload keys that say who asked and why — not what the job does.
+_INFORMATIONAL_KEYS = frozenset({"manual", "source", "source_pipeline_id", "project_path", "followup_of"})
+#: Payload keys that only decide WHEN a deploy may run (maintenance policy).
+_TIMING_KEYS = frozenset({"trigger", "force"})
+
+
+def _work_of(payload: dict | None) -> str:
+    """What a job would DO, independent of who asked and of when it may run:
+    type, targets, branch, limit and mode (dry-run, approve, skip flags, the
+    reviewed plan)."""
+    core = {k: v for k, v in (payload or {}).items()
+            if k not in _INFORMATIONAL_KEYS and k not in _TIMING_KEYS
+            and not (v is None or v is False or v == "")}
+    return json.dumps(core, sort_keys=True, default=str)
+
+
+def covers(queued: dict | None, incoming: dict | None) -> bool:
+    """Does a job that is queued and has NOT started make ``incoming`` redundant?
+
+    Yes only when it does exactly the same work in the same mode (:func:`_work_of`)
+    and is not held back by a maintenance window the incoming trigger would not
+    wait for (a policy-governed job does not cover a "run now" trigger; the other
+    way round it does). Anything else — a dry-run next to a real run, another
+    branch or limit, an approved next to an unapproved run — is never merged
+    (audit OC-05): a queued job must not end up doing more, or something else,
+    than its own trigger asked for, and nothing is ever written into its payload.
+    """
+    from .maintenance_resolver import policy_applies
+
+    if _work_of(queued) != _work_of(incoming):
+        return False
+    return (not policy_applies(queued)) or policy_applies(incoming)
+
+
+def _stored_payload(raw: str | None) -> dict | None:
+    """A stored payload as this plugin version would run it; ``None`` when it
+    cannot be compared (unreadable, or not valid any more)."""
+    from .job_payload import validate_structure
+
+    try:
+        return validate_structure(json.loads(raw))
+    except Exception:
+        return None
 
 
 def db_tag_for(payload: dict) -> str:
@@ -268,36 +397,38 @@ class JobQueue:
                                 raise
 
     # ----------------------------------------------------------------- enqueue
-    def active_keys(self, session=None) -> set[str]:
-        own = session is None
-        session = session or self._session()
-        if not session:
-            return set()
-        try:
-            rows = session.execute(
-                select(IaCJob.dedupe_key).where(IaCJob.status.in_(_ACTIVE_STATUSES))
-            ).all()
-            return {r[0] for r in rows if r[0]}
-        finally:
-            if own:
-                session.close()
-
     def enqueue(self, payload: dict, *, requested_by: str | None = None) -> int:
-        """Insert a QUEUED job for ``payload``; raises :class:`DuplicateJob` on a
-        concurrency collision. Returns the job id (-1 without a database).
-
-        A SCHEDULED job for the same target absorbs the trigger instead (see
-        :meth:`enqueue_ex`); callers that need to know use ``enqueue_ex``.
+        """Queue ``payload`` and return the id of the job that will run it (-1
+        without a database): a new job, a follow-up behind a busy target, or the
+        existing job that absorbed the trigger. Raises :class:`DuplicateJob` when
+        the trigger cannot be queued. Callers that need the outcome use
+        :meth:`enqueue_ex`.
         """
         return self.enqueue_ex(payload, requested_by=requested_by).job_id
 
     def enqueue_ex(self, payload: dict, *, requested_by: str | None = None) -> EnqueueResult:
-        """:meth:`enqueue` with the coalesce/promote outcome.
+        """:meth:`enqueue` with the outcome.
 
-        * QUEUED/RUNNING job with the same key → :class:`DuplicateJob` (first wins, as before).
-        * SCHEDULED job with the same key → the newer trigger is **coalesced** into it
-          (payload replaced, ``start_time = now`` so the CI finds it via ``since_epoch``);
-          a trigger that must run now (UI deploy, ``force``) **promotes** it to QUEUED instead.
+        Per target (concurrency key) at most one job RUNS; a trigger that arrives
+        meanwhile is kept instead of dropped (audit OC-05 — it used to be dropped
+        after the caller had been told "accepted": a newer service commit was never
+        deployed, a controller push never published):
+
+        * a QUEUED job for the target that makes the trigger redundant (same work,
+          same mode — :func:`covers`) → the trigger is **coalesced** into it. That
+          job has not started, so it runs with what this trigger wants deployed;
+        * a SCHEDULED job for the target → coalesced (policy trigger: payload
+          replaced, ``start_time = now`` so the CI finds it via ``since_epoch``) or
+          **promoted** to QUEUED when this trigger must run now (UI deploy, ``force``);
+        * a QUEUED job for the target that does something else (dry-run vs. real
+          run, another branch, limit or mode) → :class:`DuplicateJob`. Nothing is
+          merged or replaced: a queued job never ends up doing more than its own
+          trigger asked for;
+        * the target is busy (a RUNNING job, or a conflicting rollout ahead in the
+          queue) → a QUEUED **follow-up** (``waiting_for``) that :meth:`claim_next`
+          leaves alone until that job is done. Not for a run that carries
+          ``approve`` — an approval is given for what was reviewed and is not parked
+          behind a job that may publish something else → :class:`DuplicateJob`, as before.
         """
         # The single point where a payload becomes a job row: nothing unvalidated
         # is ever stored (audit OS-09). Raises InvalidJobPayload.
@@ -305,18 +436,44 @@ class JobQueue:
 
         payload = validate_structure(payload)
         key = dedupe_key_for(payload)
-        session = self._session()
-        if not session:
-            return EnqueueResult(-1)
-        try:
-            if key and _conflicts(key, self.active_keys(session)):
-                existing = session.execute(
-                    select(IaCJob.id).where(IaCJob.dedupe_key == key,
-                                            IaCJob.status.in_(_ACTIVE_STATUSES))
+        who = f" by {requested_by}" if requested_by else ""
+        with self._queue_lock():
+            session = self._session()
+            if not session:
+                return EnqueueResult(-1)
+            try:
+                if not key:
+                    return EnqueueResult(self._insert(session, payload, None, requested_by, f"Queued{who}"))
+                now = datetime.now()
+
+                # 1. Queued, not started, identical in effect → nothing to add.
+                different: int | None = None
+                queued = session.execute(
+                    select(IaCJob.id, IaCJob.payload, IaCJob.current_step)
+                    .where(IaCJob.dedupe_key == key, IaCJob.status == STATUS_QUEUED)
                     .order_by(IaCJob.id.desc())
-                ).first()
-                raise DuplicateJob(key, existing[0] if existing else None)
-            if key:
+                ).all()
+                for queued_id, raw, step in queued:
+                    stored = _stored_payload(raw)
+                    if stored is None or not covers(stored, payload):
+                        different = int(queued_id) if different is None else different
+                        continue
+                    step = str(step or "Queued")
+                    res = session.execute(
+                        update(IaCJob).where(IaCJob.id == queued_id, IaCJob.status == STATUS_QUEUED)
+                        # start_time: a CI that polls with ``since_epoch`` finds the job
+                        # its trigger went into. The payload stays as it is.
+                        .values(start_time=now,
+                                current_step=(step if step.endswith(_COALESCED_NOTE) else step + _COALESCED_NOTE)[:250])
+                    )
+                    session.commit()
+                    if res.rowcount == 1:
+                        log.info("QUEUE: coalesced trigger for '%s' into queued job #%s", key, queued_id)
+                        return EnqueueResult(int(queued_id), coalesced=True)
+                    # Claimed in this very moment: it is RUNNING now and may already
+                    # have fetched its sources — a busy target, handled below.
+
+                # 2. Parked for its maintenance window.
                 scheduled = session.execute(
                     select(IaCJob.id).where(IaCJob.dedupe_key == key, IaCJob.status == STATUS_SCHEDULED)
                     .order_by(IaCJob.id.desc())
@@ -325,7 +482,6 @@ class JobQueue:
                     from .maintenance_resolver import policy_applies
 
                     sched_id = int(scheduled[0])
-                    now = datetime.now()
                     if policy_applies(payload):
                         session.execute(
                             update(IaCJob).where(IaCJob.id == sched_id, IaCJob.status == STATUS_SCHEDULED)
@@ -340,45 +496,106 @@ class JobQueue:
                         update(IaCJob).where(IaCJob.id == sched_id, IaCJob.status == STATUS_SCHEDULED)
                         .values(status=STATUS_QUEUED, not_before=None, start_time=now,
                                 payload=json.dumps(payload, default=str),
-                                current_step="Queued" + (f" by {requested_by}" if requested_by else "") + " (run now)")
+                                current_step=f"Queued{who} (run now)")
                     )
                     session.commit()
                     log.info("QUEUE: promoted scheduled job #%s for '%s' (run now)", sched_id, key)
                     return EnqueueResult(sched_id, promoted=True)
-            job = IaCJob(
-                pipeline_type=db_tag_for(payload),
-                status=STATUS_QUEUED,
-                progress=0,
-                current_step="Queued" + (f" by {requested_by}" if requested_by else ""),
-                logs="[]",
-                pending_tasks="[]",
-                payload=json.dumps(payload, default=str),
-                dedupe_key=key,
-                requested_by=(str(requested_by)[:100] if requested_by else None),
-            )
-            session.add(job)
-            session.commit()
-            session.refresh(job)
-            return EnqueueResult(int(job.id))
-        except DuplicateJob:
-            session.rollback()
-            raise
-        except Exception:
-            session.rollback()
-            raise
-        finally:
-            session.close()
+
+                # 3. Queued, but it does something else: first wins, nothing is merged.
+                if different is not None:
+                    raise DuplicateJob(key, different,
+                                       "a queued job for this target does something else (mode, branch or limit)")
+
+                # 4. Busy target → wait behind it instead of being dropped.
+                blocker = _blocker(key, self._held_keys(session, STATUS_RUNNING))
+                if blocker is None:
+                    # Only a conflicting rollout can be left here (global vs. host).
+                    blocker = _blocker(key, self._held_keys(session, STATUS_QUEUED))
+                if blocker is not None:
+                    if payload.get("approve"):
+                        raise DuplicateJob(key, blocker, "an approved run is never queued behind another job")
+                    payload["followup_of"] = blocker
+                    job_id = self._insert(session, payload, key, requested_by,
+                                          f"Queued{who} — waiting for job #{blocker} (same target)")
+                    log.info("QUEUE: job #%s for '%s' queued as follow-up of job #%s", job_id, key, blocker)
+                    return EnqueueResult(job_id, waiting_for=blocker)
+
+                return EnqueueResult(self._insert(session, payload, key, requested_by, f"Queued{who}"))
+            except Exception:
+                session.rollback()
+                raise
+            finally:
+                session.close()
+
+    @staticmethod
+    def _insert(session, payload: dict, key: str | None, requested_by: str | None, step: str) -> int:
+        job = IaCJob(
+            pipeline_type=db_tag_for(payload),
+            status=STATUS_QUEUED,
+            progress=0,
+            current_step=step[:250],
+            logs="[]",
+            pending_tasks="[]",
+            payload=json.dumps(payload, default=str),
+            dedupe_key=key,
+            requested_by=(str(requested_by)[:100] if requested_by else None),
+        )
+        session.add(job)
+        session.commit()
+        session.refresh(job)
+        return int(job.id)
+
+    @staticmethod
+    def _held_keys(session, *statuses: str) -> dict[str, int]:
+        """Concurrency key → id of the newest job in ``statuses`` that holds it."""
+        rows = session.execute(
+            select(IaCJob.id, IaCJob.dedupe_key, IaCJob.pipeline_type)
+            .where(IaCJob.status.in_(statuses)).order_by(IaCJob.id)
+        ).all()
+        held: dict[str, int] = {}
+        for job_id, key, tag in rows:
+            key = key or _key_from_tag(tag)
+            if key:
+                held[key] = int(job_id)
+        return held
+
+    @contextmanager
+    def _queue_lock(self):
+        """Serialise enqueue and claim across instances (MariaDB ``GET_LOCK`` through
+        the core; nothing on SQLite or on a core without it). It only narrows the
+        races: every decision taken under it is also a conditional UPDATE, and a
+        job that is still claimed next to a conflicting one is handed back to the
+        queue by the engine's dispatch guard. So no lock is never fatal."""
+        with ExitStack() as stack:
+            lock = getattr(db_instance, "advisory_lock", None)
+            if callable(lock):
+                try:
+                    try:
+                        cm = lock(_QUEUE_LOCK, timeout=10)
+                    except TypeError:  # a core whose advisory_lock takes no timeout
+                        cm = lock(_QUEUE_LOCK)
+                    stack.enter_context(cm)
+                except Exception as exc:
+                    log.debug("QUEUE: advisory lock not taken (%s) — continuing without it", exc)
+            yield
 
     # ------------------------------------------------------------------- claim
     def claim_next(self, instance_id: str, incarnation: str | None = None) -> "Claim | None":
-        """Atomically move the oldest QUEUED job — or a SCHEDULED job whose
-        ``not_before`` is reached — to RUNNING owned by ``instance_id``.
+        """Atomically move the next runnable job to RUNNING owned by ``instance_id``:
+        a SCHEDULED job whose ``not_before`` is reached (oldest window first), else
+        the oldest QUEUED job — skipping every job whose target is busy.
+
+        Busy (audit OC-05): a RUNNING job holds the same concurrency key (or a
+        conflicting rollout key). Such a job is a follow-up and stays QUEUED until
+        the running one is done; a later candidate that conflicts with a waiting
+        one stays behind it, so the order among jobs for one target is kept.
+        Nothing is ever claimed next to a job it must not run next to.
 
         Two runners may race for the same row: the conditional UPDATE lets only
         one win (``rowcount == 1``); the loser retries with the next candidate.
-        Due SCHEDULED jobs come first (``not_before`` ascending), then QUEUED by id.
         ``not_before`` stays on the claimed row so the policy stage knows the job
-        is due and does not park it again.
+        is due.
 
         A claim is either returned to the caller or not made (audit OC-03): the
         payload is read *with* the candidate, so nothing has to be read after the
@@ -387,6 +604,10 @@ class JobQueue:
         row that carries it is ours and is returned, never left behind as
         "Claimed by …" with nobody executing it.
         """
+        with self._queue_lock():
+            return self._claim_next(instance_id, incarnation)
+
+    def _claim_next(self, instance_id: str, incarnation: str | None) -> "Claim | None":
         for _ in range(5):
             session = self._session()
             if not session:
@@ -394,8 +615,9 @@ class JobQueue:
             job_id, payload, token, update_sent = None, {}, uuid.uuid4().hex, False
             try:
                 now = datetime.now()
-                cand = session.execute(
-                    select(IaCJob.id, IaCJob.payload)
+                held = self._held_keys(session, STATUS_RUNNING)
+                rows = session.execute(
+                    select(IaCJob.id, IaCJob.payload, IaCJob.dedupe_key, IaCJob.pipeline_type)
                     .where(
                         (IaCJob.status == STATUS_QUEUED)
                         | ((IaCJob.status == STATUS_SCHEDULED) & (IaCJob.not_before <= now))
@@ -403,8 +625,19 @@ class JobQueue:
                     # NULLS FIRST portable across SQLite/MariaDB: due scheduled jobs
                     # (oldest window first) ahead of the plain FIFO queue.
                     .order_by(IaCJob.not_before.is_(None), IaCJob.not_before, IaCJob.id)
-                    .limit(1)
-                ).first()
+                    .limit(_CLAIM_SCAN)
+                ).all()
+                cand = None
+                for row in rows:
+                    key = row[2] or _key_from_tag(row[3])
+                    if key and _blocker(key, held) is not None:
+                        # Not now. Whatever conflicts with THIS waiting job waits
+                        # behind it (a global rollout is not overtaken for ever by
+                        # host rollouts that keep arriving).
+                        held.setdefault(key, int(row[0]))
+                        continue
+                    cand = row
+                    break
                 if not cand:
                     return None
                 job_id = int(cand[0])
@@ -607,6 +840,8 @@ class JobQueue:
                         progress=0, current_step="Scheduled",
                     )
                 )
+                if res.rowcount == 1:
+                    self._supersede_scheduled(session, job_id)
                 session.commit()
                 return res.rowcount == 1
             except Exception:
@@ -620,6 +855,28 @@ class JobQueue:
         except Exception as exc:
             log.error("QUEUE: park of job #%s failed: %s", job_id, exc)
             return False
+
+    @staticmethod
+    def _supersede_scheduled(session, job_id: int) -> None:
+        """One parked deploy per target. A follow-up that was queued while its
+        predecessor was still on its way into the window (RUNNING for the seconds
+        before the policy stage parked it) is parked as well — the newer trigger
+        wins, exactly as when it is coalesced into a SCHEDULED job at enqueue; the
+        older parked job is closed instead of deploying the target a second time."""
+        key = session.execute(select(IaCJob.dedupe_key).where(IaCJob.id == job_id)).scalar()
+        if not key:
+            return
+        older = [int(r[0]) for r in session.execute(
+            select(IaCJob.id).where(IaCJob.dedupe_key == key, IaCJob.status == STATUS_SCHEDULED,
+                                    IaCJob.id != job_id)).all()]
+        if not older:
+            return
+        session.execute(
+            update(IaCJob).where(IaCJob.id.in_(older), IaCJob.status == STATUS_SCHEDULED)
+            .values(status=STATUS_ABORTED, not_before=None, end_time=datetime.now(),
+                    current_step=f"Superseded by scheduled job #{job_id} (newer trigger for the same target)")
+        )
+        log.info("QUEUE: scheduled job(s) %s superseded by #%s (same target)", older, job_id)
 
     def promote(self, job_id: int, *, override: bool = True) -> bool:
         """SCHEDULED → QUEUED now ("run now"). ``override=True`` sets ``force`` in the
@@ -1544,6 +1801,8 @@ class JobWorker:
             self.ctx.log.error(f"WORKER: job #{job_id} crashed: {exc}")
         finally:
             self.queue.claims.pop(job_id, None)
+            # A follow-up may have been waiting for exactly this job.
+            self._wake.set()
 
     def _attended(self) -> set[int]:
         ids = set(self.running_ids)
