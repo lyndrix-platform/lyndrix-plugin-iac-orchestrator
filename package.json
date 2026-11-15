@@ -1,7 +1,7 @@
 {
   "name": "lyndrix-plugin-iac-orchestrator-ui",
   "private": true,
-  "version": "0.9.2",
+  "version": "1.7.0",
   "type": "module",
   "scripts": {
     "build": "vite build --config vite.ui.config.ts",

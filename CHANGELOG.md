@@ -5,12 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
-Proposed version: **1.7.0** (security and cluster audit 2026-11 plus the findings of the independent review; the
-manifest version is not bumped yet — the unreleased `feat/service-reconcile-1.7.0` then becomes 1.8.0). Minimum core
-unchanged (core 1.11.1 / API 1.13); newer core APIs are used only behind `getattr`. **The React bundle must be rebuilt
-before the tag** — the 1.6.1 bundle sends secret fields to `/settings/values`, which now answers 422 for the whole
-category.
+## [1.7.0] - 2026-11-15
+Security and cluster audit 2026-11, the findings of the independent review and the owner's decisions on OS-04, OS-05
+and OS-06. The unreleased `feat/service-reconcile-1.7.0` becomes 1.8.0. Minimum core unchanged (core 1.11.1 /
+API 1.13); newer core APIs are used only behind `getattr`. The React bundle must be rebuilt from this tree.
+No credential has to be changed for the upgrade: the existing webhook token keeps working for every purpose.
 
 ### Upgrade notes
 - **Runner images** outside `registry.gitlab.int.fam-feser.de/` and `ghcr.io/opentofu/opentofu` are refused at run
@@ -28,7 +27,17 @@ category.
   parked for the window; without a window each deploy emits `maintenance:window_missing` and a maintenance override on
   every target host. Define prod windows or decide the behaviour for fleet services before the rollout.
 - `POST /api/iac/infra/apply/gitlab` answers 404 unless `token_infra_apply_enabled` is set.
-- Rotate the credentials that were exposed through the monitoring sync (see Security, first item).
+- Recommendation, the owner decides: treat the credentials that went through the monitoring sync as exposed (see
+  Security, first item). The upgrade stops the exposure but does not invalidate them.
+- **Runner containers get the repositories read-only** (`runner_readonly_mounts`, default on; off restores the mounts
+  of 1.6.1). A playbook or role that writes into the checkout, or expects `.git` there, fails with "Read-only file
+  system" — test on staging before the rollout.
+- **Branch → target is enforced.** Only the catalog's prod branch of a service deploys to all its hosts; `dev`,
+  `*-dev` and `test` branches deploy to their stage only; any other branch is refused (HTTP 400 / refused job). A CI
+  project whose `PROD_BRANCH` differs from the catalog is refused too.
+- **A pending plan from before the upgrade cannot be approved** (HTTP 409) — run Check Env again.
+- **Jobs have a maximum runtime** of 6 h (`job_max_runtime_seconds`, 0 = off). Raise it before a longer rollout.
+- The NiceGUI page `/iac` needs `api:infra_apply`.
 - New database objects, created idempotently under the bootstrap lock: job columns `claim_token`,
   `owner_incarnation`, `heartbeat_utc`, `exec_state`, `requested_by`; table `iac_orchestrator_locks`; state row
   `rules_applied`.
@@ -51,6 +60,26 @@ category.
 - `GET /api/iac/health` returns only `{status, db_connected, runner_online}`; the token check is cached and off the
   event loop, and rejected calls are counted in the plugin health.
 - Directly mounted public routes are removed on disable/unload.
+- **One token per purpose, backward compatible (OS-04).** New secret slots `gitlab_hook_token`,
+  `gitlab_service_ci_token`, `gitlab_controller_ci_token` (credentials tier). While a slot is empty the shared
+  `gitlab_webhook_token` keeps authorising that purpose (deprecation line once per purpose and hour, hint
+  `webhook_tokens` in the plugin health). With a slot set only that token works for its purpose; the service-CI token
+  forces the prod branch and the hook token can no longer start a deployment with a `pipeline` body. Tokens are
+  compared in constant time on bytes. After 20 rejected calls per source address in 60 s further rejected calls get
+  429 with `Retry-After`; a valid token always passes. How to create and store the tokens:
+  `documentation.md` → "Webhook-Tokens je Zweck".
+- **Branch → target mapping (OS-05).** See the upgrade notes; payload flag `require_prod_branch`.
+- **Approving a pending plan applies the plan that was reviewed, or nothing (OS-12).** The controller commit and a
+  plan digest are stored with the pending plan; if the controller moved or the fresh plan differs, nothing is applied
+  and a new pending plan is created. `GET /infra/pending-plan` gains `controller_sha` and `approvable`.
+- **The generator and the render script no longer see the core's environment, and the bundled renderer runs in a
+  Jinja2 sandbox (OS-06).** The plugin's git calls trust one repository per command and run no hooks, fsmonitor or
+  credential helper; `safe.directory=*` is no longer written to the global git config (an existing entry stays).
+- **Runner containers (OS-06):** Ansible gets `git_repos` and `services` read-only with `.git` masked, tofu gets only
+  its per-job run dir read-write and the provider cache read-only (falls back to a run without the cache when a
+  provider is missing), plus a scratch dir per job at `/data/scratch`.
+- The NiceGUI page, its settings panel and its triggers check permissions; triggers carry the session user's
+  entitlements and name, and the abort button uses the API stop path (OS-17).
 
 ### Changed
 - **A dry-run is a property of the job:** Terraform only plans and Ansible runs with `--check`, whatever `approve` or
@@ -97,7 +126,18 @@ category.
   token, so a successful job is no longer flipped to FAILED by the recovery check.
 - Teardown removes only the public routes of its own load, so a late teardown on core 1.11.1 cannot delete the routes
   of a version restored by the core's auto-revert (review R7).
-- The suite has 410 tests (124 on 1.6.1) and passes on core 1.11.1 and on the planned core 1.12.0.
+- **No database, Vault or large-YAML work on the runner's event loop (review C3, OC-08).** Off-loop work runs in
+  the plugin's own 12-thread pool, so hanging calls cannot starve the core's cluster heartbeat; progress writes are
+  coalesced and a terminal write is never overtaken by a late progress write.
+- **A job cannot stay RUNNING for ever (review C4).** After `job_max_runtime_seconds` the job is stopped and closed
+  FAILED `max_runtime: …`; if the runner does not confirm within 120 s the job is closed with a note that containers
+  may still be running and its locks stay held for the container grace. New notification `job_timed_out`.
+- The rule-engine marker is a compare-and-set and only moves forward (review C6).
+- Job-log lines survive a database error (buffer of 20 000 lines, a "[SYSTEM] [WARNING] N log line(s) are missing"
+  marker when it overflowed); log age uses UTC; enqueue retries on 1020/1205/1213 (review C7).
+- The abort endpoint keeps jobs whose containers could not be stopped attended and names them (`unstopped_jobs`, shown
+  in the UI toast); a late teardown stops only its own service.
+- The suite has 547 tests (124 on 1.6.1) and passes on core 1.11.1 and on the planned core 1.12.0.
 
 ## [1.6.1] - 2026-11-11
 Forward-port of the complete 1.5.x hotfix line (1.5.1–1.5.7, core < 1.11) plus the runner-presence fix from the 2026-11-11 incident. Requires core ≥ 1.11.0 (API 1.13) like 1.6.0; no schema migration (the queue columns are added idempotently by `JobQueue.ensure_schema` as before).
