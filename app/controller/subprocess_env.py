@@ -70,3 +70,35 @@ def render_env() -> dict:
 def git_env(extra: dict | None = None) -> dict:
     """Environment of a git process: no prompt, plus trust anchors and proxies."""
     return minimal_env(allow=GIT_VARIABLES, extra={"GIT_TERMINAL_PROMPT": "0", **(extra or {})})
+
+
+def git_safety_args(repo) -> list[str]:
+    """``-c …`` options for a git command the plugin runs in ``repo`` (audit
+    OS-06 D); they go right after ``git``.
+
+    * ``safe.directory=<this repository>`` — for this one command. The plugin
+      used to write ``safe.directory=*`` into the global git config of the core
+      process' user: every repository on the host counted as trusted, for every
+      later git call of anyone.
+    * No hooks, no fsmonitor program, no credential helper, no ``ext::``
+      transport: programs a repository's own ``.git/config`` or ``.git/hooks``
+      could name. This narrows what a tampered checkout can make git execute; it
+      is NOT a complete defence against a hostile ``.git/config`` (filters,
+      for instance) — the defence is that runner containers cannot write the
+      checkouts at all (read-only mounts, setting ``runner_readonly_mounts``).
+    """
+    from pathlib import Path
+
+    given = str(repo)
+    paths = [given]
+    try:
+        resolved = str(Path(repo).resolve())
+        if resolved != given:
+            paths.append(resolved)                 # git compares with the real path
+    except OSError:
+        pass
+    args: list[str] = []
+    for path in paths:
+        args += ["-c", f"safe.directory={path}"]
+    return args + ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
+                   "-c", "credential.helper=", "-c", "protocol.ext.allow=never"]

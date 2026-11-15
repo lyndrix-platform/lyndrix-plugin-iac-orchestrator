@@ -1,22 +1,14 @@
 """inventory_state publisher (1.5.3) against real git repos (bare remote + clones).
 
-``state_publisher`` is stdlib-only, so it is loaded straight from its file —
-no lyndrix-core on the path needed.
+Loaded through the plugin package (it shares the git environment and the
+per-command safety options with the other git callers, ``subprocess_env``).
 """
 import asyncio
-import importlib.util
 import subprocess
-import sys
-from pathlib import Path
 
 import pytest
 
-PLUGIN_ROOT = Path(__file__).resolve().parents[1]
-_spec = importlib.util.spec_from_file_location(
-    "iac_state_publisher", PLUGIN_ROOT / "app" / "controller" / "state_publisher.py")
-sp = importlib.util.module_from_spec(_spec)
-sys.modules[_spec.name] = sp   # dataclasses resolve string annotations via sys.modules
-_spec.loader.exec_module(sp)
+from iac_plugin.app.controller import state_publisher as sp
 
 CTRL_SHA = "0123456789abcdef0123456789abcdef01234567"
 

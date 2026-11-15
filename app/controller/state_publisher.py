@@ -34,6 +34,8 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .subprocess_env import git_env, git_safety_args
+
 log = logging.getLogger("IaC:Engine")
 
 #: Local ignore rules (``.git/info/exclude``): terraform provider cache only.
@@ -73,8 +75,7 @@ class PublishResult:
 
 def credential_env(token: str | None) -> dict:
     """Process env that supplies ``token`` as an HTTP Basic header (core-compatible)."""
-    env = os.environ.copy()
-    env["GIT_TERMINAL_PROMPT"] = "0"
+    env = git_env()
     if token:
         auth = base64.b64encode(f"oauth2:{token}".encode()).decode()
         env["GIT_CONFIG_COUNT"] = "1"
@@ -85,7 +86,7 @@ def credential_env(token: str | None) -> dict:
 
 def _ssh_env(private_key: str, key_path: str) -> dict:
     """Process env for an SSH remote (mirrors the core: pinned known_hosts, batch)."""
-    env = os.environ.copy()
+    env = git_env()
     known_hosts = os.environ.get(
         "GIT_KNOWN_HOSTS_FILE",
         os.path.join(os.environ.get("GIT_STORAGE_DIR", "/data/storage/git_repos"), ".ssh", "known_hosts"))
@@ -99,9 +100,11 @@ def _ssh_env(private_key: str, key_path: str) -> dict:
 
 
 async def _git(repo: Path, *args: str, env: dict | None = None) -> tuple[int, str]:
+    # This repository only, no hooks/helpers from its config, and never the
+    # core's environment (audit OS-06 D).
     proc = await asyncio.create_subprocess_exec(
-        "git", "-c", "safe.directory=*", *args,
-        cwd=str(repo), env=env,
+        "git", *git_safety_args(repo), *args,
+        cwd=str(repo), env=env if env is not None else git_env(),
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
     )
     out, _ = await proc.communicate()

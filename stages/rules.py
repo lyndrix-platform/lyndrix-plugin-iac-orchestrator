@@ -7,6 +7,7 @@ from core.logger import get_logger
 from .base import BaseStage
 from ..utils import StageResult
 from ..app.controller.offloop import off_loop
+from ..app.controller.subprocess_env import git_env, git_safety_args
 from .ansible import AnsiblePlaybookStage, AsyncBulkRolloutStage
 
 log = get_logger("IaC:Engine:Rules")
@@ -106,8 +107,8 @@ class DynamicRuleExecutionStage(BaseStage):
     async def _git(self, engine, *args) -> tuple[int, str]:
         repo = engine.base_git_dir / "inventory_state"
         proc = await asyncio.create_subprocess_exec(
-            "git", *args,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, cwd=repo,
+            "git", *git_safety_args(repo), *args,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, cwd=repo, env=git_env(),
         )
         out, err = await proc.communicate()
         return proc.returncode, (out.decode() if proc.returncode == 0 else err.decode())

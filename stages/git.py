@@ -9,6 +9,7 @@ from core.logger import get_logger
 from .base import BaseStage
 from ..utils import StageResult
 from ..app.controller.offloop import off_loop
+from ..app.controller.subprocess_env import git_env, git_safety_args
 
 log = get_logger("IaC:Engine:Git")
 
@@ -124,7 +125,9 @@ class CloneServiceRepoStage(BaseStage):
         # Catalog YAML and three Vault round trips per service — a bulk sync does
         # this for every service of the catalog. Off the loop (audit OC-08 B3/B6).
         repo_url, svc_token, ssh_key = await off_loop(self._resolve_source, engine)
-        auth_env = os.environ.copy()
+        # git and its ssh/curl get what they need to reach the remote — not the
+        # core's environment (audit OS-06 D).
+        auth_env = git_env()
         # Supply the HTTPS token per-invocation via an HTTP auth header instead of
         # embedding it in the remote URL. Baking the token into the origin URL (the
         # old behaviour) persisted it in .git/config at clone time, so a *rotated*
@@ -144,9 +147,13 @@ class CloneServiceRepoStage(BaseStage):
                 f.write(ssh_key.replace('\\n', '\n').strip() + '\n')
             os.chmod(key_path, 0o600)
             auth_env["GIT_SSH_COMMAND"] = f"ssh -i {key_path} -o StrictHostKeyChecking=no"
+        # Every git command below trusts THIS checkout only and runs no program
+        # its config or hooks name (see git_safety_args).
+        safety = git_safety_args(target_dir)
+
         async def _run_git(cmd, cwd=None):
             proc = await asyncio.create_subprocess_exec(
-                *cmd, cwd=cwd, env=auth_env,
+                cmd[0], *safety, *cmd[1:], cwd=cwd, env=auth_env,
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
             )
             out, _ = await proc.communicate()
@@ -157,9 +164,12 @@ class CloneServiceRepoStage(BaseStage):
             # current user — the NFS/bind-mounted service dirs are owned by a squashed
             # uid, so every fetch failed with "detected dubious ownership", which used to
             # fall through to the silent stale fallback below and deploy a month-old
-            # checkout. Mark all repos safe up front (idempotent → single '*' entry),
-            # mirroring what the core git-manager already does for the IaC repos.
-            await _run_git(["git", "config", "--global", "--replace-all", "safe.directory", "*"])
+            # checkout. The checkout is marked safe per command (``-c
+            # safe.directory=<this checkout>`` in ``safety``). This stage used to
+            # write ``safe.directory=*`` into the GLOBAL git config instead — every
+            # repository on the host trusted, for every later git call (audit OS-06
+            # D). An entry an earlier version wrote is left alone: the core's own
+            # git service may rely on its global configuration.
             if (target_dir / ".git").exists():
                 git_cmds = [
                     # Reset origin to the clean (token-less) URL first: repos cloned by
