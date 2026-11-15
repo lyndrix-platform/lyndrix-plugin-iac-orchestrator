@@ -447,6 +447,74 @@ class JobDatabase:
             if session: session.close()
                 
                 
+    # -- rule-engine marker (audit OC-06) ---------------------------------------------
+    #: ``iac_orchestrator_state`` id of the marker.
+    RULES_MARKER = "rules_applied"
+
+    def rules_marker(self) -> dict | None:
+        """The inventory_state commit up to which the rule engine has acted:
+        ``{"sha", "failures", "last_error", "job_id"}``; ``None`` when none was
+        recorded yet. ``failures`` counts the rule stages that failed since the
+        marker last moved.
+
+        RAISES on a database error (unlike :meth:`get_state`): "unknown" must
+        never look like "none" — the caller would fall back to evaluating only
+        its own commit and move the marker past changes nobody acted on.
+        """
+        session = self._get_session()
+        if not session:
+            raise RuntimeError("the job database is not connected")
+        try:
+            rec = session.query(IaCState).filter(IaCState.id == self.RULES_MARKER).first()
+            if rec is None or not rec.state_data:
+                return None
+            data = json.loads(rec.state_data)
+            sha = str((data or {}).get("sha") or "")
+            if not sha:
+                return None
+            return {"sha": sha, "failures": int(data.get("failures") or 0),
+                    "last_error": str(data.get("last_error") or ""), "job_id": data.get("job_id")}
+        finally:
+            session.close()
+
+    def set_rules_marker(self, sha: str, *, job_id: int | None = None, failures: int = 0,
+                         last_error: str = "", only_if_absent: bool = False) -> bool:
+        """Write the marker; raises on a database error. ``only_if_absent``
+        initialises it (atomic by the primary key) and returns False when one
+        exists already."""
+        from sqlalchemy.exc import IntegrityError
+
+        data = json.dumps({"sha": sha, "failures": int(failures), "last_error": str(last_error or "")[:500],
+                           "job_id": job_id, "at": datetime.now().isoformat(timespec="seconds")})
+        session = self._get_session()
+        if not session:
+            raise RuntimeError("the job database is not connected")
+        try:
+            rec = session.query(IaCState).filter(IaCState.id == self.RULES_MARKER).first()
+            if rec is not None:
+                if only_if_absent:
+                    return False
+                rec.state_data, rec.commit_hash = data, sha[:40]
+                session.commit()
+                return True
+            try:
+                session.add(IaCState(id=self.RULES_MARKER, state_data=data, commit_hash=sha[:40]))
+                session.commit()
+                return True
+            except IntegrityError:          # a peer created it between the read and the insert
+                session.rollback()
+                if only_if_absent:
+                    return False
+                session.query(IaCState).filter(IaCState.id == self.RULES_MARKER).update(
+                    {"state_data": data, "commit_hash": sha[:40]}, synchronize_session=False)
+                session.commit()
+                return True
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
     def update_progress(self, job_id: int, progress: int = None, current_step: str = None, *,
                         fenced: bool = True, exec_state: dict | None = None) -> bool:
         """Live updates the progress bar and current action text.

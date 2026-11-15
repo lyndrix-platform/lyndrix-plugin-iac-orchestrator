@@ -11,6 +11,10 @@ from .ansible import AnsiblePlaybookStage, AsyncBulkRolloutStage
 log = get_logger("IaC:Engine:Rules")
 
 
+class _MarkerUnavailable(RuntimeError):
+    """The rule-engine marker could not be read (database error)."""
+
+
 class DynamicRuleExecutionStage(BaseStage):
     """Maps changes in the generated ``inventory_state`` repo to precisely-scoped
     deploy actions, driven by ``config_engine/pipeline_rules.yml``.
@@ -33,15 +37,44 @@ class DynamicRuleExecutionStage(BaseStage):
 
       ``limit`` may contain capture variables ``{site}`` / ``{stage}`` derived
       from the changed path (e.g. ``onprem/dev/...`` -> site=onprem, stage=dev).
+
+    **Which changes are evaluated (audit OC-06).** Not only the commit this
+    pipeline published: everything between the *marker* — the inventory_state
+    commit of the last rule stage that completed (``JobDatabase.rules_marker``)
+    — and the state this pipeline pinned in its prefix. A pipeline that failed
+    between publishing and its rule stage used to take its rule actions with it
+    (baseline roles, service rollouts, Terraform plans for that controller
+    change never ran, later pipelines saw "no changes"); now the next pipeline
+    that runs the rule engine picks them up.
+
+    * The marker moves only when the stage completed and the job is not a
+      dry-run. The MODE of every action is decided exactly as before (job
+      dry-run, ``auto_apply``, Terraform ``mode: plan``) — catching up never
+      turns a check into a real run.
+    * One rule stage at a time (``engine.rules_lock``); a waiter re-reads the
+      marker and usually finds nothing left to do.
+    * A backlog whose evaluation failed :data:`MAX_BACKLOG_ATTEMPTS` times is
+      given up loudly (job log + notification with the files) instead of failing
+      every later pipeline for ever: the stage then evaluates its own commit
+      only — the behaviour before this change.
+    * Without a marker (engine used without the job database) or when the
+      marker is not part of the history any more, the stage evaluates its own
+      commit only, as before.
     """
+
+    #: Failed evaluations of one backlog before it is given up.
+    MAX_BACKLOG_ATTEMPTS = 3
 
     def __init__(self, pipeline_type: str):
         super().__init__("Dynamic Rule-Based Execution")
         self.pipeline_type = pipeline_type
-        # Commit to evaluate. run() pins it to the SHA this pipeline's
-        # PublishInventoryStateStage created, so a commit pushed by a concurrent
+        # Commit to evaluate. run() pins it to the state this pipeline's
+        # PublishInventoryStateStage saw, so a commit pushed by a concurrent
         # pipeline in between never changes which diff these rules act on.
         self._ref = "HEAD"
+        # Old side of the diff: the marker; ``None`` = the parent of ``_ref``
+        # (the pipeline's own commit only).
+        self._base: str | None = None
 
     # ------------------------------------------------------------------ utils
     @staticmethod
@@ -69,10 +102,18 @@ class DynamicRuleExecutionStage(BaseStage):
         out, err = await proc.communicate()
         return proc.returncode, (out.decode() if proc.returncode == 0 else err.decode())
 
+    def _old(self, path: str) -> str:
+        """``<rev>:<path>`` of the state the changes are measured against."""
+        return f"{self._base or self._ref + '~1'}:{path}"
+
     async def _get_changed_files(self, engine) -> list[str]:
-        rc, out = await self._git(
-            engine, "diff-tree", "--no-commit-id", "--name-only", "-r", self._ref
-        )
+        if self._base:
+            # --no-renames: list both paths of a moved file, like diff-tree below.
+            rc, out = await self._git(engine, "diff", "--name-only", "--no-renames", self._base, self._ref)
+        else:
+            rc, out = await self._git(
+                engine, "diff-tree", "--no-commit-id", "--name-only", "-r", self._ref
+            )
         if rc != 0:
             if "bad object HEAD" in out:
                 return []
@@ -118,7 +159,7 @@ class DynamicRuleExecutionStage(BaseStage):
         rc_new, new_raw = await self._git(engine, "show", f"{self._ref}:{tfvars_file}")
         if rc_new != 0:
             return []
-        rc_old, old_raw = await self._git(engine, "show", f"{self._ref}~1:{tfvars_file}")
+        rc_old, old_raw = await self._git(engine, "show", self._old(tfvars_file))
         try:
             new_containers = (json.loads(new_raw) or {}).get("containers", {}) or {}
         except Exception:
@@ -164,8 +205,9 @@ class DynamicRuleExecutionStage(BaseStage):
         return result
 
     async def _changed_baseline_roles(self, engine, inventory_file: str) -> dict:
-        """Diff per-host ``baseline_roles`` between HEAD~1 and HEAD of the generated
-        inventory. Returns ``{host: [added_roles]}`` for hosts that *gained* a role,
+        """Diff per-host ``baseline_roles`` between the old side (marker, or the
+        parent commit) and the evaluated commit of the generated inventory.
+        Returns ``{host: [added_roles]}`` for hosts that *gained* a role,
         so a single newly-assigned role deploys only that role on only that host."""
         rc_new, new_raw = await self._git(engine, "show", f"{self._ref}:{inventory_file}")
         if rc_new != 0:
@@ -175,7 +217,7 @@ class DynamicRuleExecutionStage(BaseStage):
         except Exception:
             return {}
         old_inv = {}
-        rc_old, old_raw = await self._git(engine, "show", f"{self._ref}~1:{inventory_file}")
+        rc_old, old_raw = await self._git(engine, "show", self._old(inventory_file))
         if rc_old == 0:
             try:
                 old_inv = yaml.safe_load(old_raw) or {}
@@ -387,11 +429,161 @@ class DynamicRuleExecutionStage(BaseStage):
                     return res
             return StageResult(True, "Connectivity actions completed.")
 
-        if context.get("inventory_state_commit_status") == "no_changes":
-            log.info("No state changes generated. Bypassing execution.")
-            return StageResult(True, "No state changes generated. Bypassing execution.")
+        return await self._run_for_pending_changes(engine, context, rules_config)
 
-        self._ref = str(context.get("inventory_state_commit_sha") or "HEAD")
+    # ------------------------------------------------------ pending changes
+    _BYPASS = "No state changes generated. Bypassing execution."
+
+    async def _run_for_pending_changes(self, engine, context: dict, rules_config: dict) -> StageResult:
+        """Decide which state changes this run evaluates, evaluate them, and move
+        the marker (see the class docstring)."""
+        ref = str(context.get("inventory_state_head_sha") or "")
+        db = getattr(engine, "db", None)
+        if not ref or not callable(getattr(db, "rules_marker", None)):
+            return await self._run_own_commit(engine, context, rules_config)
+
+        try:
+            if await self._nothing_pending(engine, db, ref):
+                log.info(self._BYPASS)
+                return StageResult(True, self._BYPASS)
+            lock = getattr(engine, "rules_lock", None)
+            if lock is None:
+                return await self._run_tracked(engine, context, rules_config, db, ref)
+            async with lock(context.get("job_id")):
+                return await self._run_tracked(engine, context, rules_config, db, ref)
+        except _MarkerUnavailable as exc:
+            # Never guess: evaluating "only our own commit" here would move the
+            # marker past changes nobody acted on.
+            return StageResult(False, f"The rule-engine marker could not be read ({exc}) — the pending state "
+                                      "changes were NOT evaluated. They stay pending; re-trigger the pipeline.")
+
+    async def _read_marker(self, db) -> dict | None:
+        try:
+            return await asyncio.to_thread(db.rules_marker)
+        except Exception as exc:
+            raise _MarkerUnavailable(str(exc)) from exc
+
+    async def _is_ancestor(self, engine, older: str, newer: str) -> bool | None:
+        """True/False, ``None`` when git cannot tell (unknown object)."""
+        rc, _out = await self._git(engine, "merge-base", "--is-ancestor", older, newer)
+        return True if rc == 0 else (False if rc == 1 else None)
+
+    async def _nothing_pending(self, engine, db, ref: str) -> bool:
+        """Has the marker reached (or passed) the state this run pinned?"""
+        marker = await self._read_marker(db)
+        if marker is None:
+            return False
+        return marker["sha"] == ref or bool(await self._is_ancestor(engine, ref, marker["sha"]))
+
+    async def _run_tracked(self, engine, context: dict, rules_config: dict, db, ref: str) -> StageResult:
+        """Evaluate marker..ref. Called with the rules lock held."""
+        dry_run = bool(context.get("dry_run"))
+        job_id = context.get("job_id")
+        marker = await self._read_marker(db)
+        if marker is not None and (marker["sha"] == ref or await self._is_ancestor(engine, ref, marker["sha"])):
+            log.info("The rule engine already evaluated these state changes (another pipeline was faster).")
+            return StageResult(True, self._BYPASS)
+
+        base = marker["sha"] if marker else None
+        if base and not await self._is_ancestor(engine, base, ref):
+            log.warning(f"Rule engine: marker inventory_state@{base[:12]} is not part of the history of "
+                        f"{ref[:12]} (history rewritten or repository replaced) — evaluating this pipeline's "
+                        "own commit only.")
+            base = None
+        if base is None:
+            # No usable marker: exactly the behaviour before the marker existed.
+            res = await self._run_own_commit(engine, context, rules_config)
+            if res.success and not dry_run:
+                await self._advance(db, ref, job_id)
+            return res
+
+        failures = int(marker.get("failures") or 0)
+        if failures >= self.MAX_BACKLOG_ATTEMPTS and not dry_run:
+            skipped_to = await self._give_up_backlog(engine, context, db, marker)
+            if skipped_to:
+                base, failures = skipped_to, 0
+                if base == ref:
+                    return StageResult(True, self._BYPASS)
+
+        self._ref, self._base = ref, base
+        log.info(f"Rule engine: evaluating state changes inventory_state@{base[:12]}..{ref[:12]}"
+                 + ("" if base == context.get("inventory_state_base_sha")
+                    else " (includes changes of earlier pipelines whose rule stage did not complete)"))
+        try:
+            res = await self._evaluate(engine, context, rules_config)
+        except Exception as exc:
+            if not dry_run:
+                await self._note_failure(db, base, failures, f"{type(exc).__name__}: {exc}", job_id)
+            raise
+        if dry_run:
+            # A dry-run changes nothing — not the marker either: the same changes
+            # are evaluated again by the next real run.
+            log.info("Dry-run: the evaluated state changes stay pending for the next real run.")
+        elif res.success:
+            await self._advance(db, ref, job_id)
+        else:
+            await self._note_failure(db, base, failures, res.message, job_id)
+            log.error(f"Rule engine: the state changes inventory_state@{base[:12]}..{ref[:12]} stay pending "
+                      f"(failed evaluation {failures + 1}/{self.MAX_BACKLOG_ATTEMPTS}); the next pipeline that "
+                      "runs the rule engine evaluates them again.")
+        return res
+
+    @staticmethod
+    async def _advance(db, ref: str, job_id) -> None:
+        try:
+            await asyncio.to_thread(db.set_rules_marker, ref, job_id=job_id)
+        except Exception as exc:
+            # The actions ran. Without the marker the next pipeline evaluates the
+            # same changes once more (idempotent) — that is not worth failing this job.
+            log.error(f"Rule engine: marker not moved to inventory_state@{ref[:12]} ({exc}); the next pipeline "
+                      "evaluates these state changes again.")
+
+    @staticmethod
+    async def _note_failure(db, base: str, failures: int, error: str, job_id) -> None:
+        try:
+            await asyncio.to_thread(db.set_rules_marker, base, job_id=job_id, failures=failures + 1,
+                                    last_error=str(error or ""))
+        except Exception as exc:
+            log.warning(f"Rule engine: could not record the failed evaluation: {exc}")
+
+    async def _give_up_backlog(self, engine, context: dict, db, marker: dict) -> str | None:
+        """The changes earlier pipelines left behind failed too often: skip them —
+        announced, with the files — and continue from the state before this
+        pipeline's own commit. Returns that state, ``None`` when there is nothing
+        to separate from the own commit (then the caller evaluates once more)."""
+        base = marker["sha"]
+        own_base = str(context.get("inventory_state_base_sha") or "")
+        if not own_base or own_base == base or not await self._is_ancestor(engine, base, own_base):
+            return None
+        rc, out = await self._git(engine, "diff", "--name-only", "--no-renames", base, own_base)
+        files = [f for f in out.splitlines() if f and not f.startswith(".terraform_runs/")] if rc == 0 else []
+        shown = ", ".join(files[:20]) + (f" (+{len(files) - 20} more)" if len(files) > 20 else "")
+        text = (f"The rule actions for the state changes inventory_state@{base[:12]}..{own_base[:12]} failed "
+                f"{marker.get('failures')} times and are NOT retried any more. Last error: "
+                f"{marker.get('last_error') or 'unknown'}. Changed files: {shown or 'none'}. "
+                "Apply them by hand (baseline roles, service rollout, Terraform plan); later state changes "
+                "are evaluated normally.")
+        log.error(f"Rule engine: {text}")
+        notify = getattr(engine, "_notify", None)
+        if callable(notify):
+            try:
+                notify("Rule actions skipped", text[:900], "negative", broadcast=True)
+            except Exception as exc:
+                log.debug(f"give-up notification not sent: {exc}")
+        await asyncio.to_thread(db.set_rules_marker, own_base, job_id=context.get("job_id"))
+        return own_base
+
+    async def _run_own_commit(self, engine, context: dict, rules_config: dict) -> StageResult:
+        """Evaluate the commit this pipeline published — nothing else."""
+        if context.get("inventory_state_commit_status") == "no_changes":
+            log.info(self._BYPASS)
+            return StageResult(True, self._BYPASS)
+        self._ref, self._base = str(context.get("inventory_state_commit_sha") or "HEAD"), None
+        return await self._evaluate(engine, context, rules_config)
+
+    async def _evaluate(self, engine, context: dict, rules_config: dict) -> StageResult:
+        """Match the changed files of ``_base``..``_ref`` against the rules and run
+        the actions."""
         changed_files = await self._get_changed_files(engine)
         if not changed_files:
             return StageResult(True, "No changes in git diff, no actions required.")

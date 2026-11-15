@@ -46,10 +46,15 @@ class PublishInventoryStateStage(BaseStage):
         super().__init__("Commit & Push: inventory_state")
 
     async def run(self, engine, context: dict) -> StageResult:
-        from ..app.controller.state_publisher import publish_inventory_state
+        from ..app.controller.state_publisher import head_sha, publish_inventory_state
 
         repo = engine.base_git_dir / "inventory_state"
         payload = context.get("payload") or {}
+        # What was published before this run. The rule engine acts on everything
+        # between its marker and the state this run pins below (audit OC-06); the
+        # very first run records "before" as the marker, so even its own commit is
+        # not lost when the pipeline fails before the rule stage.
+        before = await head_sha(repo)
         result = await publish_inventory_state(
             repo,
             controller_sha=await engine.repo_head_sha("iac_controller"),
@@ -61,10 +66,32 @@ class PublishInventoryStateStage(BaseStage):
         context["inventory_state_commit_status"] = result.status
         if result.files:
             context["inventory_state_commit_sha"] = result.commit_sha
+        if result.ok and result.commit_sha:
+            # Pinned inside the state lock — also when nothing was committed: a
+            # commit another pipeline publishes later is not this run's business.
+            context["inventory_state_head_sha"] = result.commit_sha
+            if before:
+                context["inventory_state_base_sha"] = before
+                await self._init_rules_marker(engine, before, context.get("job_id"))
         if result.ok:
             return StageResult(True, f"inventory_state: {result.status}"
                                + (f" ({len(result.files)} file(s), {result.commit_sha[:12]})" if result.files else ""))
         return StageResult(False, f"inventory_state publish {result.status}: {result.detail}")
+
+
+    @staticmethod
+    async def _init_rules_marker(engine, sha: str, job_id) -> None:
+        setter = getattr(getattr(engine, "db", None), "set_rules_marker", None)
+        if not callable(setter):
+            return
+        try:
+            if await asyncio.to_thread(setter, sha, job_id=job_id, only_if_absent=True):
+                log.info(f"Rule engine: marker initialised at inventory_state@{sha[:12]} "
+                         "(everything published before counts as evaluated).")
+        except Exception as exc:
+            # Not fatal here: the rule stage reads the marker itself and refuses
+            # to guess when the database cannot be read.
+            log.warning(f"Rule engine: marker could not be initialised: {exc}")
 
 
 class CloneServiceRepoStage(BaseStage):

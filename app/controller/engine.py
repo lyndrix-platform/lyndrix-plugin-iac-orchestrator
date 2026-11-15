@@ -3465,11 +3465,54 @@ class DeploymentEngine:
         Waiting is bounded: after ``tf_lock_timeout_seconds`` the job fails with
         a clear message instead of starting a second tofu.
         """
+        timeout = int(getattr(self.config, "tf_lock_timeout_seconds", 1800))
+        async with self._job_lock(
+            key, job_id, timeout=timeout,
+            waiting=f"[TF] Waiting for Terraform state '{key}'",
+            step=f"Waiting for Terraform state {key}",
+            refused=(f"[TF] Terraform state '{key}' is in use by job #{{holder}} — '{task_name}' was NOT started "
+                     f"(waited {timeout}s). Re-trigger once that job has finished."),
+        ):
+            yield
+
+    #: How long a rule stage waits for another job's rule stage (see rules_lock).
+    _RULES_LOCK_TIMEOUT_SECONDS = 3600
+
+    @contextlib.asynccontextmanager
+    async def rules_lock(self, job_id: int):
+        """One rule engine at a time, cluster-wide (audit OC-06).
+
+        Rule stages no longer diff only their own commit but everything since the
+        marker of the last successful evaluation — two of them running side by
+        side would act on the same changes twice. The waiter re-reads the marker
+        once it holds the lock and usually finds nothing left to do. Same
+        ownership rules as the Terraform state lock (kept on cancellation while
+        containers may still run, taken over once the holder job is closed).
+        """
+        timeout = self._RULES_LOCK_TIMEOUT_SECONDS
+        async with self._job_lock(
+            "rules", job_id, timeout=timeout,
+            waiting="[RULES] Waiting for the rule engine",
+            step="Waiting for the rule engine",
+            refused=(f"The rule engine is in use by job #{{holder}} — the pending state changes were NOT "
+                     f"evaluated by this job (waited {timeout}s). They stay pending and are evaluated by "
+                     "the next pipeline that runs the rule engine."),
+        ):
+            yield
+
+    @contextlib.asynccontextmanager
+    async def _job_lock(self, key: str | None, job_id: int, *, timeout: float, waiting: str, step: str,
+                        refused: str):
+        """Hold lock ``key`` (table ``iac_orchestrator_locks``) for ``job_id``.
+
+        ``waiting``/``step``: log line and job step while another job holds it;
+        ``refused``: error text after ``timeout`` seconds (``{holder}`` = job id).
+        Without a queue or a real job id nothing is locked (tests, legacy calls).
+        """
         queue = getattr(self, "queue", None)
         if not key or queue is None or not job_id or job_id == -1:
             yield
             return
-        timeout = int(getattr(self.config, "tf_lock_timeout_seconds", 1800))
         deadline = time.monotonic() + timeout
         announced = object()
         owner = getattr(self.ctx, "instance_id", None)
@@ -3478,15 +3521,11 @@ class DeploymentEngine:
             if acquired:
                 break
             if time.monotonic() >= deadline:
-                raise RuntimeError(
-                    f"[TF] Terraform state '{key}' is in use by job #{holder} — '{task_name}' was NOT started "
-                    f"(waited {timeout}s). Re-trigger once that job has finished."
-                )
+                raise RuntimeError(refused.format(holder=holder))
             if holder != announced:
                 announced = holder
-                log.info(f"[TF] Waiting for Terraform state '{key}' (in use by job #{holder})…")
-                self.db.update_progress(job_id, progress=None,
-                                        current_step=f"Waiting for Terraform state {key} (job #{holder})")
+                log.info(f"{waiting} (in use by job #{holder})…")
+                self.db.update_progress(job_id, progress=None, current_step=f"{step} (job #{holder})")
             await asyncio.sleep(self._TF_LOCK_POLL_SECONDS)
         keep = False
         try:
