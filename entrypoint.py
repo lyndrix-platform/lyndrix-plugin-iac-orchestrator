@@ -3,7 +3,6 @@ import time
 import uuid
 
 from nicegui import ui
-from ui.layout import main_layout
 from core.api import ModuleManifest, NotificationEndpoint, PluginHealthStatus, db_instance
 
 from .app.controller.service import IaCService
@@ -14,6 +13,7 @@ from .app.controller.webhook_router import build_webhook_router
 from .app.controller.public_mount import mount_direct_routes, unmount_direct_routes
 from .app.api import build_plugin_router, build_stream_router
 from .app.model.models import Base
+from .app.ui.access import PAGE_PERMISSION, page_layout
 from .app.ui.dashboard import render_dashboard
 from .app.ui.settings import render_settings_ui as modular_settings_ui
 from .app.ui.widget import render_dashboard_widget as modular_widget
@@ -429,9 +429,14 @@ def setup(ctx):
     # and keep the sweep lease on the right kind of instance.
     ctx.create_task(service.watch_runner_presence(), name="iac:runner_watch")
 
-    # UI route
+    # UI route (audit OS-17). The page triggers pipelines up to a fleet apply
+    # with ``approve`` and shows job logs: it needs the strictest permission it
+    # exposes (api:infra_apply — IaC admin role), not just a login. The React UI
+    # is the canonical one and checks per route.
+    # TODO(agent): gate per action and relax to api:read once core.api offers a
+    # session permission helper (see app/ui/access.py).
     @ui.page('/iac')
-    @main_layout('IaC Orchestrator')
+    @page_layout('IaC Orchestrator', PAGE_PERMISSION)
     async def _dashboard_page():
         await render_dashboard(ctx, service)
 

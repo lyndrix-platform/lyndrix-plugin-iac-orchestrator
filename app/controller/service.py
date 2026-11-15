@@ -18,7 +18,7 @@ from .engine import ContainerStateUnknown, DeploymentEngine
 from .queue import JobQueue, JobWorker, DuplicateJob, EnqueueResult, SubmitResult
 from .socket_client import SocketBusClient
 from .gitlab_webhooks import sync_group_webhooks_from_ctx, WebhookConfigError
-from .job_payload import ALL_ENTITLEMENTS, InvalidJobPayload, strip_unentitled, validate_structure
+from .job_payload import InvalidJobPayload, strip_unentitled, validate_structure
 from .orphan_sweep import LEASE_NAME as SWEEP_LEASE, OrphanSweeper
 
 log = logging.getLogger("IaC:Service")
@@ -488,12 +488,18 @@ class IaCService:
         except Exception as exc:
             log.debug(f"trigger notification not sent: {exc}")
 
-    def submit_from_ui(self, payload: dict) -> None:
+    def submit_from_ui(self, payload: dict, *, entitlements=(), requested_by: str | None = None) -> None:
         """Trigger from the plugin's own in-process (NiceGUI) pages: sync wrapper
-        around :meth:`submit_job` with the page's entitlements."""
+        around :meth:`submit_job`.
+
+        ``entitlements`` are those of the SESSION USER (``app/ui/access.py``
+        derives them from the user's permissions, audit OS-17). They used to be
+        ``ALL_ENTITLEMENTS`` for whoever could open the page — and the page
+        checked nothing: any logged-in user could queue a fleet apply with
+        ``approve``. A caller that passes none gets an untrusted trigger."""
         async def _go():
             try:
-                await self.submit_job(payload, entitlements=ALL_ENTITLEMENTS)
+                await self.submit_job(payload, entitlements=entitlements, requested_by=requested_by)
             except InvalidJobPayload as exc:
                 log.warning(f"ENQUEUE: UI trigger rejected: {exc}")
             except Exception as exc:

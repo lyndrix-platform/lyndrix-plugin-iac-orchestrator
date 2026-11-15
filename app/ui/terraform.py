@@ -33,6 +33,7 @@ from nicegui import ui
 from ui.theme import UIStyles
 
 from . import components as c
+from .access import ui_submit
 
 # Provider is bpg/proxmox across all rendered environments (see terraform-templates).
 _TF_PROVIDER = "bpg/proxmox"
@@ -172,7 +173,7 @@ def render_terraform_panel(ctx, service):
     state = service.state
 
     def _emit(payload: dict):
-        service.submit_from_ui(payload)
+        ui_submit(service, payload)
 
     @ui.refreshable
     def _panel():
