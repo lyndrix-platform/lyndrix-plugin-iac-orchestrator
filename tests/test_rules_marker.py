@@ -340,3 +340,17 @@ def test_publish_stage_pins_the_state_and_initialises_the_marker_once(sqlite_que
     assert ctx2["inventory_state_commit_status"] == "no_changes" and "inventory_state_commit_sha" not in ctx2
     assert ctx2["inventory_state_head_sha"] == head              # pinned also without an own commit
     assert db.rules_marker()["sha"] == repo.base                 # initialised once, never moved by publishing
+
+
+def test_publish_stage_without_a_checkout_fails_cleanly(sqlite_queue, tmp_path):
+    """No inventory_state checkout yet: a stage result, not a crash while pinning the state."""
+    async def no_sha(_slug):
+        return ""
+
+    (tmp_path / "git").mkdir()
+    engine = SimpleNamespace(base_git_dir=tmp_path / "git", db=JobDatabase(), repo_head_sha=no_sha,
+                             repo_token=lambda _slug: None)
+    ctx = {"job_id": 1, "payload": {"pipeline_type": "infra_plan"}}
+    res = asyncio.run(git_stage.PublishInventoryStateStage().run(engine, ctx))
+    assert not res.success and "not a git checkout" in res.message
+    assert "inventory_state_head_sha" not in ctx and JobDatabase().rules_marker() is None

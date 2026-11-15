@@ -505,7 +505,8 @@ class JobQueue:
                 # 3. Queued, but it does something else: first wins, nothing is merged.
                 if different is not None:
                     raise DuplicateJob(key, different,
-                                       "a queued job for this target does something else (mode, branch or limit)")
+                                       "a queued job for this target does something else (mode, branch, limit, "
+                                       "or it follows the maintenance window while this trigger must run now)")
 
                 # 4. Busy target → wait behind it instead of being dropped.
                 blocker = _blocker(key, self._held_keys(session, STATUS_RUNNING))

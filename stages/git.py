@@ -54,7 +54,7 @@ class PublishInventoryStateStage(BaseStage):
         # between its marker and the state this run pins below (audit OC-06); the
         # very first run records "before" as the marker, so even its own commit is
         # not lost when the pipeline fails before the rule stage.
-        before = await head_sha(repo)
+        before = await head_sha(repo) if (repo / ".git").exists() else ""
         result = await publish_inventory_state(
             repo,
             controller_sha=await engine.repo_head_sha("iac_controller"),

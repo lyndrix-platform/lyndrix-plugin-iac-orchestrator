@@ -2300,7 +2300,7 @@ class DeploymentEngine:
         log.info("[SYSTEM] Initiating background sync for core repositories...")
         lock = getattr(self, "_state_publish_lock", None)
         if lock is not None and lock.locked():
-            log.info("[SYSTEM] A pipeline is preparing state (sync · generate · publish) — waiting for it.")
+            log.info("[SYSTEM] The repositories are in use (a pipeline prepares state, or another sync runs) — waiting.")
         async with (lock if lock is not None else contextlib.AsyncExitStack()):
             all_success = True
             for repo in ["iac_controller", "inventory_state", "config_engine", "aac_factory"]:
