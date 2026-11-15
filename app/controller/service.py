@@ -62,6 +62,9 @@ class IaCService:
         # Maintenance windows (1.6): a job the queue closes itself (orphan sweep →
         # mark_failed) still ends its maintenance override exactly once.
         self.queue.on_terminal = self.engine.end_override_for
+        # A closed job keeps a lock it did not release for as long as the orphan
+        # sweep would wait for its container (review C2).
+        self.queue.lock_takeover_grace = lambda: self.config.orphan_sweep_container_grace_seconds
         self.worker: JobWorker | None = None
         # Jobs adopted from a previous incarnation whose containers are not known
         # yet (Docker did not answer, review C1). They stay RUNNING and are
@@ -288,6 +291,9 @@ class IaCService:
             await self.engine.abort_job(job_id)
         else:
             await self.engine.stop_job_containers(job_id)
+        # Docker answered and the containers are gone: the job's locks are free
+        # for the next job now, not only after the takeover grace (review C2).
+        await asyncio.to_thread(self.queue.release_job_locks, job_id)
         # Whatever waited for Docker on behalf of this job is settled now.
         if job_id in self._unsettled:
             self._unsettled.discard(job_id)
@@ -794,6 +800,8 @@ class IaCService:
             await self.engine._close_log_writer(job_id)
             await asyncio.to_thread(self.db.update_progress, job_id, None, reason[:250])
             await asyncio.to_thread(self.db.update_job, job_id, "FAILED")
+            # Docker listed no container for it: nothing can still use its locks.
+            await asyncio.to_thread(self.queue.release_job_locks, job_id)
             self.db.claims.pop(job_id, None)
             self._unsettled.discard(job_id)
             self.engine.end_override_for(job_id)

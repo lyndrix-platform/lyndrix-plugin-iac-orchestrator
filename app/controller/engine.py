@@ -2582,6 +2582,10 @@ class DeploymentEngine:
                     kind=container["kind"], skip_lines=stored))
             results = await asyncio.gather(*watchers, return_exceptions=True)
             all_ok = all(isinstance(r, tuple) and bool(r[0]) for r in results)
+            # "Ended" needs an exit code: a watcher that lost track of its container
+            # does not know whether it still runs.
+            all_ended = all(isinstance(r, tuple) and isinstance(r[1], dict) and r[1].get("exit_code") is not None
+                            for r in results)
 
             interrupted = await self.interrupted_reason(job_id)
             try:
@@ -2605,6 +2609,10 @@ class DeploymentEngine:
                 # cannot land between "job closed" and "override ended".
                 self.db.update_progress(job_id, 100 if final == "SUCCESS" else None, step[:250])
                 done = self.db.update_job(job_id, final)
+                if all_ended and getattr(self, "queue", None) is not None:
+                    # Every container was followed to its exit: locks the detached
+                    # pipeline kept are free now, not after the takeover grace.
+                    self.queue.release_job_locks(job_id)
                 getattr(self.db, "claims", {}).pop(job_id, None)
                 self.end_override_for(job_id)
                 return done

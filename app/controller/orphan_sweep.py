@@ -12,10 +12,12 @@ a. its owner is *dead* by the core's facts — ``ctx.instance_state()`` (core AP
    view ``ctx.cluster_instances``. ``restarting`` and ``unknown`` are never dead;
 b. it made no progress for the grace period: no job heartbeat **and** no log
    line, both aged on the database clock (never the clocks of two hosts);
-c. no runner container is reported for it — the sweeper only reads the job row,
-   never a runner's Docker socket. With a container reported the job only gets
-   the step "runner lost — waiting for re-attach" until the (long) container
-   grace is over.
+c. no runner container is reported for it and it holds no lock — the sweeper
+   only reads the database, never a runner's Docker socket. The runner snapshot
+   is written fire-and-forget and may be stale, so a held ``tf:``/``rules``
+   lock counts as a container too. With either, the job only gets the step
+   "runner lost — waiting for re-attach" until the (long) container grace is
+   over.
 
 Action: FAILED ``runner_lost: <instance> last heartbeat <ts>`` (conditional on
 the claim token and the heartbeat it judged), a job-log line, the maintenance

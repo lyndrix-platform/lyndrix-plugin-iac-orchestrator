@@ -317,7 +317,16 @@ class JobQueue:
     #: maintenance override. Set by the service; may run in a worker thread.
     on_terminal: Callable[[int], None] | None = None
 
+    #: Seconds a job that is no longer RUNNING keeps the locks it did not release
+    #: itself (review C2). Its runner may not know yet that the job was closed —
+    #: the tofu container behind a ``tf:`` lock can still be writing the state.
+    #: The service points this at the orphan sweep's container grace (a number
+    #: or a callable returning one; the callable's result is cached briefly).
+    lock_takeover_grace: "Callable[[], float] | float" = 1800.0
+    _LOCK_GRACE_CACHE_SECONDS = 60.0
+
     def __init__(self):
+        self._lock_grace_cache: tuple[float, float] | None = None   # (read at, seconds)
         # job id -> claim token of the jobs THIS process executes. The service
         # shares one dict between the queue and the JobDatabase; while a token is
         # registered, the runner-side writes for that job are conditional on it.
@@ -1079,10 +1088,17 @@ class JobQueue:
     def acquire_lock(self, key: str, job_id: int, owner: str | None = None) -> tuple[bool, int | None]:
         """Try to take lock ``key`` for ``job_id``. Returns ``(acquired, holder)``.
 
-        Atomic by the primary key: the INSERT wins or fails. A lock whose holder
-        job is no longer RUNNING is stale and taken over with a conditional
-        UPDATE (only one of several waiters succeeds). Re-entrant for the job
-        that already holds it.
+        Atomic by the primary key: the INSERT wins or fails. Re-entrant for the
+        job that already holds it.
+
+        A lock whose holder job is no longer RUNNING is NOT free at once (review
+        C2): a job can be closed from outside (orphan sweep, abort for a lost
+        runner) while its container still runs, and its runner needs a moment to
+        notice and stop it. A holder that knows its containers are gone gives the
+        lock back itself (``release_lock`` / ``release_job_locks``); a lock that
+        was left behind is taken over — conditional UPDATE, only one of several
+        waiters succeeds — once the holder's last heartbeat is older than
+        ``lock_takeover_grace`` on the database clock.
         """
         from sqlalchemy.exc import IntegrityError
 
@@ -1107,6 +1123,8 @@ class JobQueue:
             status = session.execute(select(IaCJob.status).where(IaCJob.id == holder)).scalar()
             if status == STATUS_RUNNING:
                 return False, holder
+            if status is not None and not self._lock_left_long_enough(session, holder):
+                return False, holder
             res = session.execute(
                 update(IaCLock).where(IaCLock.lock_key == key, IaCLock.job_id == holder, IaCLock.token == holder_token)
                 .values(job_id=int(job_id), token=uuid.uuid4().hex, owner_instance=owner, acquired_at=datetime.now())
@@ -1120,6 +1138,61 @@ class JobQueue:
             session.rollback()
             log.error("QUEUE: acquire_lock('%s') failed: %s", key, exc)
             raise
+        finally:
+            session.close()
+
+    def _takeover_grace(self) -> float:
+        grace = self.lock_takeover_grace
+        if not callable(grace):
+            return max(0.0, float(grace))
+        cached = self._lock_grace_cache
+        now = time.monotonic()
+        if cached is not None and now - cached[0] < self._LOCK_GRACE_CACHE_SECONDS:
+            return cached[1]
+        try:
+            value = max(0.0, float(grace()))
+        except Exception as exc:
+            log.debug("QUEUE: lock takeover grace unreadable (%s) — using the default", exc)
+            value = float(JobQueue.lock_takeover_grace)
+        self._lock_grace_cache = (now, value)
+        return value
+
+    def _lock_left_long_enough(self, session, holder: int) -> bool:
+        """Has the closed job ``holder`` been silent for the takeover grace? Aged
+        like the orphan sweep ages a job: last heartbeat on the database clock;
+        a row without one (never claimed, plugin < fencing) by its end time."""
+        grace = self._takeover_grace()
+        if grace <= 0:
+            return True
+        row = session.execute(
+            select(IaCJob.heartbeat_utc, IaCJob.end_time).where(IaCJob.id == holder)).first()
+        if row is None:
+            return True
+        heartbeat, end_time = row
+        if heartbeat is not None:
+            age = _seconds_between(session.execute(select(self._utc_now(session))).scalar(), heartbeat)
+        elif end_time is not None:
+            age = _seconds_between(datetime.now(), end_time)
+        else:
+            age = None
+        return age is None or age >= grace
+
+    def release_job_locks(self, job_id: int) -> int:
+        """Give back every lock ``job_id`` still holds. Only for a caller that
+        KNOWS no container of the job is left on its host (containers stopped
+        or followed to their end, Docker answered "none") — this is what makes
+        a closed job's lock available before the takeover grace."""
+        session = self._session()
+        if not session:
+            return 0
+        try:
+            n = session.query(IaCLock).filter(IaCLock.job_id == int(job_id)).delete(synchronize_session=False)
+            session.commit()
+            return int(n or 0)
+        except Exception as exc:
+            session.rollback()
+            log.warning("QUEUE: release_job_locks(#%s) failed: %s", job_id, exc)
+            return 0
         finally:
             session.close()
 
@@ -1206,7 +1279,11 @@ class JobQueue:
         """RUNNING jobs with an owner, with their ages on the database clock —
         the facts the orphan sweep decides on (it never asks a runner's Docker
         socket): ``[{id, owner_instance, owner_incarnation, claim_token,
-        heartbeat_utc, hb_age, log_age, has_container, current_step}]``.
+        heartbeat_utc, hb_age, log_age, has_container, holds_lock, current_step}]``.
+        ``has_container`` is true when the runner snapshot reports a live task
+        OR the job holds a lock (review C2): the snapshot is written
+        fire-and-forget and can be stale or lost, while a ``tf:``/``rules`` lock
+        is only held around the protected work and released by the job itself.
         ``log_age`` is ``None`` for a job without log lines. Rows without a UTC
         heartbeat (claimed by a plugin version before the sweep) are skipped."""
         session = self._session()
@@ -1221,6 +1298,7 @@ class JobQueue:
                 .where(IaCJob.status == STATUS_RUNNING, IaCJob.owner_instance.isnot(None),
                        IaCJob.heartbeat_utc.isnot(None))
             ).all()
+            lock_holders = {int(r[0]) for r in session.execute(select(IaCLock.job_id)).all()}
             out = []
             for job_id, owner, incarnation, token, hb, runners_raw, step in rows:
                 last_log = session.execute(
@@ -1229,7 +1307,8 @@ class JobQueue:
                     runners = json.loads(runners_raw) if runners_raw else {}
                 except Exception:
                     runners = {}
-                has_container = any(
+                holds_lock = int(job_id) in lock_holders
+                has_container = holds_lock or any(
                     isinstance(info, dict) and info.get("status") in self._LIVE_RUNNER_STATUSES
                     for info in (runners or {}).values()
                 )
@@ -1238,7 +1317,7 @@ class JobQueue:
                     "claim_token": token, "heartbeat_utc": hb,
                     "hb_age": _seconds_between(db_utc, hb),
                     "log_age": _seconds_between(db_local, last_log) if last_log is not None else None,
-                    "has_container": has_container, "current_step": step,
+                    "has_container": has_container, "holds_lock": holds_lock, "current_step": step,
                 })
             return out
         finally:

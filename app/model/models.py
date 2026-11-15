@@ -67,9 +67,10 @@ class IaCLock(Base):
     ``tf:<site>_<stage>`` serialises every OpenTofu run on one environment state:
     the S3 backend has no state locking, and the per-process semaphore neither
     survives a plugin reload nor knows about a second runner. A lock is valid
-    while its job row is RUNNING — a holder that crashed keeps it until its job
-    is closed (its tofu container may still be running), after that it can be
-    taken over.
+    while its job row is RUNNING. A holder that was closed without releasing it
+    (crash, abort, orphan sweep) keeps it until its runner has stopped the
+    containers and gives it back, or until the takeover grace is over — its
+    tofu container may still be running (``JobQueue.acquire_lock``).
     """
     __tablename__ = "iac_orchestrator_locks"
 

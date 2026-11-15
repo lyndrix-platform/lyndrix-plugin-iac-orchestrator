@@ -3,6 +3,7 @@ database lock, and their containers are labelled so abort and restart recovery
 find them."""
 import asyncio
 import json
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -141,9 +142,15 @@ def test_lock_semantics(sqlite_queue):
     assert q.acquire_lock("tf:onprem_dev", b) == (True, b)           # another state is independent
     assert q.release_lock("tf:onprem_prod", b) is False              # only the holder releases
     assert q.acquire_lock("tf:onprem_prod", b) == (False, a)
-    # the holder's job ends without releasing (crash, abort): the lock is stale
+    # the holder's job is closed without releasing (crash, abort): its container
+    # may still run — the lock is only free after the takeover grace (review C2)
     with queue_mod.db_instance.SessionLocal() as s:
         s.execute(update(IaCJob).where(IaCJob.id == a).values(status="FAILED"))
+        s.commit()
+    assert q.acquire_lock("tf:onprem_prod", b) == (False, a)
+    with queue_mod.db_instance.SessionLocal() as s:
+        s.execute(update(IaCJob).where(IaCJob.id == a).values(
+            heartbeat_utc=datetime.utcnow() - timedelta(seconds=q.lock_takeover_grace + 1)))
         s.commit()
     assert q.acquire_lock("tf:onprem_prod", b) == (True, b)
     assert q.release_lock("tf:onprem_prod", b) is True and q.lock_holder("tf:onprem_prod") is None
@@ -177,12 +184,15 @@ def test_cancelled_run_keeps_the_lock_until_its_job_is_closed(sqlite_queue, monk
         with queue_mod.db_instance.SessionLocal() as s:  # … until the job is closed
             s.execute(update(IaCJob).where(IaCJob.id == first).values(status="ABORTED"))
             s.commit()
+        # … and then until the runner has stopped its containers (review C2).
+        closed = sqlite_queue.acquire_lock("tf:onprem_prod", second)
+        assert sqlite_queue.release_job_locks(first) == 1
         eng2, _ = _engine(monkeypatch, sqlite_queue, tmp_path, watch_seconds=0)
         ok, _stats = await _tf(eng2, second, mode="plan")
-        return held, ok
+        return held, closed, ok
 
-    held, ok = asyncio.run(scenario())
-    assert held == first and ok is True
+    held, closed, ok = asyncio.run(scenario())
+    assert held == first and closed == (False, first) and ok is True
 
 
 # --- per-job run dir -----------------------------------------------------------------------
