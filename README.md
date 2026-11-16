@@ -161,7 +161,7 @@ These paths help the plugin spawn sibling containers (for Ansible runners, etc.)
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `PLUGIN_IAC_ORCHESTRATOR_PARALLEL_WORKERS` | `20` | Number of concurrent deployment workers |
-| `PLUGIN_IAC_ORCHESTRATOR_ANSIBLE_IMAGE` | `registry.gitlab.int.fam-feser.de/aac-application-definitions/aac-template-engine:latest` | Docker image for Ansible runner |
+| `PLUGIN_IAC_ORCHESTRATOR_ANSIBLE_IMAGE` | `registry.gitlab.int.fam-feser.de/iac-environment/iac-platform-assets/ansible-ci-image:latest` | Docker image for Ansible runner |
 | `PLUGIN_IAC_ORCHESTRATOR_TIMEOUT_SECONDS` | `3600` | Pipeline execution timeout (seconds) |
 | `PLUGIN_IAC_ORCHESTRATOR_MAX_RETRIES` | `3` | Failed stage retry attempts |
 

@@ -330,3 +330,13 @@ def test_engine_starts_no_container_from_a_foreign_image(monkeypatch, tmp_path):
     assert not any(cmd[:2] == ["docker", "run"] for cmd in commands)
     assert not any(cmd[:2] == ["docker", "login"] for cmd in commands)   # token not sent to a foreign registry
     assert list((tmp_path / ".iac_keys").glob("*")) == []                # key file removed again
+
+
+def test_code_default_of_the_ansible_image_is_the_one_the_settings_ui_shows():
+    """Staging O-1: the UI showed ansible-ci-image, the code ran aac-template-engine."""
+    import inspect
+    from iac_plugin.app.controller import config, settings_schema
+    shown = "registry.gitlab.int.fam-feser.de/iac-environment/iac-platform-assets/ansible-ci-image:latest"
+    assert shown in inspect.getsource(config).replace('"\n', "")
+    assert "iac-platform-assets/ansible-ci-image:latest" in inspect.getsource(settings_schema)
+    assert "aac-template-engine:latest" not in inspect.getsource(config)
