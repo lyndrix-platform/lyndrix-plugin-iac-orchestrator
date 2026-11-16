@@ -27,7 +27,7 @@ Service reconcile: an iac-controller change that alters a service's **rendered**
 - `bus` and `controller-diff` are both policy triggers.
 
 ### Fixed after the staging run of 2026-11-16
-- A follow-up job for the same target was aborted ("Skipped: deployment for X already starting") when the queue claimed it while its predecessor was still in its post-run work: the in-memory dispatch key was released only after the terminal write plus drain, runner sync, log writer and cleanup. The key is now released right before the terminal write; until then the RUNNING row keeps the target busy. The deferred-reconcile drain of this release widened the window (2 of 2 follow-ups aborted on staging); the race exists in 1.7.0 too and is fixed there as 1.7.1. A job re-queued by the drain now lines up behind the job it waited for.
+- A follow-up job for the same target was aborted ("Skipped: deployment for X already starting") when the queue claimed it while its predecessor was still in its post-run work: the in-memory dispatch key was released only after the terminal write plus drain, runner sync, log writer and cleanup. The key is now released right before the terminal write; until then the RUNNING row keeps the target busy. The deferred-reconcile drain of this release widened the window (2 of 2 follow-ups aborted on staging); the race exists in 1.7.0 too; the fix was released as 1.7.1 and this release is based on it. A job re-queued by the drain now lines up behind the job it waited for.
 - `service_reconcile_exclude_services` saved empty was shown as `aac-hermes-agent` while nothing was excluded, and saving `aac-hermes-agent` back was skipped as "unchanged" — the protection stayed off. A stored empty value is now shown and compared as empty (`SettingField.empty_is_value`, this field only); a value that was never set still shows and applies the default.
 - Docs: in mode `off` the detection summary is in the runner's container log, not in the job log. The exclude list acts at dispatch time — a reconcile job already queued when a service is added to the list still runs.
 
@@ -36,7 +36,7 @@ Service reconcile: an iac-controller change that alters a service's **rendered**
 - Default is still **off**; nothing changes until the rule and the setting are both enabled.
 - The suite has 640 tests and passes on core 1.11.1 and 1.12.0. Staging run 2026-11-16 (modes off/notify/dry_run/deploy, thresholds, approval, deferred, exclude) against dummy services; not run against production GitLab or real services.
 
-Based on 1.7.0.
+Based on 1.7.1.
 
 ## [1.7.1] - 2026-11-16
 One fix on top of 1.7.0, found on staging while testing the next release. Python only — the React bundle is unchanged apart from the version number. No setting, schema or API change.

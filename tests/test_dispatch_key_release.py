@@ -97,14 +97,20 @@ def test_key_is_free_when_the_row_is_final_before_cleanup(tmp_path, monkeypatch)
     def cleanup(job_id):
         seen["at_cleanup"] = KEY in eng._active_single_service_keys
 
+    def drain():
+        # 1.8.0: the deferred-reconcile drain runs after the terminal write too.
+        seen["at_drain"] = KEY in eng._active_single_service_keys
+        return []
+
     eng.close_job_row = close_job_row
     eng._cleanup_inventory_snapshot = cleanup
+    eng.drain_deferred_reconcile = drain
     asyncio.run(eng.run_pipeline(dict(PAYLOAD), job_id=45))
 
     assert rows.status[45] == "SUCCESS"
     # Free before the terminal write (the RUNNING row guards the target until then)
     # and therefore during the post-run cleanup.
-    assert seen == {"at_close": False, "at_cleanup": False}
+    assert seen == {"at_close": False, "at_drain": False, "at_cleanup": False}
     assert KEY not in eng._active_single_service_keys
     assert eng.__dict__.get("_dispatch_keys_by_owner") == {}
 
