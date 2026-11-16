@@ -144,6 +144,11 @@ class SettingField:
     # the operator tier and never skipped as "unchanged": turning a gate off must
     # work even when the current value cannot be read (Vault hiccup, stale view).
     safe_value: str | None = None
+    # A stored "" is a deliberate value (e.g. "exclude nothing"), not "unset":
+    # only a missing value (None) falls back to ``default``. Without it a saved
+    # empty value is shown as the default, and saving the default back is
+    # skipped as "unchanged" although the effective value differs.
+    empty_is_value: bool = False
 
     def storage_key(self) -> str:
         return self.vault_key or self.key
@@ -354,6 +359,50 @@ def _build_fields() -> list[SettingField]:
             vault_key="iac_maintenance_report_missing_window",
             env_var="PLUGIN_IAC_ORCHESTRATOR_MAINTENANCE_REPORT_MISSING_WINDOW",
             description="Emit maintenance:window_missing when a window deploy runs without a window (ITSM opens a task).",
+        ),
+        # ── Service reconcile (plugin 1.8) ────────────────────────────────────
+        # Read by IaCConfig.service_reconcile_* (env > Vault > default). Second opt-in
+        # besides the `service_reconcile` rule in config_engine/pipeline_rules.yml.
+        SettingField(
+            "service_reconcile_mode", "Controller-diff service deploys", kind="select",
+            category="Service Reconcile", default="off",
+            options=["off", "notify", "dry_run", "deploy"],
+            vault_key="iac_service_reconcile_mode",
+            env_var="PLUGIN_IAC_ORCHESTRATOR_SERVICE_RECONCILE_MODE",
+            description=(
+                "What happens when an iac-controller change alters a service's rendered entry "
+                "(profile vars, secrets, …): off = log only, notify = bell/Discord, dry_run = one "
+                "single_service --check job per service limited to the changed hosts, deploy = real deploys. "
+                "Independent of auto_apply."
+            ),
+        ),
+        SettingField(
+            "service_reconcile_max_hosts", "Max hosts per auto job", kind="int",
+            category="Service Reconcile", default=10,
+            vault_key="iac_service_reconcile_max_hosts",
+            env_var="PLUGIN_IAC_ORCHESTRATOR_SERVICE_RECONCILE_MAX_HOSTS",
+            description="A service change touching more hosts than this is not deployed automatically; it waits "
+                        "under /reconcile/pending for approval.",
+        ),
+        SettingField(
+            "service_reconcile_max_services", "Max services per controller change", kind="int",
+            category="Service Reconcile", default=3,
+            vault_key="iac_service_reconcile_max_services",
+            env_var="PLUGIN_IAC_ORCHESTRATOR_SERVICE_RECONCILE_MAX_SERVICES",
+            description="More changed services than this in one controller commit (e.g. an edit to a shared "
+                        "profile) → every one waits for approval.",
+        ),
+        SettingField(
+            "service_reconcile_exclude_services", "Excluded services", category="Service Reconcile",
+            default="aac-hermes-agent",
+            vault_key="iac_service_reconcile_exclude_services",
+            env_var="PLUGIN_IAC_ORCHESTRATOR_SERVICE_RECONCILE_EXCLUDE_SERVICES",
+            # IaCConfig reads a stored "" as "exclude nothing" — show and compare it so.
+            empty_is_value=True,
+            description="Comma-separated service names the controller-diff reconcile never deploys — no job, "
+                        "no approval, no deferred re-queue; they only appear as 'excluded' in the notification. "
+                        "Default protects aac-hermes-agent (a single_service deploy tears the agent stack down). "
+                        "Save an empty value to exclude nothing.",
         ),
     ]
 
@@ -646,7 +695,16 @@ class OrchestratorSettings:
             return str(b) if f.bool_format == "python" else ("true" if b else "false")
         if f.kind == "int":
             return str(_safe_int(raw, int(f.default or 0)))
-        return str(raw if raw not in (None, "") else (f.default or "")).strip()
+        value = self._str_value(f, raw)
+        return str("" if value is None else value).strip()
+
+    @staticmethod
+    def _str_value(f: SettingField, raw):
+        """Stored → reported value of a str-like field: the default stands in for a
+        missing value — and for a blank one unless ``f.empty_is_value``."""
+        if raw is None or (raw == "" and not f.empty_is_value):
+            return f.default
+        return raw
 
     # --- public surface ------------------------------------------------------
     def get_schema(self) -> list[dict]:
@@ -687,7 +745,7 @@ class OrchestratorSettings:
             elif f.kind == "int":
                 vals[f.key] = _safe_int(raw, int(f.default or 0))
             else:
-                vals[f.key] = raw if raw not in (None, "") else f.default
+                vals[f.key] = self._str_value(f, raw)
         return vals
 
     def save_values(self, updates: dict, *, allowed_tiers: set[str] | None = None) -> dict:

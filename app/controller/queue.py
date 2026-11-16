@@ -252,7 +252,11 @@ _COALESCED_NOTE = " (+ newer trigger)"
 _CLAIM_SCAN = 200
 
 #: Payload keys that say who asked and why — not what the job does.
-_INFORMATIONAL_KEYS = frozenset({"manual", "source", "source_pipeline_id", "project_path", "followup_of"})
+_INFORMATIONAL_KEYS = frozenset({"manual", "source", "source_pipeline_id", "project_path", "followup_of",
+                                 # service reconcile (1.8): provenance only — ``target_hosts`` is NOT
+                                 # informational, a host-limited job never covers a full deploy.
+                                 "stage", "site", "changed_keys", "controller_sha", "inventory_commit",
+                                 "source_job_id", "approved_by"})
 #: Payload keys that only decide WHEN a deploy may run (maintenance policy).
 _TIMING_KEYS = frozenset({"trigger", "force"})
 
