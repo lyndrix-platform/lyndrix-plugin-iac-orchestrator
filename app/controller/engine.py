@@ -2995,8 +2995,8 @@ class DeploymentEngine:
         ids = [c["id"] for c in containers]
         if ids:
             code, _out, err = await self._docker("rm", "-f", *ids, timeout=self._DOCKER_QUERY_TIMEOUT_SECONDS)
-            if code != 0:
-                detail = err.decode(errors="replace").strip().splitlines()
+            detail = err.decode(errors="replace").strip().splitlines()
+            if code != 0 and not self._only_gone_or_going(detail):
                 raise ContainerStateUnknown(
                     f"'docker rm' for job #{job_id} failed with exit code {code}: "
                     f"{(detail[-1] if detail else 'no error output')[:200]}")
@@ -3004,6 +3004,18 @@ class DeploymentEngine:
             if isinstance(data, dict) and data.get("job_id") == job_id:
                 data["status"] = "aborted"
         return len(ids)
+
+    #: ``docker rm`` errors that mean "this container is (being) removed already".
+    _RM_GONE_MARKERS = ("is already in progress", "No such container")
+
+    @classmethod
+    def _only_gone_or_going(cls, error_lines: list[str]) -> bool:
+        """True when every error line of a failed ``docker rm`` only says that a
+        container is gone or being removed by someone else — two stop paths of the
+        same job (abort relay and worker fencing, staging 2026-11-15 job #27) race
+        for the same container; the loser is not "could not be stopped"."""
+        lines = [line for line in error_lines if line.strip()]
+        return bool(lines) and all(any(m in line for m in cls._RM_GONE_MARKERS) for line in lines)
 
     async def abort_job(self, job_id: int, *, reason: str = "Aborted by User", status: str = "ABORTED") -> int:
         """Kill this host's runner containers of ``job_id`` and close its row as

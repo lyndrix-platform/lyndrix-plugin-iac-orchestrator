@@ -941,6 +941,10 @@ class IaCService:
             self.db.claims.pop(job_id, None)
             self._unsettled.discard(job_id)
             await off_loop(self.engine.end_override_for, job_id)
+            # Its inventory snapshot and scratch directory (.job_snapshots/job_<id>)
+            # go with the job, as on every other terminal path — they were left
+            # on the runner's disk for good (staging 2026-11-15: job_4, job_7).
+            await off_loop(self.engine._cleanup_inventory_snapshot, job_id)
             self.state["last_deployment"] = "FAILED"
 
         # Containers whose job is no longer RUNNING: the job was closed while this

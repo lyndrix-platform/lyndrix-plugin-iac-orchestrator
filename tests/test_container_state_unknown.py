@@ -115,6 +115,27 @@ def test_stop_surfaces_a_failed_removal(monkeypatch):
     assert eng.state["active_tasks"]["Terraform Apply: onprem_prod"]["status"] == "running_terraform"
 
 
+
+def test_a_removal_already_in_progress_counts_as_stopped(monkeypatch):
+    """Staging 2026-11-15 (max_runtime, job #27): the abort relay and the worker's
+    fencing removed the same container 12 ms apart; the loser's "removal …
+    already in progress" was logged as "could not be stopped — may still be
+    running" and retried. A container that is gone or going is stopped."""
+    for err in (b"Error response from daemon: removal of container 2f1f5735a646 is already in progress",
+                b"Error response from daemon: No such container: 2f1f5735a646"):
+        eng, calls = _engine(monkeypatch, {"ps": _Proc(0, PS), "rm": _Proc(1, b"", err)})
+        assert asyncio.run(eng.stop_job_containers(7)) == 1
+        assert eng.state["active_tasks"]["Terraform Apply: onprem_prod"]["status"] == "aborted"
+
+
+def test_a_real_removal_error_next_to_a_gone_container_still_raises(monkeypatch):
+    err = (b"Error response from daemon: No such container: a\n"
+           b"Error response from daemon: cannot remove container b: device or resource busy")
+    eng, calls = _engine(monkeypatch, {"ps": _Proc(0, PS), "rm": _Proc(1, b"", err)})
+    with pytest.raises(ContainerStateUnknown):
+        asyncio.run(eng.stop_job_containers(7))
+
+
 # --- runner restart while Docker does not answer -----------------------------------------------
 
 def _successor(svc, monkeypatch):
@@ -345,3 +366,25 @@ def test_leftover_containers_of_a_closed_job_are_stopped_after_docker_recovers(i
     asyncio.run(scenario())
     assert stops == [job_id] * 3
     assert _row(job_id).status == "FAILED" and _row(job_id).current_step == "runner_lost: docker-auto-runner"
+
+
+def test_job_failed_at_restart_leaves_no_snapshot_or_scratch_behind(iac_service, monkeypatch, tmp_path):
+    """Staging 2026-11-15: jobs closed as "System Restart (Aborted)" kept
+    ``.job_snapshots/job_<id>`` (inventory snapshot + the 1.7 scratch dir) on
+    the runner's disk for good; every other terminal path removes it."""
+    svc = iac_service
+    job_id = _previous_job(svc, lock=None)
+    new = _successor(svc, monkeypatch)
+    docker = _Docker()
+    docker.down = False                                   # Docker answers: no container for the job
+    new.engine._list_job_containers = docker.list
+    new.engine.base_git_dir = tmp_path
+    snap = new.engine.base_git_dir / ".job_snapshots" / f"job_{job_id}"
+    (snap / "scratch").mkdir(parents=True, exist_ok=True)
+    (snap / "inventory_state").mkdir(parents=True, exist_ok=True)
+    (snap / "scratch" / "left-by-a-playbook").write_text("x")
+
+    asyncio.run(new.run_startup_reconciliation())
+
+    assert _row(job_id).status == "FAILED" and _row(job_id).current_step == "System Restart (Aborted)"
+    assert not snap.exists()

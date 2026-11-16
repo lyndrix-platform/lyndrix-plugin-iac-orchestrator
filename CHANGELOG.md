@@ -143,7 +143,11 @@ No credential has to be changed for the upgrade: the existing webhook token keep
   the whole session. Never run the suite of an older tree on a runner host.
 - A lease granted while the plugin is shutting down starts no new loop, so a cluster-wide disable no longer runs into
   the core's teardown timeout (staging O-3).
-- The suite has 558 tests (124 on 1.6.1) and passes on core 1.11.1 and on the planned core 1.12.0.
+- A job closed as "System Restart (Aborted)" at runner start now removes its `.job_snapshots/job_<id>` directory
+  (inventory snapshot and scratch) like every other terminal path (staging O-7).
+- A `docker rm` that fails only because the container is already gone or being removed counts as stopped. Two stop
+  paths racing for the same container no longer log "could not be stopped" and retry (staging O-8).
+- The suite has 561 tests (124 on 1.6.1) and passes on core 1.11.1 and on core 1.12.0.
 
 ## [1.6.1] - 2026-11-11
 Forward-port of the complete 1.5.x hotfix line (1.5.1–1.5.7, core < 1.11) plus the runner-presence fix from the 2026-11-11 incident. Requires core ≥ 1.11.0 (API 1.13) like 1.6.0; no schema migration (the queue columns are added idempotently by `JobQueue.ensure_schema` as before).
