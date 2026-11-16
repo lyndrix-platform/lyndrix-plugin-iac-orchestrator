@@ -146,7 +146,7 @@ class IaCConfig:
         )
 
     @property
-    def ansible_docker_image(self) -> str: return self._get("PLUGIN_IAC_ORCHESTRATOR_ANSIBLE_IMAGE", "ansible_docker_image", "registry.gitlab.int.fam-feser.de/iac-environment/iac-platform-assets/ansible-ci-image:latest")
+    def ansible_docker_image(self) -> str: return self._get("PLUGIN_IAC_ORCHESTRATOR_ANSIBLE_IMAGE", "ansible_docker_image", "registry.gitlab.int.fam-feser.de/aac-application-definitions/aac-template-engine:latest")
 
     @property
     def terraform_docker_image(self) -> str:

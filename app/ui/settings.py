@@ -238,7 +238,7 @@ def render_settings_ui(ctx, service):
                     ui.label('Ansible Docker Configuration').classes('text-sm font-bold uppercase tracking-widest text-[var(--lx-text-muted)]')
                 ui.label('Configure the ephemeral Docker container and Registry Auth for Ansible Playbooks.').classes(UIStyles.TEXT_MUTED)
 
-                default_img = "registry.gitlab.int.fam-feser.de/iac-environment/iac-platform-assets/ansible-ci-image:latest"
+                default_img = "registry.gitlab.int.fam-feser.de/aac-application-definitions/aac-template-engine:latest"
                 img_input = ui.input('Docker Image', value=ctx.get_secret("ansible_docker_image") or default_img).props('outlined dense').classes('w-full')
 
                 key_exists = bool(ctx.get_secret("ansible_ssh_key"))

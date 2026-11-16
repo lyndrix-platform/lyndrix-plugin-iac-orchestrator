@@ -34,10 +34,9 @@ No credential has to be changed for the upgrade: the existing webhook token keep
   system" — test on staging before the rollout. Staging confirmed the Ansible paths; the OpenTofu paths (run directory,
   provider cache) never ran with read-only mounts. **Switch `runner_readonly_mounts` off for the first production
   OpenTofu job (Check Env / plan / apply) and back on afterwards**, then run the next one with it on and watch it.
-- **The default Ansible runner image is now `…/iac-platform-assets/ansible-ci-image:latest`**, the value the settings
-  UI always showed (staging O-1); the code fell back to `…/aac-template-engine:latest`. An installation that never
-  saved the setting and has no `PLUGIN_IAC_ORCHESTRATOR_ANSIBLE_IMAGE` switches image with this upgrade — save the
-  old value explicitly to keep it.
+- **The Ansible runner image does not change.** The settings UI showed `…/iac-platform-assets/ansible-ci-image:latest`
+  as default while the code ran `…/aac-template-engine:latest` (ansible-ci-image plus the template engine); the
+  display now shows what runs (staging O-1). Nothing to do.
 - **Branch → target is enforced.** Only the catalog's prod branch of a service deploys to all its hosts; `dev`,
   `*-dev` and `test` branches deploy to their stage only; any other branch is refused (HTTP 400 / refused job). A CI
   project whose `PROD_BRANCH` differs from the catalog is refused too.
@@ -153,7 +152,8 @@ No credential has to be changed for the upgrade: the existing webhook token keep
   (inventory snapshot and scratch) like every other terminal path (staging O-7).
 - A `docker rm` that fails only because the container is already gone or being removed counts as stopped. Two stop
   paths racing for the same container no longer log "could not be stopped" and retry (staging O-8).
-- The code default of the Ansible runner image matches the settings UI (staging O-1, see Upgrade notes).
+- The settings UI and schema show the Ansible runner image the code actually uses by default,
+  `aac-template-engine:latest` (staging O-1). The code default is unchanged from 1.6.1.
 - The suite has 562 tests (124 on 1.6.1) and passes on core 1.11.1 and on core 1.12.0.
 
 ## [1.6.1] - 2026-11-11

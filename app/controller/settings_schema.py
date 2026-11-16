@@ -40,8 +40,8 @@ from .config import allowed_registry_hosts, registry_host, runner_image_error
 SECRET_SENTINEL = "********"
 
 _DEFAULT_ANSIBLE_IMAGE = (
-    "registry.gitlab.int.fam-feser.de/iac-environment/"
-    "iac-platform-assets/ansible-ci-image:latest"
+    "registry.gitlab.int.fam-feser.de/aac-application-definitions/"
+    "aac-template-engine:latest"
 )
 _DEFAULT_TOFU_IMAGE = (
     "registry.gitlab.int.fam-feser.de/iac-environment/"

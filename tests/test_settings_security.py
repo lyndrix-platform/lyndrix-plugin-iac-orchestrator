@@ -332,11 +332,14 @@ def test_engine_starts_no_container_from_a_foreign_image(monkeypatch, tmp_path):
     assert list((tmp_path / ".iac_keys").glob("*")) == []                # key file removed again
 
 
-def test_code_default_of_the_ansible_image_is_the_one_the_settings_ui_shows():
-    """Staging O-1: the UI showed ansible-ci-image, the code ran aac-template-engine."""
+def test_settings_show_the_ansible_image_the_code_runs_by_default():
+    """Staging O-1: the settings showed ansible-ci-image while the code ran
+    aac-template-engine (= ansible-ci-image + template engine, the intended runner).
+    The display follows the code; the code default must not change."""
     import inspect
     from iac_plugin.app.controller import config, settings_schema
-    shown = "registry.gitlab.int.fam-feser.de/iac-environment/iac-platform-assets/ansible-ci-image:latest"
-    assert shown in inspect.getsource(config).replace('"\n', "")
-    assert "iac-platform-assets/ansible-ci-image:latest" in inspect.getsource(settings_schema)
-    assert "aac-template-engine:latest" not in inspect.getsource(config)
+    from iac_plugin.app.ui import settings as nicegui_settings
+    default = "registry.gitlab.int.fam-feser.de/aac-application-definitions/aac-template-engine:latest"
+    assert default in inspect.getsource(config)
+    assert settings_schema._DEFAULT_ANSIBLE_IMAGE == default
+    assert default in inspect.getsource(nicegui_settings)
