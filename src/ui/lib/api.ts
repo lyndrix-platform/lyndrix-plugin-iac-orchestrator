@@ -83,6 +83,7 @@ export interface IaCJob {
   current_step?: string
   start_time: string
   end_time: string
+  waiting_for?: 'runner' | string   // set on QUEUED jobs while nothing can execute them
 }
 
 export interface CatalogService {
@@ -106,6 +107,8 @@ export interface JobStreamSnapshot {
   is_running: boolean
   queued?: number
   scheduled?: number             // parked deploys (plugin ≥ 1.6)
+  runner_online?: boolean        // is a runner instance executing jobs right now?
+  runner_state?: 'online' | 'restarting' | 'absent' | 'unknown'
   ts: number
 }
 
@@ -241,6 +244,10 @@ export interface PendingPlanResponse {
   job_id?: number
   planned_at?: string
   envs?: Record<string, PendingPlanEnv>
+  /** iac-controller commit the plan was made from — an approval is bound to it. */
+  controller_sha?: string | null
+  /** false: recorded without that commit (older plugin version) — plan again before approving. */
+  approvable?: boolean
 }
 
 // ─── Maintenance windows (plugin 1.6, core API 1.13) ────────────────────────
@@ -364,8 +371,13 @@ export const iacApi = {
   settingsSchema: () => pluginApi.get<SettingsSchemaResponse>('settings/schema'),
   settingsValues: () => pluginApi.get<SettingsValuesResponse>('settings/values'),
   saveSettingsValues: (values: Record<string, unknown>) =>
-    pluginApi.post<{ status: string; saved: string[]; values: Record<string, unknown> }>(
+    pluginApi.post<{ status: string; saved: string[]; locked?: string[]; unchanged?: string[]; values: Record<string, unknown> }>(
       'settings/values', { values },
+    ),
+  // Secret material (SSH keys, passwords, tokens) has its own route + permission.
+  setSecretSlot: (key: string, value: string) =>
+    pluginApi.post<{ status: string; key: string; configured: boolean }>(
+      `settings/secrets/${encodeURIComponent(key)}`, { value },
     ),
   listCredentials: () => pluginApi.get<{ credentials: string[] }>('settings/credentials'),
   addCredential: (alias: string, secret: string) =>

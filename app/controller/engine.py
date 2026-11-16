@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import json
 import sys
 import os
@@ -20,6 +21,14 @@ from ...stages.base import BaseStage
 from .utils import StageResult, JobFileLogBridge, current_job_id as _job_id_ctxvar
 from .queue import JobLogWriter
 from . import maintenance_resolver as mres
+from .public_projection import public_names, public_scalar, public_terraform, public_url, scrub
+from .config import allowed_registry_hosts, registry_host
+from .settings_schema import resolve_credential
+from .offloop import CoalescedWriter, off_loop
+from . import branch_policy, plan_binding
+from .subprocess_env import generator_env, render_env
+from .runner_output import RunnerOutputParser
+from .redaction import SecretRedactor, secret_values_of
 from ...stages.git import (
     SyncRepoStage,
     PublishInventoryStateStage,
@@ -153,6 +162,11 @@ class PipelineTask:
             return int((self.end_time - self.start_time) * 1000)
         return 0
 
+class ContainerStateUnknown(RuntimeError):
+    """Docker did not answer (listing failed or timed out, removal failed): which
+    runner containers exist on this host is UNKNOWN — never "none" (review C1)."""
+
+
 class JobParked(Exception):
     """Raised by :class:`MaintenancePolicyStage` after it parked the job as SCHEDULED:
     ``run_pipeline`` stops without a terminal status (the row is already SCHEDULED)."""
@@ -189,14 +203,19 @@ class MaintenancePolicyStage(BaseStage):
 
     Runs right after ``CloneServiceRepoStage`` so the fresh ``service.yml`` is on disk.
 
-    1. Target hosts = controller hosts whose ``services[]`` list the service (branch
-       ``dev``/``*-dev``/``test`` narrows the stage); the first sorted host decides.
+    1. Target hosts = controller hosts that have the service — own ``services[]`` or
+       through a profile (branch ``dev``/``*-dev``/``test`` narrows the stage). The
+       strictest host decides (``mres.service_policy``): one ``window`` host is
+       enough to make the deploy wait.
     2. Policy applies only to webhook/CI triggers (``policy_applies``). ``force``
-       (run now, promoted job), UI deploys and a due SCHEDULED job (``not_before``
-       reached) skip the evaluation.
+       (run now, promoted job) and UI deploys skip the evaluation.
     3. ``deploy_policy: window`` and not inside a window → park as SCHEDULED until the
        next window start within ``maintenance_schedule_horizon_days`` and raise
-       :class:`JobParked`. No window within the horizon (or none defined at all) →
+       :class:`JobParked`. That also holds for a SCHEDULED job that is due but could
+       not start before its window closed (runner down, backlog): it waits for the
+       next window instead of deploying in business hours (audit OC-13). A job that
+       cannot be parked FAILS — it is never deployed outside its window because the
+       bookkeeping failed. No window within the horizon (or none defined at all) →
        warning, deploy now **and** emit ``maintenance:window_missing`` (decision H; only
        when the service has a CI and the setting is on — ITSM opens a task from it).
     4. Every deploy that proceeds announces a maintenance override for the service
@@ -226,19 +245,23 @@ class MaintenancePolicyStage(BaseStage):
         controller_root = engine.base_git_dir / "iac_controller"
         svc = self.service_name
 
+        async def setting(name: str):
+            # The maintenance settings live in Vault (sync hvac round trip).
+            return await off_loop(getattr, cfg, name)
+
         # 1. Target hosts (controller is the SSoT; the branch only narrows the stage).
         hint = self._stage_hint()
-        targets = await asyncio.to_thread(mres.find_service_hosts, controller_root, svc, stage=hint)
+        targets = await off_loop(mres.find_service_hosts, controller_root, svc, stage=hint)
         if not targets and hint:
-            targets = await asyncio.to_thread(mres.find_service_hosts, controller_root, svc)
+            targets = await off_loop(mres.find_service_hosts, controller_root, svc)
         if not targets:
             log.info(f"[MAINTENANCE] No controller host lists service '{svc}' — no deploy policy, no override.")
             return StageResult(True, "No target host in the controller — maintenance policy skipped")
 
-        services = await asyncio.to_thread(mres.scan_service_ymls, [engine.config.services_dir])
+        services = await off_loop(mres.scan_service_ymls, [engine.config.services_dir])
         items: list[dict] = []
         for site, stage in sorted({(s, st) for s, st, _ in targets}):
-            tree = await asyncio.to_thread(mres.load_tree, controller_root, site, stage)
+            tree = await off_loop(mres.load_tree, controller_root, site, stage)
             items.extend(mres.resolve(site, stage, tree, services, getattr(engine, "_ci_map", None) or {},
                                       include_hypervisors=False))
         decision = mres.service_policy(items, svc, [h for _, _, h in targets])
@@ -249,37 +272,51 @@ class MaintenancePolicyStage(BaseStage):
         # 2./3. Policy.
         sched = None
         if engine.queue is not None and job_id:
-            sched = await asyncio.to_thread(engine.queue.job_schedule, job_id)
+            sched = await off_loop(engine.queue.job_schedule, job_id)
         due = bool(sched and sched.get("not_before") and sched["not_before"] <= now)
         message = "deploying now"
         if not mres.policy_applies(self.payload):
             why = "force / run now" if self.payload.get("force") else f"trigger '{self.payload.get('trigger') or 'ui'}'"
             log.info(f"[MAINTENANCE] {why} — deploy policy not applied, deploying now.")
-        elif due:
-            log.info(f"[MAINTENANCE] Scheduled deployment is due (not_before {mw.iso(sched['not_before'])}) — running.")
-            message = "scheduled window reached, deploying"
         elif decision.deploy_policy == "window":
             current = mw.current_interval(decision.schedules, now) if decision.schedules else None
-            if current is not None:
+            if current is not None and due:
+                log.info(f"[MAINTENANCE] Scheduled deployment is due (not_before {mw.iso(sched['not_before'])}) "
+                         f"and the window is open until {mw.iso(current.end)} — running.")
+                message = "scheduled window reached, deploying"
+            elif current is not None:
                 log.info(f"[MAINTENANCE] Inside maintenance window of {svc} @ {decision.host} "
                          f"until {mw.iso(current.end)} — deploying now.")
                 message = f"inside maintenance window until {mw.iso(current.end)}"
             else:
-                horizon_days = int(cfg.maintenance_schedule_horizon_days)
+                horizon_days = int(await setting("maintenance_schedule_horizon_days"))
                 nxt = (mw.next_start(decision.schedules, now, horizon=timedelta(days=horizon_days))
                        if decision.schedules else None)
                 if nxt is not None:
-                    reason = (f"deploy_policy window — next window of {svc} @ {decision.host} "
-                              f"opens {mw.iso(nxt)}")
+                    if due:
+                        # Due, but no runner started it while the window was open
+                        # (runner down or hung, every slot busy): the window is the
+                        # agreement — wait for the next one.
+                        reason = (f"missed its window (due since {mw.iso(sched['not_before'])}, the window had "
+                                  f"closed before the deploy could start) — next window of {svc} @ "
+                                  f"{decision.host} opens {mw.iso(nxt)}")
+                        log.warning(f"[MAINTENANCE] Scheduled deployment {reason}.")
+                    else:
+                        reason = (f"deploy_policy window — next window of {svc} @ {decision.host} "
+                                  f"opens {mw.iso(nxt)}")
                     parked = False
                     if engine.queue is not None and job_id:
-                        parked = await asyncio.to_thread(
+                        parked = await off_loop(
                             engine.queue.park, job_id, not_before=nxt, window_ci_ids=decision.ci_ids,
                             reason=reason, instance_id=getattr(engine.ctx, "instance_id", None),
                         )
                     if parked:
                         raise JobParked(nxt, reason)
-                    log.warning(f"[MAINTENANCE] Could not park job #{job_id} ({reason}) — deploying now.")
+                    # Never "deploy now" because the bookkeeping failed: that is a
+                    # deploy outside the agreed window (it used to be one).
+                    return StageResult(False, f"The deploy could not be parked for its maintenance window "
+                                              f"({reason}) — it was NOT deployed outside the window. "
+                                              "Re-trigger it (a deploy from the UI runs at once).")
                 else:
                     log.warning(
                         f"[MAINTENANCE] deploy_policy is 'window' for {svc} @ {decision.host} but no "
@@ -287,30 +324,65 @@ class MaintenancePolicyStage(BaseStage):
                         f"window in service.yml or the iac-controller (maintenance / maintenance_default)."
                     )
                     message = f"no maintenance window within {horizon_days} days — deployed at once (warning)"
-                    if not cfg.maintenance_report_missing_window:
+                    if not await setting("maintenance_report_missing_window"):
                         log.info("[MAINTENANCE] window_missing report disabled by setting.")
                     elif not decision.service_ci_id:
                         log.info("[MAINTENANCE] Service has no CI id (Entity Registry absent) — no window_missing event.")
                     else:
                         engine.ctx.emit(mw.TOPIC_WINDOW_MISSING, mres.window_missing_payload(
                             decision, job_id=job_id, horizon_days=horizon_days, now=now))
+        elif due:
+            # Parked under "window", but the policy is a different one by now.
+            log.info(f"[MAINTENANCE] Scheduled deployment is due (not_before {mw.iso(sched['not_before'])}), "
+                     f"deploy_policy is '{decision.deploy_policy}' now — running.")
+            message = "scheduled window reached, deploying"
         else:
             log.info(f"[MAINTENANCE] deploy_policy '{decision.deploy_policy}' for {svc} @ {decision.host} — deploying now.")
 
         # 4. Override: every executed deploy restarts containers → mark maintenance.
-        if cfg.maintenance_deploy_marks_maintenance and decision.ci_ids and job_id and engine.queue is not None:
+        marks_maintenance = bool(await setting("maintenance_deploy_marks_maintenance"))
+        if marks_maintenance and decision.ci_ids and job_id and engine.queue is not None:
             override_id = f"iac-job-{job_id}"
             engine.ctx.emit(mw.TOPIC_OVERRIDE_STARTED, mres.override_started_payload(
                 override_id, decision.ci_ids, reason=f"IaC deploy of {svc} (job #{job_id})", now=now,
-                max_override_minutes=int(cfg.maintenance_max_override_minutes),
-                linger_minutes=int(cfg.maintenance_linger_minutes),
+                max_override_minutes=int(await setting("maintenance_max_override_minutes")),
+                linger_minutes=int(await setting("maintenance_linger_minutes")),
             ))
-            await asyncio.to_thread(engine.queue.set_override, job_id, override_id, decision.ci_ids)
+            await off_loop(engine.queue.set_override, job_id, override_id, decision.ci_ids)
             context["override_id"] = override_id
             log.info(f"[MAINTENANCE] Override {override_id} started for {len(decision.ci_ids)} CI(s).")
-        elif cfg.maintenance_deploy_marks_maintenance and not decision.ci_ids:
+        elif marks_maintenance and not decision.ci_ids:
             log.info("[MAINTENANCE] No CI ids for the target hosts (Entity Registry absent) — no override event.")
         return StageResult(True, f"Maintenance policy '{decision.deploy_policy}': {message}")
+
+
+class BranchPolicyStage(BaseStage):
+    """The runner's check of branch → target (audit OS-05): the catalog was just
+    synced, so this is the authoritative one — the check at trigger time may
+    have had an older snapshot, or none. A branch that is neither the service's
+    production branch nor a dev/test branch is not cloned and not deployed."""
+
+    def __init__(self, payload: dict):
+        super().__init__(f"Branch Policy: {payload.get('service_name')}")
+        self.payload = payload or {}
+
+    async def run(self, engine, context: dict) -> StageResult:
+        try:
+            policy = await off_loop(branch_policy.load, engine.base_git_dir)
+        except Exception as exc:
+            return StageResult(False, f"The service catalog could not be read ({exc}) — the branch cannot be "
+                                      "checked, nothing was deployed.")
+        if policy is None:
+            # No catalog at all: there is nothing a branch could be measured by
+            # (and CloneServiceRepoStage falls back to its default URL, as before).
+            log.warning("Branch policy: no service catalog in the iac-controller checkout — not checked.")
+            return StageResult(True, "No service catalog — branch policy not checked")
+        refused = branch_policy.violation(policy, self.payload)
+        if refused:
+            return StageResult(False, f"Refused: {refused}. Nothing was cloned or deployed.")
+        stage = branch_policy.stage_of(policy, self.payload.get("service_name"),
+                                       self.payload.get("service_branch") or "main")
+        return StageResult(True, f"Branch allowed ({stage})")
 
 
 class StatePrepareStage:
@@ -351,6 +423,7 @@ class TerraformProvisionStage(BaseStage):
             job_id=context.get("job_id", 0),
             force_apply=force_apply,
             adopt_existing=bool(payload.get("adopt_existing")),
+            dry_run=bool(context.get("dry_run")),
         )
         # Tell downstream stages whether a fresh container was actually (re)created,
         # so a complete reinstall can invalidate stale per-host state before rollout.
@@ -378,6 +451,7 @@ class TerraformAdoptStage(BaseStage):
             job_id=context.get("job_id", 0),
             mode="import",
             adopt_existing=True,
+            dry_run=bool(context.get("dry_run")),
         )
         msg = (
             f"Adopted '{self.host_name}' into Terraform state (imported + planned)."
@@ -399,7 +473,7 @@ class TerraformStateCheckStage(BaseStage):
         if not self.host_name:
             return StageResult(False, "Missing host_name for state check.")
         try:
-            ctx = engine._find_terraform_context_for_host(self.host_name)
+            ctx = await off_loop(engine._find_terraform_context_for_host, self.host_name)
         except Exception as exc:
             return StageResult(False, f"State check: {exc}")
         addr = (
@@ -413,9 +487,9 @@ class TerraformStateCheckStage(BaseStage):
         )
         present = False
         try:
-            log_text = Path(
-                engine.config.get_log_path(context.get("job_id", 0))
-            ).read_text(encoding="utf-8", errors="replace")
+            log_text = await off_loop(
+                Path(engine.config.get_log_path(context.get("job_id", 0))).read_text,
+                encoding="utf-8", errors="replace")
             present = addr in log_text
         except Exception:
             pass
@@ -463,6 +537,7 @@ class TerraformAdoptScopeStage(BaseStage):
                 success, _ = await engine.execute_terraform_provision(
                     host_name=h, job_id=context.get("job_id", 0),
                     mode="import", adopt_existing=True,
+                    dry_run=bool(context.get("dry_run")),
                 )
             except Exception as exc:  # noqa: BLE001
                 success = False
@@ -490,6 +565,8 @@ class InfraPlanStage(BaseStage):
             mode="plan",
             job_id=context.get("job_id", 0),
             force_apply=False,
+            # What this plan was made from — an approval is bound to it (OS-12).
+            controller_sha=await engine.pinned_controller_sha(context),
         )
         envs = data.get("environments", 0) if isinstance(data, dict) else 0
         pending = data.get("pending_envs", 0) if isinstance(data, dict) else 0
@@ -516,11 +593,35 @@ class InfraApplyStage(BaseStage):
     async def run(self, engine, context: dict) -> StageResult:
         payload = context.get("payload") or {}
         force_apply = bool(payload.get("approve"))
+        job_id = context.get("job_id", 0)
+        head = await engine.pinned_controller_sha(context)
+        reviewed = None
+        if plan_binding.is_approval(payload):
+            # The approval of a reviewed plan (audit OS-12): apply THAT plan or
+            # nothing. An explicit "Deploy Infra" carries no plan and is not bound.
+            expected, sha = payload.get("plan_expected"), str(payload.get("plan_controller_sha") or "")
+            if not isinstance(expected, dict) or not expected or not sha:
+                return StageResult(False, "This approval does not say which plan was reviewed (it was queued by an "
+                                          "older plugin version or UI) — NOTHING was applied. Run Check Env and "
+                                          "approve the new plan.")
+            if not head or head.lower() != sha.lower():
+                log.error(f"[TF] Approved plan was made at iac-controller@{sha[:12]}, the controller is at "
+                          f"{(head or 'unknown')[:12]} now — nothing is applied; planning again for a new review.")
+                await engine.execute_terraform_infra(mode="plan", job_id=job_id, force_apply=False,
+                                                     controller_sha=head)
+                return StageResult(False, f"The iac-controller moved from {sha[:12]} to {(head or 'unknown')[:12]} "
+                                          "since the plan was reviewed — NOTHING was applied. A fresh plan was "
+                                          f"created by this job (#{job_id}); review and approve it.")
+            reviewed = {"controller_sha": sha, "expected": dict(expected)}
         success, data = await engine.execute_terraform_infra(
             mode="apply",
-            job_id=context.get("job_id", 0),
+            job_id=job_id,
             force_apply=force_apply,
+            reviewed=reviewed,
+            controller_sha=head,
         )
+        if isinstance(data, dict) and data.get("refused"):
+            return StageResult(False, str(data["refused"]), data=data)
         # Hand the freshly created hosts to the follow-up bootstrap stage.
         if isinstance(data, dict):
             context["created_hosts"] = list(data.get("created_hosts") or [])
@@ -578,7 +679,7 @@ class ComplianceBootstrapStage(BaseStage):
     async def run(self, engine, context: dict) -> StageResult:
         if not self.host_name:
             return StageResult(False, "Missing host_name for compliance bootstrap.")
-        if not engine.ctx.get_secret("iac_tf_ssh_private_key"):
+        if not await off_loop(engine.ctx.get_secret, "iac_tf_ssh_private_key"):
             return StageResult(
                 False,
                 "Missing root SSH private key. Set 'Root SSH Private Key' in the "
@@ -615,7 +716,7 @@ class InvalidateHostStateStage(BaseStage):
         if not context.get("container_created"):
             return StageResult(True, "No fresh container created; preserving last_known_good.")
 
-        record = engine.db.get_state("last_known_good")
+        record = await off_loop(engine.db.get_state, "last_known_good")
         state = (record.get("data") if record else {}) or {}
         removed = False
         for key in list(state.keys()):
@@ -623,7 +724,7 @@ class InvalidateHostStateStage(BaseStage):
                 state.pop(key, None)
                 removed = True
         if removed:
-            engine.db.update_state("last_known_good", state, "latest")
+            await off_loop(engine.db.update_state, "last_known_good", state, "latest")
             return StageResult(
                 True,
                 f"Cleared '{self.host_name}' from last_known_good; host rollout will redeploy its services.",
@@ -647,13 +748,37 @@ class TriggerHostRolloutStage(BaseStage):
         # Emit exactly what the Assignments 'Deploy Host' button emits: a host-scoped
         # rollout that runs the per-host drift check and deploys only this host's
         # services on this host. Reuses the proven flow rather than duplicating it.
-        engine.ctx.emit("iac:webhook_verified", {
+        payload = {
             "pipeline_type": "rollout",
             "limit": self.host_name,
             "manual": True,
             "source": "host_provision_chain",
-        })
-        return StageResult(True, f"Host rollout queued for '{self.host_name}' (existing Deploy Host flow).")
+            "trigger": "engine",
+        }
+        submit = getattr(engine, "submit_job_ex", None)
+        if submit is None:
+            # Engine used without the service (tests, legacy): the bus path — an
+            # untrusted trigger there, which is fine for a plain host rollout.
+            engine.ctx.emit("iac:webhook_verified", payload)
+            return StageResult(True, f"Host rollout queued for '{self.host_name}' (existing Deploy Host flow).")
+        try:
+            res = await submit(payload, entitlements=("trigger",))
+        except Exception as exc:
+            return StageResult(False, f"Host rollout for '{self.host_name}' could not be queued: {exc}")
+        # Report what really happened to the hand-off (audit OC-05): this stage
+        # used to log "queued" also when the trigger had been dropped because a
+        # rollout was queued or running — the new host then got no services.
+        if not res.queued:
+            blocker = f" (job #{res.duplicate_of})" if res.duplicate_of else ""
+            log.warning(f"Host rollout for '{self.host_name}' NOT queued: {res.reason}{blocker}.")
+            return StageResult(True, f"Host rollout for '{self.host_name}' NOT queued — {res.reason}{blocker}. "
+                                     "Deploy the host's services once that job is done.")
+        if res.outcome == "follow_up":
+            return StageResult(True, f"Host rollout for '{self.host_name}' queued as job #{res.job_id}; it starts "
+                                     f"when job #{res.waiting_for} (rollout in progress) is done.")
+        if res.outcome == "coalesced":
+            return StageResult(True, f"Host rollout for '{self.host_name}' is already queued as job #{res.job_id}.")
+        return StageResult(True, f"Host rollout queued for '{self.host_name}' as job #{res.job_id}.")
 
 class DetectDriftStage(BaseStage):
     def __init__(self):
@@ -720,18 +845,19 @@ class DetectDriftStage(BaseStage):
     async def run(self, engine, context: dict) -> StageResult:
         log.info("Comparing current desired state against last known good state...")
         
-        current_desired_state = self._load_current_state_from_git(engine)
+        # Every controller YAML is parsed here — off the loop, like the drift diff.
+        current_desired_state = await off_loop(self._load_current_state_from_git, engine)
         if not current_desired_state:
             return StageResult(False, "Could not parse current desired state from Git.")
 
         # Save state to context so PersistStateStage can save it to the DB later
         context["current_desired_state"] = current_desired_state
 
-        last_known_good_record = engine.db.get_state("last_known_good")
+        last_known_good_record = await off_loop(engine.db.get_state, "last_known_good")
         # `data` can be stored as null → coerce to {} so drift parsing never sees None.
         last_known_good_state = (last_known_good_record.get("data") if last_known_good_record else {}) or {}
 
-        diff = DeepDiff(last_known_good_state, current_desired_state, ignore_order=True)
+        diff = await off_loop(DeepDiff, last_known_good_state, current_desired_state, ignore_order=True)
 
         if not diff:
             log.info("✅ No drift detected. Infrastructure is up to date.")
@@ -801,7 +927,7 @@ class PersistStateStage(BaseStage):
         new_state = context.get("current_desired_state")
         if new_state:
             # Use a placeholder 'latest' for commit hash for now
-            engine.db.update_state("last_known_good", new_state, "latest")
+            await off_loop(engine.db.update_state, "last_known_good", new_state, "latest")
         return StageResult(True, "State persisted.")
 
 # ============================================================================
@@ -870,6 +996,7 @@ class SingleServiceStrategy(PipelineStrategy):
         # "service" category / trigger endpoints either way.
         playbook_path, extra_roles = service_rollout_selector(engine, svc_name)
         return [
+            BranchPolicyStage(payload),
             CloneServiceRepoStage(svc_name, svc_branch, payload),
             # Maintenance windows (1.6): decide on the fresh service.yml whether to
             # run now, park until the window, or run with a warning; marks the override.
@@ -962,6 +1089,9 @@ class AdoptHostStrategy(PipelineStrategy):
         # Import existing CT(s) into Terraform state (then plan to verify) so
         # manually-created containers come under management without recreation.
         host_name = str(payload.get("host_name") or "").strip()
+        if host_name.lower() == "all":
+            # A row queued before the scope fix: "all" was never a host.
+            return [TerraformAdoptScopeStage(limit="all")]
         if host_name and not engine.is_known_host(host_name) and engine.is_known_site(host_name):
             # A caller handed the SITE as host_name ("Adopt Host onprem" failed with
             # "No terraform.tfvars.json contains host 'onprem'"): adopt the scope.
@@ -1141,6 +1271,106 @@ class DeploymentEngine:
         # ("service", host, service) → UUID. Feeds the monitoring sync, the
         # maintenance publisher and the policy stage (runner instances only).
         self._ci_map: dict[tuple, str] = {}
+        # job id -> dry-run flag of the persisted payload (see _job_is_dry_run).
+        self._job_modes: dict[int, bool] = {}
+        # Jobs an operator asked to abort. ONLY these become ABORTED when their
+        # task is cancelled; any other cancellation (plugin reload, draining
+        # instance, fenced job) detaches the job without a terminal status.
+        self._abort_requested: set[int] = set()
+        # job id -> (stage index, stage count, stage name) of the running stage.
+        self._job_stage: dict[int, tuple] = {}
+        # Why the runner is stopping (set by IaCService.shutdown) — for the log.
+        self.detaching: str | None = None
+        # job id -> redactor holding the secret values that job was given.
+        self._redactors: dict[int, SecretRedactor] = {}
+
+    def _runner_image(self, kind: str) -> str:
+        """Runner image for ``kind`` (ansible|terraform), verified against the
+        allowlist right before use — raises instead of starting a container from
+        an image somebody pointed elsewhere (audit OS-02)."""
+        checked = getattr(self.config, "checked_runner_image", None)
+        if callable(checked):
+            return checked(kind)
+        return self.config.ansible_docker_image if kind == "ansible" else self.config.terraform_docker_image
+
+    # -- writes that never run on the event loop (review C3 / audit OC-08) ------------
+    @staticmethod
+    def _merge_progress(waiting: dict, new: dict) -> dict:
+        """Two progress updates in a row, as one: the newer value of each field
+        wins, a field the newer update leaves out keeps the older value."""
+        merged = dict(waiting)
+        merged.update({k: v for k, v in new.items() if v is not None and v != ""})
+        return merged
+
+    def _write_progress(self, job_id, values: dict):
+        extra = {"exec_state": values["exec_state"]} if values.get("exec_state") is not None else {}
+        return self.db.update_progress(job_id, values.get("progress"), values.get("current_step"), **extra)
+
+    @property
+    def _progress(self) -> CoalescedWriter:
+        """Progress/step writer of the running jobs: off the loop, one write in
+        flight per job, newest wins (see offloop.CoalescedWriter)."""
+        writer = self.__dict__.get("_progress_writer")
+        if writer is None:
+            writer = self.__dict__["_progress_writer"] = CoalescedWriter(
+                self._write_progress, merge=self._merge_progress, name="progress")
+        return writer
+
+    @property
+    def _runner_snapshots(self) -> CoalescedWriter:
+        """Runner snapshot writer (``JobQueue.set_runners``), same rules."""
+        writer = self.__dict__.get("_runner_snapshot_writer")
+        if writer is None:
+            writer = self.__dict__["_runner_snapshot_writer"] = CoalescedWriter(
+                lambda job_id, snapshot: self.queue.set_runners(job_id, snapshot), name="runners")
+        return writer
+
+    def push_progress(self, job_id, progress=None, current_step=None, *, exec_state=None) -> None:
+        """Record progress / the current step of a running job. Never blocks:
+        the database write happens in the plugin's thread pool, and while one is
+        in flight later calls are folded into a single waiting write. A step per
+        Ansible TASK line used to be a synchronous UPDATE on the event loop —
+        with a dead connection each one froze the instance until the socket
+        timeout (prod 2026-11-11)."""
+        if job_id in (None, -1):
+            return
+        self._progress.push(job_id, {"progress": progress, "current_step": current_step, "exec_state": exec_state})
+
+    async def flush_progress(self, job_id, timeout: float | None = 5.0) -> bool:
+        """Wait (bounded) until the progress of ``job_id`` is in the database."""
+        return await self._progress.flush(job_id, timeout)
+
+    def write_progress_now(self, job_id, progress=None, current_step=None, **kwargs) -> bool:
+        """Synchronous (call through ``off_loop``): write this step after the
+        write in flight; whatever was still waiting is superseded by it."""
+        writer = self._progress
+        with writer.exclusive(job_id):
+            writer.discard(job_id)
+            return bool(self.db.update_progress(job_id, progress, current_step, **kwargs))
+
+    def close_job_row(self, job_id, status: str, *, step: str | None = None, progress=None,
+                      end_override: bool = True) -> bool:
+        """Synchronous (call through ``off_loop``): the terminal write of a job
+        this process executes — last progress first, then the status, as ONE
+        ordered unit. It holds the job's progress lock, so it runs after the
+        progress write in flight and no later one can follow: a terminal write
+        is never overtaken by a late progress write. Returns ``update_job``'s
+        result (False: closed/taken over elsewhere, or the database is away —
+        see ``JobDatabase.unwritten_terminal``).
+
+        This is also where the bounded retry of the terminal write sleeps
+        (review C5, up to 7.5 s): in a pool thread, never on the event loop.
+        """
+        writer = self._progress
+        with writer.exclusive(job_id):
+            values = self._merge_progress(writer.take(job_id) or {}, {"progress": progress, "current_step": step})
+            if any(v is not None for v in values.values()):
+                self._write_progress(job_id, values)
+            done = bool(self.db.update_job(job_id=job_id, status=status))
+            writer.seal(job_id)
+        if end_override:
+            self.end_override_for(job_id)
+        return done
 
     def get_default_ansible_stages(self, pipeline_type: str = "connectivity"):
         if pipeline_type == "rollout":
@@ -1258,9 +1488,12 @@ class DeploymentEngine:
                     "ansible_host": host_data.get("ansible_host"),
                     "groups": groups,
                     "ansible_groups": groups,
-                    "baseline_roles": host_data.get("baseline_roles") or [],
-                    "profiles": host_data.get("profiles") or [],
-                    "terraform": host_data.get("terraform") or {},
+                    "baseline_roles": public_names(host_data.get("baseline_roles")),
+                    "profiles": public_names(host_data.get("profiles")),
+                    # Allowlisted placement facts only: the merged block of a
+                    # hypervisor carries its Proxmox password, API token and SSH
+                    # key, and the monitoring serves its metadata to every viewer.
+                    "terraform": public_terraform(host_data.get("terraform")),
                     "site": site,
                     "stage": stage,
                     "ci_id": host_ci,
@@ -1280,12 +1513,15 @@ class DeploymentEngine:
                         "service_name": docker_name,
                         "service_slug": slug,
                         "name": docker_name,
-                        "state": service.get("state"),
-                        "desired_state": service.get("state"),
-                        "deploy_type": service.get("deploy_type"),
-                        "git_repo": service.get("git_repo"),
-                        "git_version": service.get("git_version"),
-                        "config": service.get("config") or {},
+                        "state": public_scalar(service.get("state")),
+                        "desired_state": public_scalar(service.get("state")),
+                        "deploy_type": public_scalar(service.get("deploy_type")),
+                        "git_repo": public_url(service.get("git_repo")),
+                        "git_version": public_scalar(service.get("git_version")),
+                        # Never the service's config block (vars + secrets of the
+                        # SSoT). The key stays, empty, so the consumer overwrites
+                        # what plugin versions <= 1.6.1 stored there.
+                        "config": {},
                         "groups": groups,
                         "ansible_groups": groups,
                         "site": site,
@@ -1307,10 +1543,12 @@ class DeploymentEngine:
 
     async def emit_monitoring_inventory_sync(self):
         try:
-            inventory = self._load_generated_inventory()
+            # Parsing the generated inventory takes about a second (635 KB of
+            # YAML), building the payload reads every service.yml: off the loop.
+            inventory = await off_loop(self._load_generated_inventory)
             if not inventory:
                 return
-            payload = self._build_monitoring_inventory_payload(inventory)
+            payload = await off_loop(self._build_monitoring_inventory_payload, inventory)
             await self._post_monitoring_inventory(payload)
         except Exception as exc:
             log.error(f"MONITORING: Failed to post inventory sync: {exc}")
@@ -1354,26 +1592,13 @@ class DeploymentEngine:
     # Generic inventory event — consumed by any interested plugin
     # ------------------------------------------------------------------
 
-    # Credentials never leave the plugin on the bus: the merged terraform block
-    # can carry the Proxmox password/token and the SSH key.
-    _TERRAFORM_SECRET_KEYS = {"password", "token", "ssh_key", "api_token", "secret", "private_key"}
-
+    # Credentials never leave the plugin: the merged terraform block can carry
+    # the Proxmox password/token and the SSH key. Every outbound payload (bus,
+    # monitoring sync, snapshots) uses the allowlist in public_projection.
     @classmethod
     def _public_terraform(cls, block: dict | None) -> dict:
-        """Copy of a host's terraform block without any credential-like keys."""
-        out: dict = {}
-        for key, value in (block or {}).items():
-            lk = str(key).lower()
-            if (
-                lk in cls._TERRAFORM_SECRET_KEYS
-                or "password" in lk
-                or "secret" in lk
-                or lk.endswith("_token")
-                or lk.endswith("_key")
-            ):
-                continue
-            out[key] = value
-        return out
+        """Allowlisted, credential-free view of a host's terraform block."""
+        return public_terraform(block)
 
     def _build_inventory_hosts(self, inventory: dict | None = None) -> list[dict]:
         """Generic host list from the generated inventory (sync — YAML read)."""
@@ -1401,15 +1626,15 @@ class DeploymentEngine:
                 "hostname": host_data.get("hostname") or host_name,
                 "ip": host_data.get("ansible_host"),
                 "groups": groups,
-                "baseline_roles": host_data.get("baseline_roles") or [],
+                "baseline_roles": public_names(host_data.get("baseline_roles")),
                 "terraform": self._public_terraform(host_data.get("terraform")),
                 "entity_type": "hypervisor" if is_hypervisor else "host",
                 "site": next((g[len("site_"):] for g in groups if g.startswith("site_")), None),
                 "stage": next((g[len("stage_"):] for g in groups if g.startswith("stage_")), None),
                 # Maintenance windows (1.6): the host's own blocks travel with the event
                 # (consumers evaluate them with core.api.maintenance).
-                "maintenance": host_data.get("maintenance") if isinstance(host_data.get("maintenance"), dict) else None,
-                "incidents": host_data.get("incidents") if isinstance(host_data.get("incidents"), dict) else None,
+                "maintenance": scrub(host_data.get("maintenance")) if isinstance(host_data.get("maintenance"), dict) else None,
+                "incidents": scrub(host_data.get("incidents")) if isinstance(host_data.get("incidents"), dict) else None,
                 "ci_id": None,  # filled in by the Entity Registry when it is present
             })
         return hosts
@@ -1586,11 +1811,11 @@ class DeploymentEngine:
         Both degrade gracefully when the target plugin is absent.
         """
         try:
-            inventory = await asyncio.to_thread(self._load_generated_inventory)
-            hosts = self._build_inventory_hosts(inventory) if inventory else []
+            inventory = await off_loop(self._load_generated_inventory)
+            hosts = await off_loop(self._build_inventory_hosts, inventory) if inventory else []
             if not hosts:
                 return
-            services = self._build_inventory_services(inventory)
+            services = await off_loop(self._build_inventory_services, inventory)
             await self._attach_ci_ids(hosts, services)
             self.ctx.emit("iac:inventory_updated", {"hosts": hosts, "services": services})
             self._register_servers(hosts)
@@ -1628,14 +1853,14 @@ class DeploymentEngine:
             if not controller_root.is_dir():
                 log.debug("MAINTENANCE: no iac_controller checkout — nothing to publish.")
                 return False
-            items = await asyncio.to_thread(
+            items = await off_loop(
                 mres.resolve_all, controller_root, [self.config.services_dir],
                 dict(getattr(self, "_ci_map", None) or {}),
             )
-            defaults = await asyncio.to_thread(mres.default_switches, controller_root)
+            defaults = await off_loop(mres.default_switches, controller_root)
             now = mw.utcnow()
             snapshot = {"items": items, "defaults": defaults, "published_at": mw.iso(now)}
-            await asyncio.to_thread(self.db.update_state, self.MAINTENANCE_SNAPSHOT, snapshot, "")
+            await off_loop(self.db.update_state, self.MAINTENANCE_SNAPSHOT, snapshot, "")
             if items and getattr(self, "_registry_ok", None) is False:
                 log.info(
                     f"MAINTENANCE: Entity Registry unavailable — {len(items)} item(s) resolved "
@@ -1658,7 +1883,7 @@ class DeploymentEngine:
         (the id is taken atomically from the row). Called on every terminal path:
         pipeline end, abort, orphan sweep, container recovery. Sync and thread-safe
         (``ctx.emit`` hops onto the loop since core 1.7)."""
-        if self.queue is None or job_id in (None, -1, 0):
+        if getattr(self, "queue", None) is None or job_id in (None, -1, 0):
             return False
         try:
             override_id = self.queue.clear_override(int(job_id))
@@ -1764,7 +1989,7 @@ class DeploymentEngine:
         async def _running():
             nonlocal running_jobs
             if running_jobs is None:
-                running_jobs = await asyncio.to_thread(self.db.get_jobs_by_status, "RUNNING")
+                running_jobs = await off_loop(self.db.get_jobs_by_status, "RUNNING")
             return running_jobs
 
         # Prevent concurrent bulk rollouts and duplicate single_service runs for the same service.
@@ -1788,15 +2013,15 @@ class DeploymentEngine:
                     if not incoming_limit or incoming_limit == "all":
                         # Global (no-limit) rollout: block if ANY rollout is in flight.
                         log.warning("ENGINE: A rollout is already in progress — global rollout blocked.")
-                        return self._skip_claimed(job_id, "a rollout is already in progress")
+                        return await off_loop(self._skip_claimed, job_id, "a rollout is already in progress", True)
                     # Host-scoped rollout: block if the SAME host is already rolling out.
                     if rollout_key in active_rollout_types:
                         log.warning(f"ENGINE: Rollout for host '{incoming_limit}' is already running — duplicate blocked.")
-                        return self._skip_claimed(job_id, f"rollout for '{incoming_limit}' already running")
+                        return await off_loop(self._skip_claimed, job_id, f"rollout for '{incoming_limit}' already running", True)
                     # Also block if a global (no-limit) rollout is in flight to avoid conflicts.
                     if "rollout:all" in active_rollout_types or "rollout" in active_rollout_types:
                         log.warning(f"ENGINE: Global rollout in progress — host rollout for '{incoming_limit}' blocked.")
-                        return self._skip_claimed(job_id, "global rollout in progress")
+                        return await off_loop(self._skip_claimed, job_id, "global rollout in progress", True)
                 self._active_rollout_keys.add(rollout_key)
             if pipeline_type == "single_service":
                 service_name = str(payload.get("service_name") or "").strip().lower()
@@ -1806,7 +2031,7 @@ class DeploymentEngine:
                     if single_key in self._active_single_service_keys:
                         log.warning(f"ENGINE: Duplicate single_service pipeline ignored for '{service_name}' (in-memory lock).")
                         self._notify("Pipeline Ignored", f"A deployment for {service_name} is already being started.", "warning")
-                        return self._skip_claimed(job_id, f"deployment for {service_name} already starting")
+                        return await off_loop(self._skip_claimed, job_id, f"deployment for {service_name} already starting", True)
 
                     active_service_jobs = [
                         j for j in await _running()
@@ -1815,7 +2040,7 @@ class DeploymentEngine:
                     if active_service_jobs:
                         log.warning(f"ENGINE: Duplicate single_service pipeline ignored for '{service_name}'.")
                         self._notify("Pipeline Ignored", f"A deployment for {service_name} is already running.", "warning")
-                        return self._skip_claimed(job_id, f"deployment for {service_name} already running")
+                        return await off_loop(self._skip_claimed, job_id, f"deployment for {service_name} already running", True)
 
                     self._active_single_service_keys.add(single_key)
             if pipeline_type in ("host_provision", "bootstrap_compliance", "init_host", "compliance", "state_check"):
@@ -1828,13 +2053,13 @@ class DeploymentEngine:
                 if not host_name:
                     log.warning(f"ENGINE: {pipeline_type} ignored (missing host_name).")
                     self._notify("Pipeline Ignored", f"{pipeline_type} requires host_name.", "warning")
-                    return self._skip_claimed(job_id, f"{pipeline_type} requires host_name")
+                    return await off_loop(self._skip_claimed, job_id, f"{pipeline_type} requires host_name")
                 payload["host_name"] = host_name
                 terraform_key = f"{pipeline_type}:{host_name}"
                 if terraform_key in self._active_terraform_host_keys:
                     log.warning(f"ENGINE: Duplicate {pipeline_type} ignored for '{host_name}' (in-memory lock).")
                     self._notify("Pipeline Ignored", f"A {pipeline_type} run for {host_name} is already being started.", "warning")
-                    return self._skip_claimed(job_id, f"{pipeline_type} for {host_name} already starting")
+                    return await off_loop(self._skip_claimed, job_id, f"{pipeline_type} for {host_name} already starting", True)
 
                 active_tf_jobs = [
                     j for j in await _running()
@@ -1843,7 +2068,7 @@ class DeploymentEngine:
                 if active_tf_jobs:
                     log.warning(f"ENGINE: Duplicate {pipeline_type} ignored for '{host_name}'.")
                     self._notify("Pipeline Ignored", f"A {pipeline_type} run for {host_name} is already running.", "warning")
-                    return self._skip_claimed(job_id, f"{pipeline_type} for {host_name} already running")
+                    return await off_loop(self._skip_claimed, job_id, f"{pipeline_type} for {host_name} already running", True)
                 self._active_terraform_host_keys.add(terraform_key)
             if pipeline_type in ("infra_plan", "infra_apply"):
                 active_infra_jobs = [
@@ -1853,13 +2078,14 @@ class DeploymentEngine:
                 if active_infra_jobs:
                     log.warning("ENGINE: An infrastructure plan/apply is already in progress.")
                     self._notify("Pipeline Ignored", "An infrastructure plan/apply is already running.", "warning")
-                    return self._skip_claimed(job_id, "an infrastructure plan/apply is already running")
+                    return await off_loop(self._skip_claimed, job_id, "an infrastructure plan/apply is already running", True)
 
         # Every key reserved above is released in this finally — also when the
         # pipeline set-up raises before its own try/finally is reached (job row,
         # strategy, log bridge, notify). A leaked key blocks that target on this
         # instance until the process restarts.
         try:
+            self._guard_bounces.pop(job_id, None)
             await self._execute_dispatched(payload, job_id, pipeline_type)
         finally:
             if single_key:
@@ -1887,9 +2113,9 @@ class DeploymentEngine:
         if job_id:
             # Claimed from the queue: the row exists (RUNNING, owned by this instance).
             current_job_id = job_id
-            self.db.update_progress(current_job_id, progress=0, current_step="Pending Start")
+            self.push_progress(current_job_id, progress=0, current_step="Pending Start")
         else:
-            current_job_id = self.db.create_job(db_type)
+            current_job_id = await off_loop(self.db.create_job, db_type)
 
         # FILE LOGGING SETUP. Tag this execution context with the job id so the
         # bridge persists only this job's records (concurrent pipelines share the
@@ -1897,11 +2123,15 @@ class DeploymentEngine:
         # also go to the database (JobLogWriter) so every instance can serve them.
         _job_ctx_token = _job_id_ctxvar.set(current_job_id)
         _writer = self._log_writer(current_job_id)
+        # Known secrets first, then the bridge: no line of this job is stored unmasked.
+        await self._prime_redactor(current_job_id)
         bridge = JobFileLogBridge(self.config.get_log_path(current_job_id), job_id=current_job_id,
-                                  sink=_writer.append if _writer else None)
+                                  sink=_writer.append if _writer else None,
+                                  redact=lambda line, _jid=current_job_id: self._redact(_jid, line))
         logging.getLogger("IaC:Engine").addHandler(bridge)
         final_status = "FAILED"
         parked = False  # set by the JobParked handler (maintenance windows, 1.6)
+        detached = False  # cancelled without an abort request: the job lives on (OC-10)
 
         log.info("[SYSTEM] Pipeline Started")
         log.info(f"[SYSTEM] Job #{current_job_id} registered in database.")
@@ -1915,11 +2145,12 @@ class DeploymentEngine:
         # with --check and no deploy state is persisted. Independent of auto_apply,
         # which only gates infrastructure applies (Terraform, rule-engine actions).
         dry_run = _payload_dry_run(payload)
+        self._set_job_mode(current_job_id, dry_run)
         if dry_run:
             pipeline_label = f"{pipeline_label} (Dry-Run)"
             log.warning(
-                "[SYSTEM] DRY-RUN job: Ansible runs with --check, nothing is changed "
-                "and no deploy state is persisted."
+                "[SYSTEM] DRY-RUN job: Ansible runs with --check, Terraform only plans "
+                "(no apply, no state import); nothing is changed and no deploy state is persisted."
             )
 
         # Sticky "started" notification routed through the central router.
@@ -1969,7 +2200,8 @@ class DeploymentEngine:
         pipeline = [StatePrepareStage(prefix)]
 
         # Type-specific stages (polymorphic strategy replaces the if/elif ladder).
-        pipeline.extend(strategy.build_stages(self, payload, context))
+        # Off the loop: building them reads the service catalog / tfvars files.
+        pipeline.extend(await off_loop(strategy.build_stages, self, payload, context))
 
         try:
             # host_provision organizes stages into named tasks with tracking.
@@ -1981,7 +2213,7 @@ class DeploymentEngine:
                 total_stages = len(pipeline)
                 for idx, stage in enumerate(pipeline):
                     pct = int((idx / total_stages) * 50)
-                    self.db.update_progress(current_job_id, progress=pct, current_step=f"Stage: {stage.name}")
+                    self._mark_stage(current_job_id, idx, total_stages, stage, pct, f"Stage: {stage.name}")
                     
                     log.info(f"--- STAGE: {stage.name} ---")
                     res = await stage.run(self, context)
@@ -1995,7 +2227,7 @@ class DeploymentEngine:
             log.info("[SYSTEM] Pipeline completed successfully.")
             final_status = "SUCCESS"
             self.state["last_deployment"] = final_status
-            self.db.update_progress(
+            self.push_progress(
                 current_job_id, progress=100,
                 current_step="Completed (Dry-Run, nothing changed)" if dry_run else "Completed Successfully",
             )
@@ -2036,19 +2268,44 @@ class DeploymentEngine:
                 severity="success",
             )
         except asyncio.CancelledError:
-            # Abort (do_abort → worker.cancel): the row is closed as ABORTED by the
-            # finally below; the containers were killed by abort_job().
-            final_status = "ABORTED"
-            self.state["last_deployment"] = final_status
-            log.warning("[SYSTEM] Pipeline aborted.")
+            if current_job_id in self.__dict__.setdefault("_abort_requested", set()):
+                # Abort (do_abort → worker.cancel): the row is closed as ABORTED by the
+                # finally below; the containers are killed by abort_job(). A stop
+                # for the runtime limit closes it as FAILED with its reason instead.
+                final_status, stop_reason = self._stop_verdict(current_job_id)
+                self.state["last_deployment"] = final_status
+                if stop_reason:
+                    log.error(f"[SYSTEM] Pipeline stopped: {stop_reason}.")
+                    self.push_progress(current_job_id, progress=None, current_step=stop_reason)
+                else:
+                    log.warning("[SYSTEM] Pipeline aborted.")
+            else:
+                # Any other cancellation — plugin reload/disable, a draining
+                # instance, a job that was closed elsewhere: the containers keep
+                # running, so this is NOT the end of the job. No terminal status,
+                # the maintenance override stays; the next runner start re-attaches
+                # to the containers and closes the job from all of them (OC-10).
+                detached = True
+                stage = self.__dict__.setdefault("_job_stage", {}).get(current_job_id)
+                where = f"stage {stage[0]}/{stage[1]} ({stage[2]})" if stage else "start-up"
+                why = getattr(self, "detaching", None) or "stopping"
+                log.warning(f"[SYSTEM] Runner is {why} — pipeline detached at {where}; running containers "
+                            "are left alone. The next runner start re-attaches or closes the job.")
+                # Written by the progress writer's own task (the core cancels this
+                # one); IaCService.shutdown waits for it (flush_for_shutdown).
+                self.push_progress(
+                    current_job_id, progress=None,
+                    current_step=f"Runner reloading — detached at {where}; containers keep running")
             raise
         except JobParked as parked_exc:
             # Maintenance windows (1.6): the policy stage parked the job as SCHEDULED
             # (row already updated, claim released). No terminal status, no override.
             parked = True
             log.info(f"[SYSTEM] Deployment scheduled for {mw.iso(parked_exc.not_before)} ({parked_exc.reason})")
-            self.db.update_progress(current_job_id, progress=0,
-                                    current_step=f"Scheduled for {mw.iso(parked_exc.not_before)}")
+            # The row is SCHEDULED now and its claim released — this describes a
+            # row we gave up on purpose, hence the one unfenced progress write.
+            await off_loop(self.write_progress_now, current_job_id, 0,
+                           f"Scheduled for {mw.iso(parked_exc.not_before)}", fenced=False)
             self.ctx.notify(
                 "deployment_started",
                 payload={
@@ -2070,11 +2327,13 @@ class DeploymentEngine:
         except Exception as e:
             import traceback
             error_detail = str(e) if str(e) else f"{type(e).__name__}: (no message)"
+            # Leaves the plugin (bell, Discord, …): masked and capped like the log.
+            error_detail = self._redact(current_job_id, error_detail)[:500]
             log.error(f"!!! [FATAL] {error_detail}")
             log.debug(f"Exception traceback:\n{traceback.format_exc()}")
             final_status = "FAILED"
             self.state["last_deployment"] = final_status
-            self.db.update_progress(current_job_id, progress=None, current_step="Failed")
+            self.push_progress(current_job_id, progress=None, current_step="Failed")
             
             # Upsert the sticky bell entry in-place with the failure result.
             if pipeline_type == "single_service":
@@ -2114,88 +2373,109 @@ class DeploymentEngine:
             _job_id_ctxvar.reset(_job_ctx_token)
             self.state["running_jobs"] = max(0, self.state.get("running_jobs", 0) - 1)
             self.state["is_running"] = self.state["running_jobs"] > 0
-            if not parked:
+            if not parked and not detached:
                 # Per-job result (never the shared last_deployment: concurrent pipelines
                 # used to overwrite each other's final status through it). A parked job
-                # is already SCHEDULED — writing a terminal status would un-park it.
-                self.db.update_job(job_id=current_job_id, status=final_status)
-                self.end_override_for(current_job_id)
+                # is already SCHEDULED — writing a terminal status would un-park it; a
+                # detached job is still running in its containers.
+                # Off the loop — the write retries with pauses when the connection
+                # is lost (up to 7.5 s) — and in order: the last progress first,
+                # then the status, then the maintenance override (close_job_row).
+                if not await off_loop(self.close_job_row, current_job_id, final_status):
+                    if current_job_id in getattr(self.db, "unwritten_terminal", {}):
+                        # The database did not take the write (review C5) — it is
+                        # kept and stored by the worker once the database is back.
+                        log.error(f"[SYSTEM] Job #{current_job_id}: result {final_status} could not be written — "
+                                  "the database is unreachable; it is written as soon as it answers again.")
+                    else:
+                        # Conditional write (fencing): the row was closed or taken
+                        # over elsewhere — the orphan sweep, an abort on another
+                        # instance, a newer incarnation. Its state stands.
+                        log.warning(f"[SYSTEM] Job #{current_job_id}: result {final_status} NOT written — "
+                                    "the job was already closed or taken over elsewhere.")
             self._sync_runners(current_job_id, force=True)
             await self._close_log_writer(current_job_id)
-            self._cleanup_inventory_snapshot(current_job_id)
+            if not detached:
+                # A detached job's playbook may still read its inventory snapshot.
+                await off_loop(self._cleanup_inventory_snapshot, current_job_id)
+            self.__dict__.setdefault("_job_modes", {}).pop(current_job_id, None)
+            self.__dict__.setdefault("_job_stage", {}).pop(current_job_id, None)
+            self.__dict__.setdefault("_abort_requested", set()).discard(current_job_id)
+            self.__dict__.setdefault("_stop_reasons", {}).pop(current_job_id, None)
+            self.__dict__.setdefault("_redactors", {}).pop(current_job_id, None)
             await self._publish_snapshots()
 
-    async def resume_bulk_rollout(self, job_id: int, pending_services: list[str]):
-        if not pending_services: return
-        
-        self.state["running_jobs"] = self.state.get("running_jobs", 0) + 1
-        self.state["is_running"] = self.state["running_jobs"] > 0
-        
-        self.db.update_progress(job_id, progress=50, current_step="Resuming Bulk Rollout...")
-        _job_ctx_token = _job_id_ctxvar.set(job_id)
-        _writer = self._log_writer(job_id)
-        bridge = JobFileLogBridge(self.config.get_log_path(job_id), job_id=job_id,
-                                  sink=_writer.append if _writer else None)
-        logging.getLogger("IaC:Engine").addHandler(bridge)
-        final_status = "FAILED"
-        log.info(f"[SYSTEM] Resuming {len(pending_services)} pending services from job #{job_id}")
-        
-        self.ctx.emit(
-            "system:notify",
-            {
-                "id": f"job_{job_id}",
-                "title": f"Pipeline #{job_id}",
-                "message": "Resuming Bulk Rollout...",
-                "type": "ongoing",
-                "toast": False,
-                "emit_outbound": False,
-            },
-        )
-        
-        # TODO(agent): the original job payload (incl. dry_run) is not available here,
-        # so a resumed rollout always deploys for real.
-        context = {"payload": {}, "job_id": job_id}
-        stage = AsyncBulkRolloutStage(inventory_path="global/ansible/inventory.yml", limit="all", target_services=pending_services)
+    # NB: there is deliberately no "resume" of an interrupted bulk rollout any more
+    # (audit OC-07 / OS-08). The old resume_bulk_rollout() rebuilt the stage from an
+    # empty payload: a dry-run or --check-gated rollout was continued FOR REAL and a
+    # host-scoped one was widened to every host. A job row does not record enough to
+    # continue safely (which stage owned the pending list, the effective check mode
+    # of a rule action, the remaining stages), so an interrupted rollout is closed
+    # as FAILED "interrupted — re-trigger" (see interrupted_reason).
 
+    async def interrupted_reason(self, job_id: int) -> str | None:
+        """Why ``job_id`` cannot be reported as completed after a runner restart:
+        its bulk rollout still lists services that were never deployed."""
         try:
-            res = await stage.run(self, context)
-            log.info("[SYSTEM] Resumed Pipeline completed.")
-            final_status = "SUCCESS" if res.success else "FAILED"
-            self.state["last_deployment"] = final_status
-            if res.success:
-                self.db.update_progress(job_id, progress=100, current_step="Resume Completed")
-                self._notify_clear(f"job_{job_id}")
-                self._notify(f"Pipeline #{job_id}", "Resume completed successfully.", "positive", persist=False)
-            else:
-                self._notify(
-                    f"Pipeline #{job_id} Resume Failed", "Stage failed.", "negative",
-                    notification_id=f"job_{job_id}",
-                )
-        except Exception as e:
-            log.error(f"!!! [FATAL] {str(e)}")
-            final_status = "FAILED"
-            self.state["last_deployment"] = final_status
-            self.db.update_progress(job_id, progress=None, current_step="Resume Failed")
-            self._notify(f"Pipeline #{job_id} Resume Failed", str(e), "negative", notification_id=f"job_{job_id}")
-        finally:
-            logging.getLogger("IaC:Engine").removeHandler(bridge)
-            _job_id_ctxvar.reset(_job_ctx_token)
-            self.state["running_jobs"] = max(0, self.state.get("running_jobs", 0) - 1)
-            self.state["is_running"] = self.state["running_jobs"] > 0
-            self.db.update_job(job_id=job_id, status=final_status)
-            self._sync_runners(job_id, force=True)
-            await self._close_log_writer(job_id)
+            pending = await off_loop(self.db.get_pending_tasks, job_id)
+        except Exception as exc:
+            # Unknown is not "complete": never turn an unreadable row into SUCCESS.
+            return f"Interrupted by a runner restart (pending services unreadable: {exc}) — re-trigger the pipeline"
+        if not isinstance(pending, list) or not pending:
+            return None
+        return (f"Interrupted by a runner restart — {len(pending)} service(s) were not deployed; "
+                "nothing is resumed automatically, re-trigger the rollout")
+
+    # -- job mode (dry-run) -----------------------------------------------------------
+    def _set_job_mode(self, job_id, dry_run: bool) -> None:
+        self.__dict__.setdefault("_job_modes", {})[job_id] = bool(dry_run)
+
+    async def _job_is_dry_run(self, job_id) -> bool:
+        """Is ``job_id`` a dry-run job? The answer belongs to the JOB, not to the
+        caller: it is registered from the persisted payload when the job starts
+        and re-read from the job row on any path that did not go through there.
+        Both executors ask this, so no stage can run a dry-run job for real by
+        forgetting to pass a flag (audit OS-08). A row that cannot be read raises
+        — an unknown mode never defaults to "real"."""
+        modes = self.__dict__.setdefault("_job_modes", {})
+        if job_id in modes:
+            return modes[job_id]
+        if not job_id or job_id == -1:
+            return False        # no job row (legacy direct call): the caller's flags decide
+        loader = getattr(getattr(self, "db", None), "get_job_payload", None)
+        if loader is None:
+            return False
+        try:
+            payload = await off_loop(loader, job_id)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Cannot determine the mode (dry-run or real) of job #{job_id}: {exc} — refusing to execute."
+            ) from exc
+        dry = _payload_dry_run(payload) if isinstance(payload, dict) else False
+        modes[job_id] = dry
+        return dry
 
     async def sync_core_repos(self):
-        """Periodic/Startup task to keep core repositories up to date."""
+        """Pull the core repositories (``repo_sync`` job).
+
+        Under the state lock (audit OC-14): a sync resets the working trees to
+        their remotes. Outside the lock it could run between a pipeline's
+        generation and its publish — the generated inventory was wiped, the
+        publish said "no changes" and the rule engine had nothing to act on.
+        Must not be called with the lock held (the pipeline prefix syncs the
+        repositories itself, see StatePrepareStage).
+        """
         log.info("[SYSTEM] Initiating background sync for core repositories...")
-        
-        all_success = True
-        for repo in ["iac_controller", "inventory_state", "config_engine", "aac_factory"]:
-            success = await self.execute_git_sync(repo)
-            if not success:
-                log.warning(f"Failed to sync {repo} during background operation.")
-                all_success = False
+        lock = getattr(self, "_state_publish_lock", None)
+        if lock is not None and lock.locked():
+            log.info("[SYSTEM] The repositories are in use (a pipeline prepares state, or another sync runs) — waiting.")
+        async with (lock if lock is not None else contextlib.AsyncExitStack()):
+            all_success = True
+            for repo in ["iac_controller", "inventory_state", "config_engine", "aac_factory"]:
+                success = await self.execute_git_sync(repo)
+                if not success:
+                    log.warning(f"Failed to sync {repo} during background operation.")
+                    all_success = False
         if not all_success:
             log.warning("[SYSTEM] Core repository sync completed with failures. Check logs.")
         return all_success
@@ -2204,12 +2484,42 @@ class DeploymentEngine:
     # Cluster control plane (plugin ≥ 1.4): queue-aware helpers
     # ------------------------------------------------------------------
 
-    def _skip_claimed(self, job_id, reason: str):
-        """The dispatch guard rejected a job the worker already claimed: the row
-        must not stay RUNNING forever — close it as ABORTED with the reason."""
-        if job_id:
-            self.db.update_progress(job_id, progress=None, current_step=f"Skipped: {reason}"[:250])
-            self.db.update_job(job_id, "ABORTED")
+    #: How often the dispatch guard hands one claimed job back to the queue before
+    #: it gives up on it (see _skip_claimed).
+    _MAX_GUARD_BOUNCES = 3
+
+    @property
+    def _guard_bounces(self) -> dict:
+        return self.__dict__.setdefault("_guard_bounce_counts", {})
+
+    def _skip_claimed(self, job_id, reason: str, busy: bool = False):
+        """The dispatch guard rejected a job the worker already claimed. Nothing of
+        the job has run; the row must not stay RUNNING.
+
+        ``busy`` — the target is occupied by another job. The claim skips such a
+        job (``JobQueue.claim_next``), so this is the rare race of two runners
+        claiming conflicting targets in the same moment. The job was accepted and
+        is not dropped (audit OC-05): it goes back to the queue and is claimed
+        again once the target is free. Bounded — a job the guard keeps rejecting
+        (and every job rejected for another reason) is closed as ABORTED with the
+        reason, as before.
+
+        Synchronous database work: call it through ``off_loop``.
+        """
+        if not job_id:
+            return None
+        queue = getattr(self, "queue", None)
+        if busy and queue is not None:
+            bounces = self._guard_bounces
+            bounces[job_id] = bounces.get(job_id, 0) + 1
+            if bounces[job_id] <= self._MAX_GUARD_BOUNCES:
+                token = getattr(queue, "claims", {}).get(job_id)
+                if queue.release(job_id, token, f"Queued — waiting: {reason}"[:250]):
+                    log.warning(f"ENGINE: job #{job_id} handed back to the queue ({reason}).")
+                    return None
+            bounces.pop(job_id, None)
+        self.db.update_progress(job_id, progress=None, current_step=f"Skipped: {reason}"[:250])
+        self.db.update_job(job_id, "ABORTED")
         return None
 
     def _log_writer(self, job_id):
@@ -2234,8 +2544,65 @@ class DeploymentEngine:
             except Exception as exc:
                 log.debug("Job log writer close failed: %s", exc)
 
+    # -- redaction (audit OS-07) -----------------------------------------------------------
+    def _redactor(self, job_id) -> SecretRedactor:
+        return self.__dict__.setdefault("_redactors", {}).setdefault(job_id, SecretRedactor())
+
+    def _redact(self, job_id, text: str) -> str:
+        """Mask the job's secret values and credential-shaped text in ``text``."""
+        try:
+            return self._redactor(job_id).redact(text)
+        except Exception:
+            return "[log line withheld: redaction failed]"
+
+    async def _prime_redactor(self, job_id) -> None:
+        """Register the secret values this job can be given, read once and off the
+        event loop: the plugin's secret slots, the webhook token and every stored
+        git credential. Terraform secrets and the inventory's credential values
+        are added where they are built/generated."""
+        def _collect() -> list:
+            from .settings_schema import SETTINGS_FIELDS, OrchestratorSettings
+
+            # The root PUBLIC key is not a secret (and its text is all over tofu output).
+            keys = [f.storage_key() for f in SETTINGS_FIELDS if f.sensitive and f.key != "iac_tf_ssh_key"]
+            keys.append("gitlab_webhook_token")
+            try:
+                keys += [a for a in OrchestratorSettings(self.ctx, None).credential_aliases() if isinstance(a, str)]
+            except Exception:
+                pass
+            values = []
+            for key in keys:
+                try:
+                    values.append(self.ctx.get_secret(key))
+                except Exception:
+                    continue
+            return values
+
+        try:
+            self._redactor(job_id).add_many(await off_loop(_collect))
+        except Exception as exc:
+            log.debug(f"redactor for job #{job_id} not primed from Vault: {exc}")
+
+    def _register_inventory_secrets(self, job_id) -> int:
+        """Add the credential-like values of the job's generated inventory (service
+        ``config.secrets``, host vars such as ansible_password / vault_vars) — what
+        ends up in rendered env files and therefore in a ``--diff``. Sync (YAML
+        parse): call through ``off_loop``."""
+        try:
+            snapshot = self._job_inventory_snapshot_dir(job_id) / "global" / "ansible" / "inventory.yml"
+            shared = self.base_git_dir / "inventory_state" / "global" / "ansible" / "inventory.yml"
+            with open(snapshot if snapshot.exists() else shared, "r", encoding="utf-8") as handle:
+                data = yaml.safe_load(handle) or {}
+        except Exception:
+            return 0
+        redactor = self._redactor(job_id)
+        redactor.add_many(secret_values_of(data))
+        return len(redactor)
+
     def _log_line(self, job_id, text: str) -> None:
-        """Append one line to the job log: the host file (as before) and the database."""
+        """Append one line to the job log: the host file (as before) and the database.
+        Secret values are masked first — nothing unredacted is stored or streamed."""
+        text = self._redact(job_id, text)
         try:
             with open(self.config.get_log_path(job_id), "a", encoding="utf-8") as f:
                 f.write(text + "\n")
@@ -2261,8 +2628,10 @@ class DeploymentEngine:
             if isinstance(data, dict) and data.get("job_id") == job_id
         }
         try:
-            self.ctx.create_task(asyncio.to_thread(self.queue.set_runners, job_id, snapshot),
-                                 name=f"iac:runners:{job_id}")
+            # One write in flight per job, the newest snapshot wins: a task per
+            # second per job piled up threads (and pooled connections) for as
+            # long as the database did not answer.
+            self._runner_snapshots.push(job_id, snapshot)
         except Exception as exc:
             log.debug("Runner snapshot not scheduled: %s", exc)
 
@@ -2273,7 +2642,7 @@ class DeploymentEngine:
         try:
             from . import api as _api
 
-            await asyncio.to_thread(_api.publish_repo_snapshots)
+            await off_loop(_api.publish_repo_snapshots)
         except Exception as exc:
             log.debug("Repo snapshot publish skipped: %s", exc)
 
@@ -2285,141 +2654,379 @@ class DeploymentEngine:
         writer = self._log_writer(job_id)
         # Same per-job log capture as run_pipeline, so the git sync output lands in the job log.
         _job_ctx_token = _job_id_ctxvar.set(job_id)
+        await self._prime_redactor(job_id)
         bridge = JobFileLogBridge(self.config.get_log_path(job_id), job_id=job_id,
-                                  sink=writer.append if writer else None)
+                                  sink=writer.append if writer else None,
+                                  redact=lambda line, _jid=job_id: self._redact(_jid, line))
         logging.getLogger("IaC:Engine").addHandler(bridge)
         try:
-            self.db.update_progress(job_id, progress=10, current_step="Syncing core repositories")
+            self.push_progress(job_id, progress=10, current_step="Syncing core repositories")
             log.info("[SYSTEM] Repository sync started.")
             ok = await self.sync_core_repos()
-            self.db.update_progress(job_id, progress=80, current_step="Publishing snapshots")
+            self.push_progress(job_id, progress=80, current_step="Publishing snapshots")
             await self._publish_snapshots()
             final_status = "SUCCESS" if ok else "FAILED"
-            self.db.update_progress(job_id, progress=100 if ok else None,
-                                    current_step="Repositories synced" if ok else "Sync completed with failures")
+            self.push_progress(job_id, progress=100 if ok else None,
+                               current_step="Repositories synced" if ok else "Sync completed with failures")
             log.info(f"[SYSTEM] Repository sync finished: {final_status}.")
         except asyncio.CancelledError:
-            final_status = "ABORTED"
+            # ABORTED only on an operator's abort; otherwise the row stays RUNNING
+            # and the next runner start closes it ("System Restart").
+            requested = job_id in self.__dict__.setdefault("_abort_requested", set())
+            final_status = self._stop_verdict(job_id)[0] if requested else None
             raise
         except Exception as exc:
             log.error(f"Repository sync job #{job_id} failed: {exc}")
-            self.db.update_progress(job_id, progress=None, current_step=f"Failed: {exc}"[:250])
+            self.push_progress(job_id, progress=None, current_step=f"Failed: {exc}"[:250])
         finally:
             logging.getLogger("IaC:Engine").removeHandler(bridge)
             _job_id_ctxvar.reset(_job_ctx_token)
             self.state["running_jobs"] = max(0, self.state.get("running_jobs", 0) - 1)
             self.state["is_running"] = self.state["running_jobs"] > 0
-            self.db.update_job(job_id, final_status)
+            if final_status:
+                await off_loop(self.close_job_row, job_id, final_status, end_override=False)
+            self.__dict__.setdefault("_abort_requested", set()).discard(job_id)
+            self.__dict__.setdefault("_stop_reasons", {}).pop(job_id, None)
             await self._close_log_writer(job_id)
 
-    async def finalize_from_containers(self, job_id: int, *, reason: str = "runner restarted") -> bool:
-        """A job whose runner process died (self-deploy, restart) may still have
-        its ``aac-runner-*`` containers on this host: re-attach to running ones,
-        read the exit code of finished ones, append their log tail to the job log
-        and close the row. Returns True when the job was handled here."""
-        if not shutil.which("docker"):
-            return False
+    def request_abort(self, job_id: int, *, status: str = "ABORTED", reason: str | None = None) -> None:
+        """Mark ``job_id`` as stopped on request: its cancellation is terminal, not
+        a detach. An operator's abort ends as ABORTED; the sweep's stop for the
+        maximum runtime (review C4) passes ``status="FAILED"`` and its reason."""
+        self.__dict__.setdefault("_abort_requested", set()).add(int(job_id))
+        if status == "FAILED":
+            self.__dict__.setdefault("_stop_reasons", {})[int(job_id)] = ("FAILED", str(reason or "")[:250])
+
+    def _stop_verdict(self, job_id: int) -> tuple[str, str | None]:
+        """``(final status, reason)`` of a requested stop — ABORTED unless the
+        request said otherwise."""
+        status, reason = self.__dict__.setdefault("_stop_reasons", {}).get(int(job_id), ("ABORTED", None))
+        return status, (reason or None)
+
+    def _mark_stage(self, job_id, index: int, total: int, stage, progress, step: str) -> None:
+        """Progress write of a stage start that also records WHERE the job is, in
+        the row (``exec_state``): restart recovery decides from it whether the
+        pipeline had reached its last stage."""
+        name = str(getattr(stage, "name", "") or stage.__class__.__name__)
+        self.__dict__.setdefault("_job_stage", {})[job_id] = (index + 1, total, name)
+        self.push_progress(job_id, progress=progress, current_step=step, exec_state={
+            "stage": index + 1, "stages": total, "stage_name": name, "last": index + 1 >= total,
+        })
+
+    def register_recovered(self, job_id: int, containers: list[dict]) -> None:
+        """Make re-attached containers visible (UI, heartbeat) before their
+        watchers start."""
+        tasks = self.state.setdefault("active_tasks", {})
+        for container in containers:
+            tasks[container["task_name"]] = {
+                "status": "running_terraform" if container["kind"] == "terraform" else "running_ansible",
+                "logs": [], "job_id": job_id,
+            }
+        self._sync_runners(job_id, force=True)
+
+    async def recover_job(self, job_id: int, containers: list[dict]) -> str | None:
+        """Close a job a previous incarnation of this runner left behind, from ALL
+        its containers (audit OC-10) — running ones are followed to their end,
+        finished ones are read; output that is already in the job log is not
+        stored twice.
+
+        * a container failed                       → FAILED
+        * services of a bulk rollout never started → FAILED "Interrupted …" (OC-07)
+        * the pipeline was not in its last stage   → FAILED "Interrupted … at stage
+          i/n": the remaining stages (service deploy, rules, state persist) did
+          not run — a green container is not a green pipeline
+        * last stage and every container exit 0    → SUCCESS
+        * rows without stage info (older plugin)   → exit codes decide, as before
+
+        Returns the final status, ``None`` when the row was closed elsewhere
+        meanwhile (its state stands). A cancellation (another reload) leaves the
+        row RUNNING for the next incarnation.
+        """
+        self.state["running_jobs"] = self.state.get("running_jobs", 0) + 1
+        self.state["is_running"] = True
         try:
-            ps = await asyncio.create_subprocess_exec(
-                "docker", "ps", "-a", "--filter", f"label=iac_job_id={job_id}",
-                "--format", "{{.ID}}\t{{.Names}}\t{{.State}}\t{{.Label \"iac_task_name\"}}",
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
-            )
-            out, _ = await ps.communicate()
-        except Exception as exc:
-            log.debug(f"finalize_from_containers: docker ps failed: {exc}")
-            return False
-        rows = [ln.split("\t") for ln in out.decode(errors="replace").splitlines() if ln.strip()]
-        if not rows:
-            return False
+            # The rest of the containers' output is masked like the first part was.
+            await self._prime_redactor(job_id)
+            await off_loop(self._register_inventory_secrets, job_id)
+            watchers = []
+            for container in containers:
+                stored = 0
+                if getattr(self, "queue", None) is not None:
+                    stored = await off_loop(self.queue.count_task_lines, job_id, container["task_name"])
+                watchers.append(self._watch_detached_runner(
+                    container["name"], container["task_name"], job_id,
+                    kind=container["kind"], skip_lines=stored))
+            results = await asyncio.gather(*watchers, return_exceptions=True)
+            all_ok = all(isinstance(r, tuple) and bool(r[0]) for r in results)
+            # "Ended" needs an exit code: a watcher that lost track of its container
+            # does not know whether it still runs.
+            all_ended = all(isinstance(r, tuple) and isinstance(r[1], dict) and r[1].get("exit_code") is not None
+                            for r in results)
 
-        running = [r for r in rows if len(r) >= 3 and r[2] == "running"]
-        if running:
-            # Still executing: re-attach exactly like the startup reconciliation does.
-            for cid, name, _state, *rest in running:
-                task_name = (rest[0] if rest and rest[0] else name.replace("aac-runner-", ""))
-                self.state.setdefault("active_tasks", {})
-                self.state["active_tasks"].setdefault(task_name, {"status": "running_ansible", "logs": [], "job_id": job_id})
-                self._sync_runners(job_id, force=True)
-                self.ctx.create_task(self._reconcile_and_finalize(name, task_name, job_id),
-                                     name=f"iac:reconcile:{job_id}:{task_name}")
-            log.info(f"RECOVERY: job #{job_id} — re-attached to {len(running)} running container(s) after {reason}.")
-            return True
-
-        # Everything finished while nobody watched: decide from the exit codes.
-        success = True
-        for cid, name, _state, *rest in rows:
-            task_name = (rest[0] if rest and rest[0] else name.replace("aac-runner-", ""))
+            interrupted = await self.interrupted_reason(job_id)
             try:
-                insp = await asyncio.create_subprocess_exec(
-                    "docker", "inspect", "--format", "{{.State.ExitCode}}", cid,
-                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
-                )
-                code_out, _ = await insp.communicate()
-                exit_code = int(code_out.decode().strip() or "1")
+                exec_state = await off_loop(self.db.get_exec_state, job_id)
             except Exception:
-                exit_code = 1
-            try:
-                lg = await asyncio.create_subprocess_exec(
-                    "docker", "logs", "--tail", "400", cid,
-                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
-                )
-                log_out, _ = await lg.communicate()
-                for line in log_out.decode(errors="replace").splitlines():
-                    if line.strip():
-                        self._log_line(job_id, f"[{task_name}] {line.rstrip()}")
-            except Exception:
-                pass
-            self._log_line(job_id, f"[SYSTEM] Runner container '{name}' finished with exit code {exit_code} "
-                                   f"while the orchestrator was {reason} — recovered from the container.")
-            success = success and exit_code == 0
-            try:
-                rm = await asyncio.create_subprocess_exec("docker", "rm", "-f", cid,
-                                                          stdout=asyncio.subprocess.DEVNULL,
-                                                          stderr=asyncio.subprocess.DEVNULL)
-                await rm.wait()
-            except Exception:
-                pass
+                exec_state = {"stage": "?", "stages": "?", "stage_name": "unknown", "last": False}
+            if interrupted:
+                final, step = "FAILED", interrupted
+            elif not all_ok:
+                final, step = "FAILED", "Recovered after runner restart (failed)"
+            elif isinstance(exec_state, dict) and not exec_state.get("last"):
+                final = "FAILED"
+                step = (f"Interrupted by a runner restart at stage {exec_state.get('stage')}/{exec_state.get('stages')} "
+                        f"({exec_state.get('stage_name')}) — the remaining stages did not run; re-trigger the pipeline")
+            else:
+                final, step = "SUCCESS", "Recovered after runner restart"
+            self._log_line(job_id, f"[SYSTEM] {step}.")
 
-        final = "SUCCESS" if success else "FAILED"
-        self.db.update_progress(job_id, progress=100 if success else None,
-                                current_step="Recovered after runner restart" + ("" if success else " (failed)"))
-        self.db.update_job(job_id, final)
-        self.end_override_for(job_id)
-        await self._close_log_writer(job_id)
-        self._notify(f"Pipeline #{job_id}", f"Recovered after runner restart: {final}.",
-                     "positive" if success else "negative", notification_id=f"job_{job_id}")
-        log.info(f"RECOVERY: job #{job_id} closed as {final} from {len(rows)} finished container(s).")
-        return True
+            def _close() -> bool:
+                # One thread call: a cancellation of this task (another reload)
+                # cannot land between "job closed" and "override ended".
+                done = self.close_job_row(job_id, final, step=step[:250],
+                                          progress=100 if final == "SUCCESS" else None, end_override=False)
+                if all_ended and getattr(self, "queue", None) is not None:
+                    # Every container was followed to its exit: locks the detached
+                    # pipeline kept are free now, not after the takeover grace.
+                    self.queue.release_job_locks(job_id)
+                getattr(self.db, "claims", {}).pop(job_id, None)
+                self.end_override_for(job_id)
+                return done
 
-    async def abort_job(self, job_id: int, *, reason: str = "Aborted by User") -> int:
-        """Kill this host's runner containers of ``job_id`` and close its row as ABORTED.
-        Returns the number of containers removed."""
-        killed = 0
-        if shutil.which("docker"):
+            closed = await off_loop(_close)
+            await self._close_log_writer(job_id)
+            self._cleanup_inventory_snapshot(job_id)
+            self.__dict__.setdefault("_redactors", {}).pop(job_id, None)
+            if not closed:
+                log.warning(f"RECOVERY: job #{job_id} was closed elsewhere meanwhile — its state stands "
+                            f"(containers: {'ok' if all_ok else 'failed'}).")
+                return None
+            self.state["last_deployment"] = final
+            self._notify(f"Pipeline #{job_id}", f"{step}.", "positive" if final == "SUCCESS" else "negative",
+                         notification_id=f"job_{job_id}")
+            log.info(f"RECOVERY: job #{job_id} closed as {final} from {len(containers)} container(s).")
+            return final
+        finally:
+            self.state["running_jobs"] = max(0, self.state.get("running_jobs", 0) - 1)
+            self.state["is_running"] = self.state["running_jobs"] > 0
+
+    async def flush_for_shutdown(self, timeout: float = 3.0) -> None:
+        """Persist what is still buffered (job-log writers, runner snapshots)
+        before the plugin goes away. Bounded; never raises."""
+        deadline = time.monotonic() + max(0.2, timeout)
+        for job_id in list(self._log_writers):
+            self._sync_runners(job_id, force=True)
             try:
-                ps = await asyncio.create_subprocess_exec(
-                    "docker", "ps", "-q", "--filter", f"label=iac_job_id={job_id}",
-                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
-                )
-                out, _ = await ps.communicate()
-                ids = out.decode().split()
-                if ids:
-                    rm = await asyncio.create_subprocess_exec(
-                        "docker", "rm", "-f", *ids,
-                        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
-                    )
-                    await rm.wait()
-                    killed = len(ids)
+                await asyncio.wait_for(self._close_log_writer(job_id), timeout=max(0.2, deadline - time.monotonic()))
             except Exception as exc:
-                log.debug(f"abort_job: container cleanup failed: {exc}")
+                log.debug(f"shutdown flush for job #{job_id} incomplete: {exc}")
+        # The steps the detached jobs just recorded ("detached at stage i/n") and
+        # the last runner snapshots: the next incarnation and the UI read them.
+        for writer in (self._progress, self._runner_snapshots):
+            for job_id in writer.keys():
+                if not await writer.flush(job_id, timeout=max(0.2, deadline - time.monotonic())):
+                    log.debug(f"shutdown flush for job #{job_id} incomplete (database slow).")
+
+    #: ``active_tasks`` statuses that mean "a container of this task may be running".
+    _LIVE_TASK_STATUSES = ("pulling_image", "running_ansible", "running_terraform")
+
+    def attended_job_ids(self) -> set[int]:
+        """Jobs this process still watches containers for (incl. re-attached ones
+        that are not worker tasks) — they are heartbeated like running job tasks."""
+        return {
+            int(data["job_id"]) for data in (self.state.get("active_tasks") or {}).values()
+            if isinstance(data, dict) and data.get("job_id") and data.get("status") in self._LIVE_TASK_STATUSES
+        }
+
+    # -- what a runner container may write (audit OS-06 A) -----------------------------
+    #: Where a job's scratch directory appears inside its Ansible containers.
+    SCRATCH_MOUNT = "/data/scratch"
+
+    def _git_dirs_to_mask(self) -> list[str]:
+        """Container paths of every ``.git`` directory below the two mounted
+        trees (core repositories and service checkouts). Sync (directory scan)."""
+        masks = []
+        for root, mount in ((self.base_git_dir, "/data/storage/git_repos"),
+                            (self.config.services_dir, "/data/storage/services")):
+            try:
+                for git_dir in sorted(Path(root).glob("*/.git")):
+                    if git_dir.is_dir():
+                        masks.append(f"{mount}/{git_dir.parent.name}/.git")
+            except OSError as exc:
+                log.warning(f"[Runner] could not list the checkouts below {root}: {exc}")
+        return masks
+
+    def _ansible_mounts(self, job_id, h_git: str, h_svc: str, readonly: bool) -> list[str]:
+        """``docker run`` mount options of an Ansible runner. Sync (directory
+        scan, mkdir): call through ``off_loop``.
+
+        Read-only mode (setting ``runner_readonly_mounts``, default on):
+
+        * ``git_repos`` and ``services`` are mounted READ-ONLY. The container
+          reads playbooks, roles, the inventory snapshot, the service checkout
+          and its SSH key file from them; it builds in its own filesystem
+          (``/tmp/aac_builds``) and deploys over SSH. It used to have both trees
+          read-write: a playbook, a role or a service repository could rewrite
+          another repository, the generated inventory — or plant
+          ``.git/hooks``/``.git/config`` that git on the core side runs later.
+        * every ``.git`` below them is hidden behind an empty read-only tmpfs —
+          history, remotes and credentials old clones kept in ``.git/config``
+          are none of the playbook's business;
+        * a per-job scratch directory is mounted read-write at
+          ``/data/scratch`` (``IAC_SCRATCH_DIR``) for anything a playbook wants
+          to keep between its containers; it is removed with the job's
+          inventory snapshot.
+        """
+        if not readonly:
+            return ["-v", f"{h_git}:/data/storage/git_repos", "-v", f"{h_svc}:/data/storage/services"]
+        args = ["-v", f"{h_git}:/data/storage/git_repos:ro", "-v", f"{h_svc}:/data/storage/services:ro"]
+        for path in self._git_dirs_to_mask():
+            args += ["--tmpfs", f"{path}:ro,size=64k,mode=0555"]
+        if job_id and job_id > 0:
+            scratch_rel = f".job_snapshots/job_{job_id}/scratch"
+            try:
+                (self.base_git_dir / scratch_rel).mkdir(parents=True, exist_ok=True)
+                args += ["-v", f"{h_git}/{scratch_rel}:{self.SCRATCH_MOUNT}:rw",
+                         "-e", f"IAC_SCRATCH_DIR={self.SCRATCH_MOUNT}"]
+            except OSError as exc:
+                log.warning(f"[Runner] no scratch directory for job #{job_id}: {exc}")
+        return args
+
+    def _terraform_mounts(self, h_git: str, run_rel_dir: str, readonly: bool) -> list[str]:
+        """``docker run`` mount options of a Terraform runner.
+
+        Read-only mode: tofu gets ITS run directory read-write — the rendered
+        environment with its modules, ``.terraform``, the lock file, the plan
+        file — and nothing else of ``git_repos`` (it had all of it read-write,
+        ``.git`` directories included). The provider cache is mounted read-only:
+        a run cannot replace a provider binary that later runs execute with the
+        hypervisor credentials. See the ``init`` fallback in
+        ``execute_terraform_docker`` for a cache that lacks a provider.
+        """
+        providers = getattr(self.config, "host_terraform_providers_dir", None)
+        if not readonly:
+            args = ["-v", f"{h_git}:/data/storage/git_repos:rw"]
+            if providers:
+                args += ["-v", f"{providers}:/data/storage/terraform-providers:rw"]
+            return args
+        args = ["-v", f"{h_git}/{run_rel_dir}:/data/storage/git_repos/{run_rel_dir}:rw"]
+        if providers:
+            args += ["-v", f"{providers}:/data/storage/terraform-providers:ro"]
+        return args
+
+    #: Seconds a Terraform container gets to finish its current state write on abort.
+    _TF_STOP_GRACE_SECONDS = 30
+
+    #: Seconds one ``docker ps`` / ``docker rm`` may take before it counts as failed.
+    _DOCKER_QUERY_TIMEOUT_SECONDS = 20.0
+
+    async def _docker(self, *args: str, timeout: float | None = None) -> tuple[int, bytes, bytes]:
+        """Run ``docker <args>`` off the event loop: ``(returncode, stdout, stderr)``.
+        A call that does not answer in time is killed and raises
+        :class:`ContainerStateUnknown` — a hanging daemon is not an answer."""
+        proc = await asyncio.create_subprocess_exec(
+            "docker", *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        try:
+            out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except asyncio.TimeoutError:
+            with contextlib.suppress(Exception):
+                proc.kill()
+            raise ContainerStateUnknown(f"'docker {args[0]}' did not answer within {int(timeout or 0)}s") from None
+        return int(proc.returncode or 0), out or b"", err or b""
+
+    async def _list_job_containers(self, job_id: int | None = None) -> list[dict]:
+        """Runner containers on this host by label (all states): ``[{id, name,
+        state, job_id, task_name, kind}]``. Both kinds — Ansible and Terraform —
+        carry ``iac_job_id``; ``kind`` falls back to the name prefix for
+        containers started by an older plugin version.
+
+        ``[]`` means "Docker answered: there are none". A listing that failed or
+        timed out raises :class:`ContainerStateUnknown` (review C1): it used to
+        look like "no containers", which closed jobs whose tofu/ansible container
+        was still running and made their state lock takeable.
+        """
+        if not shutil.which("docker"):
+            # No docker CLI on this instance: it cannot have started a runner
+            # container either (control-plane pods) — that IS an answer.
+            return []
+        label = f"label=iac_job_id={job_id}" if job_id is not None else "label=iac_job_id"
+        fmt = ('{{.ID}}\t{{.Names}}\t{{.State}}\t{{.Label "iac_job_id"}}\t'
+               '{{.Label "iac_task_name"}}\t{{.Label "iac_kind"}}')
+        code, out, err = await self._docker("ps", "-a", "--filter", label, "--format", fmt,
+                                            timeout=self._DOCKER_QUERY_TIMEOUT_SECONDS)
+        if code != 0:
+            detail = err.decode(errors="replace").strip().splitlines()
+            raise ContainerStateUnknown(
+                f"'docker ps' failed with exit code {code}: {(detail[-1] if detail else 'no error output')[:200]}")
+        containers = []
+        for line in out.decode(errors="replace").splitlines():
+            parts = line.split("\t")
+            if len(parts) < 4 or not parts[0].strip():
+                continue
+            name = parts[1]
+            kind = (parts[5].strip() if len(parts) > 5 else "") or ("terraform" if name.startswith("iac-tf-") else "ansible")
+            task = (parts[4].strip() if len(parts) > 4 else "") or name.replace("aac-runner-", "")
+            try:
+                cid_job = int(parts[3])
+            except ValueError:
+                continue
+            containers.append({"id": parts[0].strip(), "name": name, "state": parts[2].strip(),
+                               "job_id": cid_job, "task_name": task, "kind": kind})
+        return containers
+
+    async def stop_job_containers(self, job_id: int) -> int:
+        """Stop and remove this host's runner containers of ``job_id`` (found by
+        label — Terraform containers too, audit OC-02). A running Terraform
+        container is stopped with a grace period first so tofu can finish writing
+        its state; everything is removed afterwards. No status write — callers
+        decide what the job's row becomes. Returns the number of containers.
+
+        Raises :class:`ContainerStateUnknown` when Docker did not answer the
+        listing or did not remove the containers (review C1): "could not look"
+        must never read as "nothing to stop" — the caller retries and reports.
+        """
+        containers = await self._list_job_containers(job_id)
+        tf_running = [c["id"] for c in containers if c["kind"] == "terraform" and c["state"] == "running"]
+        if tf_running:
+            # Its result does not matter: the forced removal below is what counts.
+            with contextlib.suppress(ContainerStateUnknown):
+                await self._docker("stop", "-t", str(self._TF_STOP_GRACE_SECONDS), *tf_running,
+                                   timeout=self._TF_STOP_GRACE_SECONDS + self._DOCKER_QUERY_TIMEOUT_SECONDS)
+        ids = [c["id"] for c in containers]
+        if ids:
+            code, _out, err = await self._docker("rm", "-f", *ids, timeout=self._DOCKER_QUERY_TIMEOUT_SECONDS)
+            detail = err.decode(errors="replace").strip().splitlines()
+            if code != 0 and not self._only_gone_or_going(detail):
+                raise ContainerStateUnknown(
+                    f"'docker rm' for job #{job_id} failed with exit code {code}: "
+                    f"{(detail[-1] if detail else 'no error output')[:200]}")
         for data in list((self.state.get("active_tasks") or {}).values()):
             if isinstance(data, dict) and data.get("job_id") == job_id:
                 data["status"] = "aborted"
+        return len(ids)
+
+    #: ``docker rm`` errors that mean "this container is (being) removed already".
+    _RM_GONE_MARKERS = ("is already in progress", "No such container")
+
+    @classmethod
+    def _only_gone_or_going(cls, error_lines: list[str]) -> bool:
+        """True when every error line of a failed ``docker rm`` only says that a
+        container is gone or being removed by someone else — two stop paths of the
+        same job (abort relay and worker fencing, staging 2026-11-15 job #27) race
+        for the same container; the loser is not "could not be stopped"."""
+        lines = [line for line in error_lines if line.strip()]
+        return bool(lines) and all(any(m in line for m in cls._RM_GONE_MARKERS) for line in lines)
+
+    async def abort_job(self, job_id: int, *, reason: str = "Aborted by User", status: str = "ABORTED") -> int:
+        """Kill this host's runner containers of ``job_id`` and close its row as
+        ``status`` (ABORTED; FAILED for a stop by the runtime limit) — a no-op
+        when the row is no longer RUNNING/ours. Returns the number of
+        containers removed. Raises :class:`ContainerStateUnknown` — before any
+        row write — when the containers could not be stopped."""
+        killed = await self.stop_job_containers(job_id)
         self._sync_runners(job_id, force=True)
-        self.db.update_progress(job_id, progress=None, current_step=reason)
-        self.db.update_job(job_id, "ABORTED")
-        self.end_override_for(job_id)
+
+        await off_loop(self.close_job_row, job_id, "FAILED" if status == "FAILED" else "ABORTED", step=reason)
         return killed
 
     async def _on_git_status(self, payload: dict):
@@ -2442,10 +3049,23 @@ class DeploymentEngine:
                 f"Ignoring uncorrelated git status for repo '{repo_id}' without request_id: {status}"
             )
 
-    async def execute_git_sync(self, role_slug: str) -> bool:
+    def _repo_credentials(self, role_slug: str) -> tuple[dict | None, str | None]:
+        """``(repo config, credential)`` of a core repo — two Vault round trips.
+        Synchronous: call through ``off_loop``. ``(None, None)`` when the repo
+        is not configured; raises on an unreadable configuration."""
         raw_config = self.ctx.get_secret(f"repo_{role_slug}_config")
-        if not raw_config: return False
+        if not raw_config:
+            return None, None
         config = json.loads(raw_config)
+        if not isinstance(config, dict) or not config.get("url"):
+            return (config if isinstance(config, dict) else {}), None
+        # A reference can only resolve to a credential alias — never to
+        # another secret of the plugin (settings_schema.resolve_credential).
+        return config, resolve_credential(self.ctx, config.get("token_key"))
+
+    async def execute_git_sync(self, role_slug: str) -> bool:
+        config, secret_value = await off_loop(self._repo_credentials, role_slug)
+        if config is None: return False
         if not config.get("url"): return True
 
         request_id = f"sync:{role_slug}:{uuid.uuid4().hex[:12]}"
@@ -2457,12 +3077,22 @@ class DeploymentEngine:
             "repo_id": role_slug,
             "url": config.get("url"),
             "auth_type": "ssh" if "git@" in config.get("url") else "token",
-            "secret_value": self.ctx.get_secret(config.get("token_key", "")) if config.get("token_key") else ""
+            "secret_value": secret_value or ""
         })
-        try: return (await asyncio.wait_for(future, timeout=240.0)).get("status") == "synced"
-        except asyncio.TimeoutError: return False
+        try:
+            result = await asyncio.wait_for(future, timeout=240.0)
+        except asyncio.TimeoutError:
+            log.error(f"Git sync of '{role_slug}' timed out after 240s (no answer from the core git service).")
+            return False
         finally:
             self.pending_syncs.pop(request_id, None)
+        if result.get("status") == "synced":
+            return True
+        # The core's reason (DNS failure, 401 after a token rotation, …) belongs in
+        # the job log — "Failed to sync iac_controller" alone sent operators to the
+        # runner's container log during the 2026-10-28 outage (audit OC-16).
+        log.error(f"Git sync of '{role_slug}' failed: {result.get('error') or result.get('status') or 'unknown error'}")
+        return False
 
     def repo_token(self, role_slug: str) -> str | None:
         """Access token for a configured core repo (``repo_<slug>_config.token_key``)."""
@@ -2473,7 +3103,7 @@ class DeploymentEngine:
             key = (json.loads(raw) or {}).get("token_key")
         except Exception:
             return None
-        return self.ctx.get_secret(key) if key else None
+        return resolve_credential(self.ctx, key)
 
     async def repo_head_sha(self, role_slug: str) -> str:
         """HEAD commit of a synced core repo working tree ('' when unknown)."""
@@ -2486,19 +3116,15 @@ class DeploymentEngine:
         future = asyncio.get_event_loop().create_future()
         self.pending_syncs[request_id] = (role_slug, future)
 
-        raw_config = self.ctx.get_secret(f"repo_{role_slug}_config")
         auth_type = "none"
         secret_value = None
-        if raw_config:
-            try:
-                cfg = json.loads(raw_config)
-                url = cfg.get("url", "")
-                token_key = cfg.get("token_key", "")
-                if token_key:
-                    secret_value = self.ctx.get_secret(token_key)
-                    auth_type = "ssh" if url.startswith("git@") else "token"
-            except Exception:
-                pass
+        try:
+            cfg, credential = await off_loop(self._repo_credentials, role_slug)
+            if cfg and cfg.get("token_key"):
+                secret_value = credential
+                auth_type = "ssh" if str(cfg.get("url") or "").startswith("git@") else "token"
+        except Exception:
+            pass
 
         self.ctx.emit("git:commit_push", {
             "request_id": request_id,
@@ -2525,8 +3151,10 @@ class DeploymentEngine:
         if not generator_script.exists():
             raise FileNotFoundError(f"Generator script not found at {generator_script}")
 
-        # Inject the private vendor directory into the subprocess PYTHONPATH
-        env = os.environ.copy()
+        # The generator renders Jinja from the iac-controller: it gets an explicit,
+        # minimal environment (audit OS-06) — not the core's, with its database
+        # password, session secret and Vault material — plus the PYTHONPATH below.
+        env = generator_env()
         
         # Build a new PYTHONPATH, prioritizing the plugin's vendored libraries
         # and its own source root for relative imports.
@@ -2573,7 +3201,12 @@ class DeploymentEngine:
         async with self._shared_state_lock:
             await self._execute_native_generation()
             if job_id:
-                self._snapshot_inventory(job_id)
+                # copytree of the generated tree (still under the lock: nobody
+                # regenerates while it is copied).
+                await off_loop(self._snapshot_inventory, job_id)
+        if job_id:
+            # What this job will render into env files must never show up in its log.
+            await off_loop(self._register_inventory_secrets, job_id)
 
     def _snapshot_inventory(self, job_id: int):
         src = self.base_git_dir / "inventory_state"
@@ -2618,82 +3251,28 @@ class DeploymentEngine:
         except Exception:
             pass
 
-    async def reconcile_orphaned_runners(self, job_id=None):
-        try:
-            if self.socket_client is None:
-                raise RuntimeError("Socket manager client is not configured.")
-            payload = await self.socket_client.request("docker:runners", args={"prefix": "aac-runner-"})
-            containers = []
-            if isinstance(payload, dict):
-                containers = payload.get("containers") or []
-            if not containers:
-                return
-
-            log.info(f"Reconciliation: Found {len(containers)} orphaned runners. Reattaching...")
-            self.state["is_running"] = True
-            
-            for container in containers:
-                c_name = container.get("name") or ""
-                labels = container.get("labels") or {}
-                try:
-                    recovered_job_id = int(labels.get("iac_job_id")) if labels.get("iac_job_id") else (job_id or 0)
-                except ValueError:
-                    recovered_job_id = job_id or 0
-                    
-                task_name = labels.get("iac_task_name") or c_name.replace("aac-runner-", "")
-                
-                if "active_tasks" not in self.state: self.state["active_tasks"] = {}
-                if task_name not in self.state["active_tasks"]:
-                    self.state["active_tasks"][task_name] = {
-                        "status": "running_ansible",
-                        "logs": [],
-                        "job_id": recovered_job_id
-                    }
-                    self._sync_runners(recovered_job_id, force=True)
-
-                self.state["running_jobs"] = self.state.get("running_jobs", 0) + 1
-                self.ctx.create_task(
-                    self._reconcile_and_finalize(c_name, task_name, recovered_job_id),
-                    name=f"iac:reconcile:{recovered_job_id}:{task_name}"
-                )
-        except Exception as e: log.error(f"Failed to reconcile: {e}")
-
-    async def _reconcile_and_finalize(self, c_name: str, task_name: str, job_id: int):
-        """Wrapper to safely close out a recovered job in the database after the runner finishes."""
-        success, _ = await self._watch_detached_runner(c_name, task_name, job_id)
-
-        if job_id != 0:
-            # The row may already have been closed as FAILED by an orphan sweep while
-            # this container was still running — a successful container wins then.
-            job = next((j for j in self.db.get_jobs_by_status("RUNNING") if j.id == job_id), None)
-            if job is None and success:
-                job = next((j for j in self.db.get_jobs_by_status("FAILED") if j.id == job_id), None)
-            if job:
-                final_status = "SUCCESS" if success else "FAILED"
-                self.state["last_deployment"] = final_status
-                self.db.update_progress(job_id, progress=100 if success else None, current_step="Reconciled & Completed" if success else "Reconciled & Failed")
-                self.db.update_job(job_id, final_status)
-                self._notify_clear(f"job_{job_id}")
-                self._notify(f"Pipeline #{job_id}", "Recovered job finished.", "positive" if success else "negative")
-                
-        self.state["running_jobs"] = max(0, self.state.get("running_jobs", 0) - 1)
-        self.state["is_running"] = self.state["running_jobs"] > 0
-
     # Extracts the tfvars key (== hostname) from a container resource address like
     # ``module.lxc_cerberus.proxmox_virtual_environment_container.ct["docker-dev"]``.
     _TF_CT_HOST_RE = re.compile(r'proxmox_virtual_environment_container\.ct\["([^"]+)"\]')
 
-    async def _watch_detached_runner(self, container_name: str, task_name: str, job_id: int):
-        successful_hosts, failed_hosts = 0, 0
-        containers_created = 0  # Terraform: count freshly (re)created LXC containers
-        created_hosts: list = []      # Terraform apply: hostnames whose CT was (re)created
-        hosts_to_create: list = []    # Terraform plan: hostnames a plan would create/replace
-        hosts_to_destroy: list = []   # Terraform plan: hostnames a plan would destroy
-        plan_summary = ""             # Terraform plan: the "Plan: X to add, ..." line
+    async def _watch_detached_runner(self, container_name: str, task_name: str, job_id: int, *,
+                                     kind: str | None = None, tolerate_already_running: bool = False,
+                                     tf_host: str | None = None, skip_lines: int = 0):
+        """Follow a runner container to its end and return ``(success, stats)``.
+
+        Success is the container's exit code, cross-checked with Ansible's recap —
+        never a phrase somewhere in the output (audit OS-14, see runner_output).
+        ``kind`` is ``ansible`` or ``terraform`` (derived from the container name
+        when a recovery path does not know it); ``tolerate_already_running`` is
+        set only by a Terraform run that really applies. ``skip_lines``: output
+        lines that are already in the job log (re-attach after a restart) — they
+        are parsed for the verdict but not stored again.
+        """
+        if kind is None:
+            kind = "terraform" if container_name.startswith("iac-tf-") else "ansible"
+        parser = RunnerOutputParser(kind, tolerate_already_running=tolerate_already_running, tf_host=tf_host)
         ansible_progress = 50.0  # Base progress for Ansible phase
-        tf_already_running = False  # Proxmox "CT already running" is a non-fatal drift condition
-        no_hosts_matched = False  # Empty --limit intersection is a no-op skip, not a failure
-        
+
         try:
             log_proc = await asyncio.create_subprocess_exec("docker", "logs", "-f", container_name, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
             while True:
@@ -2701,6 +3280,10 @@ class DeploymentEngine:
                 if not line: break
                 decoded = line.decode('utf-8', errors='replace').rstrip()
                 if decoded:
+                    parser.feed(decoded)
+                    if skip_lines > 0:
+                        skip_lines -= 1      # stored before the restart — not again
+                        continue
                     # 1. WRITE TO DISK + DATABASE (file for the host, DB for every instance)
                     self._log_line(job_id, f"[{task_name}] {decoded}")
 
@@ -2708,63 +3291,16 @@ class DeploymentEngine:
                     if "TASK [" in decoded:
                         ansible_task = decoded.split("TASK [")[1].split("]")[0]
                         ansible_progress = min(99.0, ansible_progress + 1.5)  # Increment slightly per task, capping at 99%
-                        self.db.update_progress(job_id, progress=int(ansible_progress), current_step=f"Ansible: {ansible_task}")
+                        # Coalesced and off the loop: a playbook prints these faster
+                        # than a slow database answers (audit OC-08 B2).
+                        self.push_progress(job_id, progress=int(ansible_progress), current_step=f"Ansible: {ansible_task}")
 
                     # 3. LIGHTWEIGHT UI MEMORY (Keep only the last 50 lines for the active popup)
                     if "active_tasks" in self.state and task_name in self.state["active_tasks"]:
-                        self.state["active_tasks"][task_name]["logs"].append(decoded)
+                        self.state["active_tasks"][task_name]["logs"].append(self._redact(job_id, decoded))
                         if len(self.state["active_tasks"][task_name]["logs"]) > 50:
                             self.state["active_tasks"][task_name]["logs"].pop(0)
                         self._sync_runners(job_id)  # throttled DB snapshot for the other instances
-
-                    if "ok=" in decoded and "failed=" in decoded and ":" in decoded:
-                        try:
-                            sp = decoded.split(":")[1]
-                            fc = int(sp.split("failed=")[1].split()[0])
-                            uc = int(sp.split("unreachable=")[1].split()[0])
-                            if fc > 0 or uc > 0: failed_hosts += 1
-                            else: successful_hosts += 1
-                        except Exception: pass
-
-                    # Terraform: a fresh LXC container was actually (re)created.
-                    if "proxmox_virtual_environment_container.ct[" in decoded and "Creation complete" in decoded:
-                        containers_created += 1
-                        m = self._TF_CT_HOST_RE.search(decoded)
-                        if m and m.group(1) not in created_hosts:
-                            created_hosts.append(m.group(1))
-
-                    # Terraform plan lines: capture which hosts a plan would touch, so a
-                    # gated plan can be surfaced for operator review-and-approve.
-                    if "proxmox_virtual_environment_container.ct[" in decoded:
-                        m = self._TF_CT_HOST_RE.search(decoded)
-                        if m:
-                            _h = m.group(1)
-                            if ("will be created" in decoded or "must be replaced" in decoded):
-                                if _h not in hosts_to_create:
-                                    hosts_to_create.append(_h)
-                            elif "will be destroyed" in decoded and _h not in hosts_to_destroy:
-                                hosts_to_destroy.append(_h)
-                    stripped = decoded.strip()
-                    if stripped.startswith("Plan:") and " to add" in stripped:
-                        plan_summary = stripped
-
-                    # Terraform state drift: container exists and is already running on Proxmox.
-                    # This is the desired end-state — treat it as a non-fatal warning, not a failure.
-                    # Match the actual Proxmox error shape ("CT <id> ... already running") rather than
-                    # loose substrings, to avoid masking unrelated failures as success.
-                    if re.search(r"CT\s+\d+\b.*already running", decoded, re.IGNORECASE):
-                        tf_already_running = True
-                        log.warning("[TF] Proxmox state drift detected (%s): container is already running. Treating as success.", task_name)
-                        self._log_line(job_id, f"[{task_name}] [WARNING] State drift: container already running — desired state achieved, continuing.")
-
-                    # Ansible "no hosts to target": the --limit intersection matched zero
-                    # hosts (e.g. a service group not present on the limited host, or an
-                    # empty site/stage group). That is a no-op, not a failure — treat it
-                    # as a graceful skip so a scoped rollout or a rule targeting an empty
-                    # group does not abort the whole pipeline.
-                    if ("no hosts to target" in decoded
-                            or "Could not match supplied host pattern" in decoded):
-                        no_hosts_matched = True
 
             wait_proc = await asyncio.create_subprocess_exec(
                 "docker", "wait", container_name,
@@ -2782,36 +3318,24 @@ class DeploymentEngine:
                 msg = (f"[ERROR] could not read the runner exit code ({wait_err}); "
                        "the output above may be incomplete.")
                 log.error("[Runner] %s: %s", task_name, msg)
-                self._log_line(job_id, f"[{task_name}] {msg}")
-            # Override failure if the only Terraform error was "already running" (desired state IS achieved)
-            success = exit_code == 0 or tf_already_running
-            # An empty --limit intersection exits non-zero with no PLAY RECAP on this
-            # ansible-core; treat it as a skip, but only when nothing actually ran or
-            # failed (so a real task failure is never masked).
-            if not success and no_hosts_matched and successful_hosts == 0 and failed_hosts == 0:
-                log.info("[Ansible] '%s' matched no hosts (empty --limit) — skipping (no-op).", task_name)
-                success = True
+                self._log_line(job_id, f"[SYSTEM] [{task_name}] {msg}")
+            success, note = parser.verdict(exit_code)
+            if note:
+                level = "WARNING" if success else "ERROR"
+                log.warning("[Runner] %s: %s", task_name, note)
+                self._log_line(job_id, f"[SYSTEM] [{task_name}] [{level}] {note}.")
             if not success and exit_code is not None:
-                self._log_line(job_id, f"[{task_name}] [ERROR] runner container exited with code {exit_code}.")
+                self._log_line(job_id, f"[SYSTEM] [{task_name}] [ERROR] runner container exited with code {exit_code}.")
 
             if "active_tasks" in self.state and task_name in self.state["active_tasks"]:
                 self.state["active_tasks"][task_name]["status"] = "success" if success else "failed"
                 self._sync_runners(job_id, force=True)
             await asyncio.create_subprocess_exec("docker", "rm", "-f", container_name)
-            return success, {
-                "successful_hosts": successful_hosts,
-                "failed_hosts": failed_hosts,
-                "containers_created": containers_created,
-                "created_hosts": created_hosts,
-                "hosts_to_create": hosts_to_create,
-                "hosts_to_destroy": hosts_to_destroy,
-                "plan_summary": plan_summary,
-                "exit_code": exit_code,
-            }
+            return success, parser.stats(exit_code)
 
         except Exception as exc:  # noqa: BLE001
             log.exception("[Runner] watching '%s' (%s) failed", task_name, container_name)
-            self._log_line(job_id, f"[{task_name}] [ERROR] lost track of runner container '{container_name}': {exc!r}")
+            self._log_line(job_id, f"[SYSTEM] [{task_name}] [ERROR] lost track of runner container '{container_name}': {exc!r}")
             if "active_tasks" in self.state and task_name in self.state["active_tasks"]:
                 self.state["active_tasks"][task_name]["status"] = "error"
                 self._sync_runners(job_id, force=True)
@@ -2835,7 +3359,7 @@ class DeploymentEngine:
     async def _await_host_ssh(self, host_name: str, timeout: float = 120.0):
         """Poll TCP/22 on the host until reachable so a freshly-booted guest is
         ready before the bootstrap playbook connects. Non-fatal on timeout."""
-        ip = self._resolve_host_ip(host_name)
+        ip = await off_loop(self._resolve_host_ip, host_name)   # parses the generated inventory
         if not ip:
             log.info(f"No ansible_host for '{host_name}'; skipping SSH readiness wait.")
             return
@@ -3033,6 +3557,14 @@ class DeploymentEngine:
             },
         }
 
+    def _register_terraform_secrets(self, job_id, payload: dict) -> None:
+        """The credentials of a Terraform run (they come from Vault or from the
+        controller repo) are masked in that job's log."""
+        backend = payload.get("backend") if isinstance(payload.get("backend"), dict) else {}
+        self._redactor(job_id).add_many([
+            payload.get("proxmox_password"), payload.get("root_password"), backend.get("secret_key"),
+        ])
+
     @staticmethod
     def _write_secrets_file(secrets_file: Path, payload: dict) -> None:
         """Write the Terraform render secrets with owner-only perms (0600).
@@ -3138,6 +3670,9 @@ class DeploymentEngine:
         force_apply: bool = False,
         host_name: str = "",
         import_specs: list[dict] | None = None,
+        dry_run: bool = False,
+        state_key: str | None = None,
+        stable_rel_dir: str | None = None,
     ) -> tuple[bool, dict]:
         """Run OpenTofu/Terraform in an ephemeral Docker container against a
         rendered run dir.
@@ -3149,7 +3684,11 @@ class DeploymentEngine:
         - Apply happens only when ``force_apply`` (explicit operator approval) or
           the ``auto_apply`` config is set; otherwise the plan is shown but not
           applied — preserving the safe default for the webhook/auto path.
+        - A dry-run job (``dry_run`` or the job's persisted payload) never applies
+          and never imports/removes state, whatever ``force_apply``/``auto_apply``
+          say: it plans and shows.
         """
+        dry = bool(dry_run) or await self._job_is_dry_run(job_id)
         if "active_tasks" not in self.state:
             self.state["active_tasks"] = {}
         self.state["active_tasks"][task_name] = {
@@ -3158,20 +3697,41 @@ class DeploymentEngine:
             "job_id": job_id,
         }
         self._sync_runners(job_id, force=True)
+        # ``state_key`` ("tf:<site>_<stage>") names the environment state this run
+        # reads/writes; ``stable_rel_dir`` is where a per-job run dir is promoted to.
 
         safe_task_name = "".join(c if c.isalnum() or c in ".-_" else "-" for c in task_name).strip("-")
-        c_name = f"iac-tf-{safe_task_name}"[:62]
-        await asyncio.create_subprocess_exec(
-            "docker", "rm", "-f", c_name,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
+        # One container per JOB and task (audit OC-01): the shared name
+        # "iac-tf-Terraform-Provision--<host>" let a second job's `docker rm -f`
+        # kill the first job's running apply. Nothing is removed before the state
+        # lock is held, and then only a leftover of this very job and task.
+        c_name = f"iac-tf-j{job_id}-{safe_task_name}"[:120]
 
-        tf_bin = str(self.config.terraform_binary or "tofu").strip()
+        # The binary, the auto-apply switch and the image are settings (Vault):
+        # read together, off the loop. The image check may raise — as before,
+        # before anything is locked or started.
+        tf_bin, auto_apply, tf_image, readonly = await off_loop(lambda: (
+            str(self.config.terraform_binary or "tofu").strip(), bool(self.config.auto_apply),
+            self._runner_image("terraform"), bool(getattr(self.config, "runner_readonly_mounts", False))))
         target_flags = "".join(f" -target='{t}'" for t in (targets or []))
         run_dir = f"/data/storage/git_repos/{run_rel_dir}"
-        do_apply = mode == "apply" and (force_apply or self.config.auto_apply)
-        if mode == "state_list":
+        do_apply = mode in ("apply", "apply_saved") and not dry and (force_apply or auto_apply)
+        if mode == "apply_saved" and not do_apply:
+            # Applying a saved plan is never downgraded to "plan and show": the
+            # caller decided to apply exactly that file, or nothing runs.
+            raise RuntimeError("[TF] A saved plan is only applied with an approval and never in a dry-run job.")
+        if dry and mode in ("apply", "import"):
+            log.warning("[TF] DRY-RUN job: '%s' plans only — no apply, no state import.", host_name or "(env)")
+        if mode == "plan_save":
+            # Read-only: compute the plan and keep it as ``tfplan`` in the run dir —
+            # the approved-plan flow compares it with the reviewed plan and then
+            # applies exactly this file (mode ``apply_saved``).
+            action_cmd = f"STEP=plan; {tf_bin} plan -input=false -no-color -out=tfplan{target_flags}"
+        elif mode == "apply_saved":
+            # No new plan: the file the comparison was made on. tofu refuses it
+            # ("Saved plan is stale") when the state changed since it was written.
+            action_cmd = f"STEP=apply; {tf_bin} apply -input=false -no-color -auto-approve tfplan"
+        elif mode == "state_list":
             # Read-only: list the resources tracked in state. Never plans or applies.
             action_cmd = f"{tf_bin} state list -no-color"
         elif mode in ("plan", "import"):
@@ -3193,8 +3753,17 @@ class DeploymentEngine:
         # already tracked), every decision is echoed into the job log, and a
         # not-yet-existing CT falls through to apply (see _build_import_cmd).
         import_cmd = ""
-        if import_specs and (mode == "import" or do_apply):
+        if import_specs and not dry and (mode == "import" or do_apply):
             import_cmd = self._build_import_cmd(tf_bin, import_specs)
+        init_cmd = f"{tf_bin} init -input=false -no-color"
+        if readonly:
+            # The provider cache is read-only. A provider (version) it does not
+            # hold cannot be added to it by this run: install into the run dir
+            # instead of failing — slower, and said so in the job log, so the
+            # cache gets filled deliberately (docs: "Runner-Container: Mounts").
+            init_cmd = (f"{{ {init_cmd} || {{ echo '[TF] init with the read-only provider cache failed — "
+                        f"retrying without the cache (providers are installed into the run dir)'; "
+                        f"unset TF_PLUGIN_CACHE_DIR; {init_cmd}; }}; }}")
         # stderr is folded into stdout so tofu's "Error:" blocks reach the job log
         # in order, and the EXIT trap names the failing step + exit code — before,
         # a failure right after `init` left nothing in the job log but the FATAL.
@@ -3203,45 +3772,30 @@ class DeploymentEngine:
             "trap 'rc=$?; if [ \"$rc\" -ne 0 ]; then "
             "echo \"[TF] step <$STEP> failed with exit code $rc\"; fi; exit \"$rc\"' EXIT; "
             f"cd '{run_dir}'; "
-            f"{tf_bin} init -input=false -no-color; "
+            f"{init_cmd}; "
             f"STEP=import; {import_cmd}"
             f"STEP={mode}; {action_cmd}"
         )
 
         h_git = self.config.host_git_repos_dir
-        mounts = [
-            {
-                "source": h_git,
-                "target": "/data/storage/git_repos",
-                "mode": "rw",
-            }
+        # Mounts: only this run's directory read-write and the provider cache
+        # read-only (setting runner_readonly_mounts), else the whole tree as before.
+        tf_mounts = self._terraform_mounts(h_git, run_rel_dir, readonly)
+        # Spawned with the docker CLI like the Ansible runner (not via the core's
+        # docker:spawn, which cannot set labels): the labels are what abort and
+        # restart recovery find the container by (audit OC-02).
+        cmd = [
+            "docker", "run", "-d", "--name", c_name, "--pull", "always",
+            "--label", f"iac_job_id={job_id}", "--label", f"iac_task_name={task_name}",
+            "--label", "iac_kind=terraform", "--label", f"iac_tf_mode={mode}",
+            "-e", f"IAC_JOB_ID={job_id}", "-e", "TF_IN_AUTOMATION=1", "-e", "CHECKPOINT_DISABLE=1",
+            "-e", "TF_PLUGIN_CACHE_DIR=/data/storage/terraform-providers",
+            *tf_mounts,
         ]
-        if getattr(self.config, "host_terraform_providers_dir", None):
-            mounts.append(
-                {
-                    "source": self.config.host_terraform_providers_dir,
-                    "target": "/data/storage/terraform-providers",
-                    "mode": "rw",
-                }
-            )
-        env_vars = [
-            {"key": "IAC_JOB_ID", "value": str(job_id)},
-            {"key": "TF_IN_AUTOMATION", "value": "1"},
-            {"key": "CHECKPOINT_DISABLE", "value": "1"},
-            {"key": "TF_PLUGIN_CACHE_DIR", "value": "/data/storage/terraform-providers"},
-        ]
-        spawn_request = {
-            "image": self.config.terraform_docker_image,
-            "name": c_name,
-            "env_vars": env_vars,
-            "mounts": mounts,
-            "command": ["/bin/sh", "-lc", shell_cmd],
-            # No auto-remove: a fast-failing tofu run would otherwise vanish before
-            # `docker logs -f` drained it and before `docker wait` read the exit code
-            # (→ empty output, swallowed error). _watch_detached_runner removes it.
-            "remove": False,
-            "networks": [],
-        }
+        # No --rm: a fast-failing tofu run would otherwise vanish before
+        # `docker logs -f` drained it and before `docker wait` read the exit code
+        # (→ empty output, swallowed error). _watch_detached_runner removes it.
+        cmd += ["--entrypoint", "", tf_image, "/bin/sh", "-lc", shell_cmd]
 
         log.info(
             "Executing Terraform in Docker: scope=%s mode=%s apply=%s host=%s",
@@ -3250,27 +3804,24 @@ class DeploymentEngine:
             do_apply,
             host_name or "(env)",
         )
-        self.state["active_tasks"][task_name]["status"] = "running_terraform"
-        self._sync_runners(job_id, force=True)
 
-        async with self._terraform_run_semaphore:
-            log.info("[TF] Acquired terraform run slot for '%s'.", host_name or "(env)")
-            if self.socket_client is None:
-                raise RuntimeError("Socket manager client is not configured.")
-            try:
-                spawn_result = await self.socket_client.spawn_runner(**spawn_request, timeout=120.0)
-            except TimeoutError as te:
-                raise RuntimeError(f"[TF] Terraform spawn request timed out: {te}")
-            except Exception as se:
-                raise RuntimeError(f"[TF] Failed to send terraform spawn request: {se}")
-            
-            if not isinstance(spawn_result, dict) or spawn_result.get("status") != "running":
-                error_msg = "unknown error"
-                if isinstance(spawn_result, dict):
-                    error_msg = spawn_result.get("error") or error_msg
-                raise RuntimeError(f"Failed to spawn Terraform runner container: {error_msg}")
-
-            success, _stats = await self._watch_detached_runner(c_name, task_name, job_id)
+        # Order: state lock (cluster-wide, per environment state) → run slot (this
+        # process) → container. The lock is given back when the container ended.
+        async with self._terraform_state(state_key, job_id, task_name):
+            async with self._terraform_run_semaphore:
+                log.info("[TF] Acquired terraform run slot for '%s'.", host_name or "(env)")
+                self.state["active_tasks"][task_name]["status"] = "running_terraform"
+                self._sync_runners(job_id, force=True)
+                await self._spawn_terraform_container(c_name, cmd)
+                success, _stats = await self._watch_detached_runner(
+                    c_name, task_name, job_id, kind="terraform",
+                    # Only a run that really applies may meet (and tolerate) Proxmox'
+                    # "CT already running"; scoped to the targeted host when there is one.
+                    tolerate_already_running=do_apply,
+                    tf_host=(host_name if targets else None),
+                )
+            if stable_rel_dir and stable_rel_dir != run_rel_dir:
+                await off_loop(self._promote_run_dir, run_rel_dir, stable_rel_dir, job_id)
 
         return success, {
             "successful_hosts": 1 if success else 0,
@@ -3282,6 +3833,143 @@ class DeploymentEngine:
             "plan_summary": _stats.get("plan_summary") or "",
             "exit_code": _stats.get("exit_code"),
         }
+
+    _TF_LOCK_POLL_SECONDS = 5.0
+    _TF_SPAWN_TIMEOUT_SECONDS = 600.0
+
+    @contextlib.asynccontextmanager
+    async def _terraform_state(self, key: str | None, job_id: int, task_name: str):
+        """Hold the cluster-wide lock of one Terraform state for a container run.
+
+        The S3 backend has no state locking and the run slot above is per process
+        (it does not survive a plugin reload and knows nothing of a second
+        runner), so two jobs could run tofu on one environment at once (audit
+        OC-01). The lock row belongs to the JOB: it is released when the container
+        ended; when the watcher is cancelled (abort, reload) it is deliberately
+        NOT released — the container may still be running — and stays with the
+        job until that job is closed, after which the next waiter takes it over.
+        Waiting is bounded: after ``tf_lock_timeout_seconds`` the job fails with
+        a clear message instead of starting a second tofu.
+        """
+        timeout = int(await off_loop(lambda: getattr(self.config, "tf_lock_timeout_seconds", 1800)))
+        async with self._job_lock(
+            key, job_id, timeout=timeout,
+            waiting=f"[TF] Waiting for Terraform state '{key}'",
+            step=f"Waiting for Terraform state {key}",
+            refused=(f"[TF] Terraform state '{key}' is in use by job #{{holder}} — '{task_name}' was NOT started "
+                     f"(waited {timeout}s). Re-trigger once that job has finished."),
+        ):
+            yield
+
+    #: How long a rule stage waits for another job's rule stage (see rules_lock).
+    _RULES_LOCK_TIMEOUT_SECONDS = 3600
+
+    @contextlib.asynccontextmanager
+    async def rules_lock(self, job_id: int):
+        """One rule engine at a time, cluster-wide (audit OC-06).
+
+        Rule stages no longer diff only their own commit but everything since the
+        marker of the last successful evaluation — two of them running side by
+        side would act on the same changes twice. The waiter re-reads the marker
+        once it holds the lock and usually finds nothing left to do. Same
+        ownership rules as the Terraform state lock (kept on cancellation while
+        containers may still run, taken over once the holder job is closed).
+        """
+        timeout = self._RULES_LOCK_TIMEOUT_SECONDS
+        async with self._job_lock(
+            "rules", job_id, timeout=timeout,
+            waiting="[RULES] Waiting for the rule engine",
+            step="Waiting for the rule engine",
+            refused=(f"The rule engine is in use by job #{{holder}} — the pending state changes were NOT "
+                     f"evaluated by this job (waited {timeout}s). They stay pending and are evaluated by "
+                     "the next pipeline that runs the rule engine."),
+        ):
+            yield
+
+    @contextlib.asynccontextmanager
+    async def _job_lock(self, key: str | None, job_id: int, *, timeout: float, waiting: str, step: str,
+                        refused: str):
+        """Hold lock ``key`` (table ``iac_orchestrator_locks``) for ``job_id``.
+
+        ``waiting``/``step``: log line and job step while another job holds it;
+        ``refused``: error text after ``timeout`` seconds (``{holder}`` = job id).
+        Without a queue or a real job id nothing is locked (tests, legacy calls).
+        """
+        queue = getattr(self, "queue", None)
+        if not key or queue is None or not job_id or job_id == -1:
+            yield
+            return
+        deadline = time.monotonic() + timeout
+        announced = object()
+        owner = getattr(self.ctx, "instance_id", None)
+        while True:
+            acquired, holder = await off_loop(queue.acquire_lock, key, job_id, owner if isinstance(owner, str) else None)
+            if acquired:
+                break
+            if time.monotonic() >= deadline:
+                raise RuntimeError(refused.format(holder=holder))
+            if holder != announced:
+                announced = holder
+                log.info(f"{waiting} (in use by job #{holder})…")
+                self.push_progress(job_id, progress=None, current_step=f"{step} (job #{holder})")
+            await asyncio.sleep(self._TF_LOCK_POLL_SECONDS)
+        keep = False
+        try:
+            yield
+        except asyncio.CancelledError:
+            keep = True
+            raise
+        finally:
+            if not keep:
+                await off_loop(queue.release_lock, key, job_id)
+
+    async def _spawn_terraform_container(self, c_name: str, cmd: list[str]) -> None:
+        """``docker run -d`` for a Terraform runner. Called with the state lock and
+        the run slot held; removes only a leftover container of the same job+task."""
+        if not shutil.which("docker"):
+            raise RuntimeError("[TF] docker CLI is not available on this instance.")
+        rm = await asyncio.create_subprocess_exec(
+            "docker", "rm", "-f", c_name, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        await rm.communicate()
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+        try:
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=self._TF_SPAWN_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            with contextlib.suppress(Exception):
+                proc.kill()
+            raise RuntimeError(f"[TF] Terraform spawn timed out after {int(self._TF_SPAWN_TIMEOUT_SECONDS)}s (image pull?).")
+        if proc.returncode != 0:
+            detail = (out or b"").decode("utf-8", errors="replace").strip()[-500:]
+            raise RuntimeError(f"Failed to spawn Terraform runner container: {detail or 'docker run failed'}")
+
+    _RUN_DIR_JOB_RE = re.compile(r"^(?P<stable>.+)__j(?P<job>\d+)$")
+
+    def _promote_run_dir(self, run_rel_dir: str, stable_rel_dir: str, job_id: int) -> None:
+        """Finished per-job run dir → its stable name (the one that is versioned in
+        inventory_state), and drop leftover run dirs of jobs that are no longer
+        running. Called while the state lock is held — never touches the dir of a
+        job that may still be using it."""
+        src, dst = self.base_git_dir / run_rel_dir, self.base_git_dir / stable_rel_dir
+        try:
+            if src.is_dir():
+                if dst.exists():
+                    shutil.rmtree(dst)
+                os.replace(src, dst)
+        except OSError as exc:
+            log.warning("[TF] could not promote run dir %s: %s", src.name, exc)
+        queue = getattr(self, "queue", None)
+        for sibling in dst.parent.glob(f"{dst.name}__j*"):
+            m = self._RUN_DIR_JOB_RE.match(sibling.name)
+            if not m or not sibling.is_dir() or int(m.group("job")) == int(job_id or 0):
+                continue
+            try:
+                status = queue.job_status(int(m.group("job"))) if queue is not None else None
+            except Exception:
+                status = "RUNNING"   # unknown → hands off
+            if status == "RUNNING":
+                continue
+            shutil.rmtree(sibling, ignore_errors=True)
 
     @staticmethod
     def _build_import_cmd(tf_bin: str, import_specs: list[dict]) -> str:
@@ -3371,13 +4059,13 @@ class DeploymentEngine:
 
     async def execute_terraform_provision(
         self, host_name: str, job_id: int, force_apply: bool = False,
-        mode: str = "apply", adopt_existing: bool = False,
+        mode: str = "apply", adopt_existing: bool = False, dry_run: bool = False,
     ) -> tuple[bool, dict]:
         host_name = str(host_name or "").strip().lower()
         if not host_name:
             return False, {"successful_hosts": 0, "failed_hosts": 1}
 
-        ctx = self._find_terraform_context_for_host(host_name)
+        ctx = await off_loop(self._find_terraform_context_for_host, host_name)
         infra_repo = self.base_git_dir / "infra_engine"
         render_script = infra_repo / "scripts" / "python" / "render_environment.py"
         templates_dir = infra_repo / "terraform-templates"
@@ -3386,13 +4074,19 @@ class DeploymentEngine:
         if not templates_dir.exists():
             raise RuntimeError(f"Missing templates dir: {templates_dir}")
 
-        secrets_payload, missing = self._build_terraform_secrets_payload(ctx)
+        # About a dozen Vault reads plus the controller YAML: off the loop.
+        secrets_payload, missing = await off_loop(self._build_terraform_secrets_payload, ctx)
         if missing:
             raise RuntimeError(
                 "Missing Terraform secret(s): " + ", ".join(sorted(set(missing)))
             )
+        self._register_terraform_secrets(job_id, secrets_payload)
 
-        run_rel_dir = f"inventory_state/.terraform_runs/{ctx['env_name']}__{host_name}"
+        # Per-job run dir (audit OC-01): two jobs for one host used to rmtree and
+        # re-render the same directory under each other's running tofu. Only this
+        # job ever touches <stable>__j<job>; it becomes <stable> when the run ended.
+        stable_rel_dir = f"inventory_state/.terraform_runs/{ctx['env_name']}__{host_name}"
+        run_rel_dir = f"{stable_rel_dir}__j{job_id}" if job_id and job_id > 0 else stable_rel_dir
         run_dir = self.base_git_dir / run_rel_dir
         if run_dir.exists():
             shutil.rmtree(run_dir)
@@ -3416,6 +4110,7 @@ class DeploymentEngine:
                 *render_cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
+                env=render_env(),    # repository code: never the core's environment (OS-06)
             )
             render_out, _ = await render_proc.communicate()
             render_text = render_out.decode("utf-8", errors="replace").strip()
@@ -3469,6 +4164,9 @@ class DeploymentEngine:
             task_name=f"Terraform Provision: {host_name}",
             job_id=job_id,
             import_specs=import_specs,
+            dry_run=dry_run,
+            state_key=f"tf:{ctx['env_name']}",
+            stable_rel_dir=stable_rel_dir,
         )
 
     def _iter_terraform_environments(self) -> list[dict]:
@@ -3522,7 +4220,20 @@ class DeploymentEngine:
     ) -> tuple[bool, dict]:
         """Render and run OpenTofu for an entire environment (no -target)."""
         env_name = env_ctx["env_name"]
-        ctx = self._find_terraform_context_for_host(env_ctx["representative_host"])
+        # ``plan_save`` and ``apply_saved`` are the two halves of an approved apply:
+        # they share the run dir of the job's apply ("<env>__apply__j<job>").
+        dir_mode = "apply" if mode in ("plan_save", "apply_saved") else mode
+        stable_rel_dir = f"inventory_state/.terraform_runs/{env_name}__{dir_mode}"
+        run_rel_dir = f"{stable_rel_dir}__j{job_id}" if job_id and job_id > 0 else stable_rel_dir
+        if mode == "apply_saved":
+            if not (self.base_git_dir / run_rel_dir / "tfplan").is_file():
+                raise RuntimeError(f"[TF] No saved plan for environment '{env_name}' in this job — nothing applied.")
+            return await self.execute_terraform_docker(
+                run_rel_dir=run_rel_dir, host_name=f"env:{env_name}", targets=None, mode="apply_saved",
+                force_apply=force_apply, task_name=f"Terraform Apply: {env_name}", job_id=job_id,
+                state_key=f"tf:{env_name}", stable_rel_dir=stable_rel_dir,
+            )
+        ctx = await off_loop(self._find_terraform_context_for_host, env_ctx["representative_host"])
 
         infra_repo = self.base_git_dir / "infra_engine"
         render_script = infra_repo / "scripts" / "python" / "render_environment.py"
@@ -3532,13 +4243,13 @@ class DeploymentEngine:
         if not templates_dir.exists():
             raise RuntimeError(f"Missing templates dir: {templates_dir}")
 
-        secrets_payload, missing = self._build_terraform_secrets_payload(ctx)
+        secrets_payload, missing = await off_loop(self._build_terraform_secrets_payload, ctx)
         if missing:
             raise RuntimeError(
                 "Missing Terraform secret(s): " + ", ".join(sorted(set(missing)))
             )
+        self._register_terraform_secrets(job_id, secrets_payload)
 
-        run_rel_dir = f"inventory_state/.terraform_runs/{env_name}__{mode}"
         run_dir = self.base_git_dir / run_rel_dir
         if run_dir.exists():
             shutil.rmtree(run_dir)
@@ -3562,6 +4273,7 @@ class DeploymentEngine:
                 *render_cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
+                env=render_env(),    # repository code: never the core's environment (OS-06)
             )
             render_out, _ = await render_proc.communicate()
             render_text = render_out.decode("utf-8", errors="replace").strip()
@@ -3577,7 +4289,7 @@ class DeploymentEngine:
             except OSError:
                 pass
 
-        verb = "Plan" if mode == "plan" else "Apply"
+        verb = {"plan": "Plan", "plan_save": "Plan (approved)"}.get(mode, "Apply")
         return await self.execute_terraform_docker(
             run_rel_dir=run_rel_dir,
             host_name=f"env:{env_name}",
@@ -3586,17 +4298,157 @@ class DeploymentEngine:
             force_apply=force_apply,
             task_name=f"Terraform {verb}: {env_name}",
             job_id=job_id,
+            state_key=f"tf:{env_name}",
+            # The saved plan stays in the job's run dir until it was applied.
+            stable_rel_dir=None if mode == "plan_save" else stable_rel_dir,
         )
 
+    async def pinned_controller_sha(self, context: dict | None = None) -> str:
+        """The iac-controller commit this pipeline generated its state from: the
+        one pinned in the pipeline prefix (state lock held), else the working
+        tree's HEAD right now. ``""`` when unknown."""
+        pinned = str((context or {}).get("iac_controller_sha") or "")
+        if pinned:
+            return pinned
+        try:
+            return str(await self.repo_head_sha("iac_controller") or "")
+        except Exception as exc:
+            log.warning(f"[TF] iac-controller commit not readable: {exc}")
+            return ""
+
+    async def _store_pending_plan(self, job_id: int, pending_envs: dict, controller_sha: str | None) -> None:
+        """Persist the plan awaiting approval together with what an approval is
+        bound to: the controller commit and a fingerprint per environment."""
+        await off_loop(self.db.update_state, "pending_infra_plan", {
+            "job_id": job_id,
+            "planned_at": datetime.now(timezone.utc).isoformat(),
+            "controller_sha": str(controller_sha or ""),
+            "envs": plan_binding.with_fingerprints(pending_envs),
+        }, "latest")
+
+    def _discard_saved_plans(self, environments: list[dict], job_id: int) -> None:
+        """Remove this job's run dirs of an approved apply that was not carried out
+        (they hold a plan file that must not be applied later). Sync: thread."""
+        if not job_id or job_id <= 0:
+            return          # without a job id the run dir is the shared stable one
+        for env_ctx in environments:
+            run_dir = self.base_git_dir / f"inventory_state/.terraform_runs/{env_ctx['env_name']}__apply__j{job_id}"
+            shutil.rmtree(run_dir, ignore_errors=True)
+
+    async def _apply_reviewed_plan(self, environments: list[dict], job_id: int, reviewed: dict,
+                                   controller_sha: str | None, dry: bool) -> tuple[bool, dict]:
+        """Apply the plan an operator reviewed — or nothing (audit OS-12).
+
+        1. Plan every environment again, read-only, and keep each plan as a file.
+        2. Compare the fingerprints with the reviewed ones. Any difference (an
+           environment gained or lost changes, other counts, other hosts): nothing
+           is applied, the fresh plan becomes the new pending plan.
+        3. Apply exactly the saved plan files. tofu refuses a file whose state
+           changed since step 1, so nothing but the compared plan can be applied.
+        """
+        envs_total = len(environments)
+        result = {"successful_hosts": 0, "failed_hosts": 0, "skipped": 0, "environments": envs_total,
+                  "created_hosts": [], "pending_envs": 0}
+        fresh: dict[str, dict] = {}
+        planned: list[dict] = []
+        for env_ctx in environments:
+            env = env_ctx["env_name"]
+            log.info("Infra apply (approved plan): planning environment '%s' (%d host(s))", env, env_ctx["host_count"])
+            try:
+                ok, stats = await self.execute_terraform_environment(env_ctx, "plan_save", job_id)
+            except RuntimeError as exc:
+                msg = str(exc)
+                if "Missing Terraform secret" in msg or "render failed" in msg.lower():
+                    # Not configured: it was skipped when the plan was reviewed, too.
+                    log.warning("Infra apply: skipping unconfigured env '%s' (%s).", env, msg)
+                    result["skipped"] += 1
+                    continue
+                ok, stats = False, {"error": msg}
+            except Exception as exc:  # noqa: BLE001
+                ok, stats = False, {"error": str(exc)}
+            if not ok:
+                detail = f": {stats['error']}" if isinstance(stats, dict) and stats.get("error") else ""
+                log.error("Infra apply: the plan of env '%s' failed%s — nothing is applied.", env, detail)
+                result.update(failed_hosts=1, refused=(
+                    f"The plan of environment '{env}' could not be computed{detail} — it cannot be compared with "
+                    "the reviewed plan, so NOTHING was applied. The reviewed plan stays pending."))
+                await off_loop(self._discard_saved_plans, environments, job_id)
+                return False, result
+            planned.append(env_ctx)
+            if isinstance(stats, dict) and stats.get("plan_summary"):
+                fresh[env] = {"summary": stats.get("plan_summary"),
+                              "hosts_to_create": stats.get("hosts_to_create") or [],
+                              "hosts_to_destroy": stats.get("hosts_to_destroy") or []}
+
+        diffs = plan_binding.differences(reviewed.get("expected"), plan_binding.fingerprints(fresh))
+        if diffs:
+            for line in diffs:
+                log.error(f"[TF] Plan differs from the reviewed plan — {line}")
+            if fresh:
+                await self._store_pending_plan(job_id, fresh, controller_sha)
+            else:
+                await off_loop(self.db.update_state, "pending_infra_plan", {}, "latest")
+            result.update(pending_envs=len(fresh), refused=(
+                "The plan is not the one that was reviewed — NOTHING was applied. " + "; ".join(diffs)[:600]
+                + (f". The fresh plan (job #{job_id}) awaits review." if fresh else
+                   ". There is nothing left to apply.")))
+            await off_loop(self._discard_saved_plans, environments, job_id)
+            return False, result
+        log.info("[TF] The plan matches the reviewed plan (%d environment(s) with changes).", len(fresh))
+        if dry:
+            log.warning("[TF] DRY-RUN job: the approved plan was verified, nothing is applied.")
+            result["pending_envs"] = len(fresh)
+            await off_loop(self._discard_saved_plans, environments, job_id)
+            return True, result
+
+        overall_ok = True
+        for env_ctx in planned:
+            env = env_ctx["env_name"]
+            if env not in fresh:
+                log.info("Infra apply: environment '%s' has no changes — nothing to apply.", env)
+                result["successful_hosts"] += 1
+                await off_loop(self._discard_saved_plans, [env_ctx], job_id)
+                continue
+            try:
+                ok, stats = await self.execute_terraform_environment(env_ctx, "apply_saved", job_id, force_apply=True)
+            except Exception as exc:  # noqa: BLE001
+                log.error("Infra apply failed for env '%s': %s", env, exc)
+                ok, stats = False, {}
+            for host in (stats.get("created_hosts") or []) if isinstance(stats, dict) else []:
+                if host not in result["created_hosts"]:
+                    result["created_hosts"].append(host)
+            if ok:
+                result["successful_hosts"] += 1
+            else:
+                result["failed_hosts"] += 1
+                overall_ok = False
+        log.info("Infra apply summary: %d ok, %d failed, %d skipped (of %d env).",
+                 result["successful_hosts"], result["failed_hosts"], result["skipped"], envs_total)
+        if overall_ok:
+            await off_loop(self.db.update_state, "pending_infra_plan", {}, "latest")
+        return overall_ok, result
+
     async def execute_terraform_infra(
-        self, mode: str, job_id: int, force_apply: bool = False
+        self, mode: str, job_id: int, force_apply: bool = False, *,
+        reviewed: dict | None = None, controller_sha: str | None = None,
     ) -> tuple[bool, dict]:
         """Run a whole-infrastructure plan or apply across every non-empty
-        Terraform environment."""
-        environments = self._iter_terraform_environments()
+        Terraform environment.
+
+        ``controller_sha``: the iac-controller commit the state was generated
+        from — stored with a pending plan. ``reviewed`` (``mode="apply"``): the
+        approval of a pending plan, ``{"controller_sha", "expected": {env:
+        fingerprint}}`` — the apply is then bound to that plan
+        (:meth:`_apply_reviewed_plan`).
+        """
+        # Read once for the bookkeeping below; execute_terraform_docker enforces it.
+        dry = await self._job_is_dry_run(job_id)
+        environments = await off_loop(self._iter_terraform_environments)
         if not environments:
             log.warning("No Terraform environments with containers found; nothing to %s.", mode)
             return True, {"successful_hosts": 0, "failed_hosts": 0, "environments": 0}
+        if mode == "apply" and reviewed is not None:
+            return await self._apply_reviewed_plan(environments, job_id, reviewed, controller_sha, dry)
 
         overall_ok = True
         succeeded = 0
@@ -3665,19 +4517,16 @@ class DeploymentEngine:
         if overall_ok:
             if mode == "plan":
                 if pending_envs:
-                    self.db.update_state("pending_infra_plan", {
-                        "job_id": job_id,
-                        "planned_at": datetime.now(timezone.utc).isoformat(),
-                        "envs": pending_envs,
-                    }, "latest")
+                    await self._store_pending_plan(job_id, pending_envs, controller_sha)
                     log.info(
                         "Infra plan left %d environment(s) with pending changes — awaiting operator approval.",
                         len(pending_envs),
                     )
                 else:
-                    self.db.update_state("pending_infra_plan", {}, "latest")
-            elif mode == "apply":
-                self.db.update_state("pending_infra_plan", {}, "latest")
+                    await off_loop(self.db.update_state, "pending_infra_plan", {}, "latest")
+            elif mode == "apply" and not dry:
+                # A dry-run "apply" applied nothing: the reviewed plan stays pending.
+                await off_loop(self.db.update_state, "pending_infra_plan", {}, "latest")
 
         return overall_ok, {
             "successful_hosts": succeeded,
@@ -3701,6 +4550,12 @@ class DeploymentEngine:
         
         if not shutil.which("docker"): return False, {"successful_hosts": 0, "failed_hosts": 0}
 
+        # The job's persisted mode wins over the caller's flag: a stage that does
+        # not pass check_mode can never run a dry-run job for real (audit OS-08).
+        if not check_mode and await self._job_is_dry_run(job_id):
+            log.warning(f"DRY-RUN job #{job_id}: forcing --check for {playbook_subpath}.")
+            check_mode = True
+
         if "active_tasks" not in self.state: self.state["active_tasks"] = {}
         self.state["active_tasks"][task_name] = {
             "status": "pulling_image",
@@ -3710,12 +4565,19 @@ class DeploymentEngine:
         }
         self._sync_runners(job_id, force=True)
 
-        reg_url, reg_user, reg_token = self.ctx.get_secret("ansible_registry_url"), self.ctx.get_secret("ansible_registry_user"), self.ctx.get_secret("ansible_registry_token")
+        # Four Vault round trips per playbook run — off the loop (audit OC-08 B3).
+        reg_url, reg_user, reg_token, ssh_key = await off_loop(lambda: (
+            self.ctx.get_secret("ansible_registry_url"), self.ctx.get_secret("ansible_registry_user"),
+            self.ctx.get_secret("ansible_registry_token"), self.ctx.get_secret(ssh_key_secret)))
+        if reg_url and reg_user and reg_token and registry_host(reg_url) not in allowed_registry_hosts():
+            # The registry token is only ever sent to a registry of the runner
+            # image allowlist, whatever the stored URL says.
+            log.error(f"Registry login skipped: '{registry_host(reg_url)}' is not part of the runner image allowlist.")
+            reg_token = None
         if reg_url and reg_user and reg_token:
             proc = await asyncio.create_subprocess_exec("docker", "login", reg_url, "-u", reg_user, "--password-stdin", stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
             await proc.communicate(input=reg_token.encode('utf-8'))
 
-        ssh_key = self.ctx.get_secret(ssh_key_secret)
         if not ssh_key:
             log.error(f"Ansible run aborted: secret '{ssh_key_secret}' is not set in Vault.")
             return False, {"successful_hosts": 0, "failed_hosts": 0}
@@ -3763,21 +4625,34 @@ class DeploymentEngine:
             if extra_roles_paths:
                 ansible_roles_path += ":" + ":".join(str(p) for p in extra_roles_paths)
 
+            # Image and diff mode are settings (Vault). The image check may raise
+            # — inside this try, so the task ends as "error" as before.
+            ansible_image, diff_mode, readonly = await off_loop(lambda: (
+                self._runner_image("ansible"), getattr(self.config, "ansible_diff_mode", "dry_run"),
+                bool(getattr(self.config, "runner_readonly_mounts", False))))
+            mounts = await off_loop(self._ansible_mounts, job_id, h_git, h_svc, readonly)
+
             cmd = [
                 "docker", "run", "-d", "--name", c_name, "--pull", "always",
                 "--label", f"iac_job_id={job_id}", "--label", f"iac_task_name={task_name}",
+                "--label", "iac_kind=ansible",
                 "-e", f"IAC_JOB_ID={job_id}",
-                "-v", f"{h_git}:/data/storage/git_repos", "-v", f"{h_svc}:/data/storage/services",
+                *mounts,
                 "-e", "ANSIBLE_HOST_KEY_CHECKING=False", "-e", "PYTHONUNBUFFERED=1", "-e", "ANSIBLE_NOCOLOR=1", "-e", "ANSIBLE_DEPRECATION_WARNINGS=0", "-e", "ANSIBLE_INTERPRETER_PYTHON=auto_silent",
                 "-e", f"ANSIBLE_ROLES_PATH={ansible_roles_path}", "-e", "PYTHONPATH=/data/storage/git_repos/aac_factory/scripts",
                 "--entrypoint", "",
-                self.config.ansible_docker_image,
+                ansible_image,
                 "/bin/sh", "-c", 
                 "mkdir -p /root/.ssh && cp \"$1\" /root/.ssh/id_rsa && chmod 600 /root/.ssh/id_rsa && shift && exec \"$@\"", 
                 "--", f"/data/storage/services/.iac_keys/{key_filename}",
                 "ansible-playbook", "-i", f"/data/storage/git_repos/{inv_root}/{inventory_subpath}", f"/data/storage/git_repos/config_engine/{playbook_subpath}",
-                "-u", remote_user, "--diff" 
+                "-u", remote_user,
             ]
+            # --diff prints the rendered content of every templated file — the
+            # service's stack.env with its secrets included — into the job log
+            # (audit OS-07). Default: only for dry-runs; never for real deploys.
+            if diff_mode == "always" or (diff_mode == "dry_run" and check_mode):
+                cmd.append("--diff")
             if limit: cmd.extend(["--limit", limit])
             if extra_vars:
                 for k, v in extra_vars.items(): cmd.extend(["-e", f"{k}={v}"])
@@ -3800,7 +4675,7 @@ class DeploymentEngine:
                 error_msg = stdout.decode('utf-8', errors='replace').strip()
                 raise RuntimeError(f"Failed to spawn Docker runner container: {error_msg}")
 
-            return await self._watch_detached_runner(c_name, task_name, job_id)
+            return await self._watch_detached_runner(c_name, task_name, job_id, kind="ansible")
         except Exception as e:
             log.error(f"Docker Execution Error: {e}")
             if "active_tasks" in self.state and task_name in self.state["active_tasks"]:
@@ -3865,6 +4740,8 @@ class DeploymentEngine:
         
         total_tasks = len(tasks)
         task_results = []
+        flat_total = sum(len(t.stages) for t in tasks)
+        flat_index = 0
         
         for task in tasks:
             task.start_time = time.time()
@@ -3874,7 +4751,9 @@ class DeploymentEngine:
                 for idx, stage in enumerate(task.stages):
                     # Update progress per stage within task
                     stage_pct = int(((task.task_num - 1 + idx / len(task.stages)) / total_tasks) * 50)
-                    self.db.update_progress(job_id, progress=stage_pct, current_step=f"[Task {task.task_num}/{total_tasks}] {stage.name}")
+                    self._mark_stage(job_id, flat_index, flat_total, stage, stage_pct,
+                                     f"[Task {task.task_num}/{total_tasks}] {stage.name}")
+                    flat_index += 1
                     
                     log.info(f"  → Stage: {stage.name}")
                     res = await stage.run(self, context)
@@ -3914,7 +4793,8 @@ class DeploymentEngine:
                 
                 # Insert task record into database
                 try:
-                    self.db.insert_job_task(
+                    await off_loop(
+                        self.db.insert_job_task,
                         job_id=job_id,
                         task_num=task.task_num,
                         task_name=task.task_name,

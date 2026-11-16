@@ -9,6 +9,7 @@ from ui.theme import UIStyles
 from .overview_dashboard import render_overview_dashboard
 from .terraform import render_terraform_panel
 from . import components as c
+from .access import PERM_WRITE, session_may, session_username, ui_submit
 from ..controller.pipeline_meta import classify, describe
 
 DOCKER_ICON = 'svg:M6.1,10L0,10.1V13h6.1V10z M13.1,10H7v3h6.1V10z M20.1,10H14v3h6.1V10z M13.1,3H7v3h6.1V3z'
@@ -94,32 +95,34 @@ async def render_dashboard(ctx, service):
         return sorted(unique_assignments.values(), key=lambda x: (x['site'], x['stage'], x['host']))
 
     async def abort_execution():
-        ctx.log.warning("UI: ABORT SEQUENCE INITIATED BY USER.")
-        ui.notify("Aborting execution and destroying runner containers...", type="negative")
-        for task_name in state.get("active_tasks", {}).keys():
-            safe_task_name = "".join(c if c.isalnum() or c in ".-_" else "-" for c in task_name).strip("-")
-            try: await asyncio.create_subprocess_exec("docker", "rm", "-f", f"aac-runner-{safe_task_name}")
-            except Exception: pass
-            
-        recent = engine.db.get_recent_jobs(1)
-        if recent and recent[0]["status"] == "RUNNING":
-            job_id = recent[0]["id"]
-            engine.db.update_job(job_id, "ABORTED")
-            engine.db.update_progress(job_id, progress=None, current_step="Aborted by User")
-            from core.api import OutboundMessage, MessageSeverity
-            _abort_msg = OutboundMessage(
-                title=f"Pipeline #{job_id} Aborted",
-                body="Execution aborted by user.",
-                severity=MessageSeverity.WARNING,
-                source_plugin_id="lyndrix.plugin.iac_orchestrator",
-                target_provider="system",
-                metadata={"notification_id": f"job_{job_id}", "toast": True, "persist": True},
-            )
-            ctx.emit("messaging:outbound", _abort_msg.model_dump(mode="json"))
-            
-        state["is_running"] = False
-        state["active_tasks"] = {}
-        ui.notify("Execution Aborted Successfully.", type="info")
+        """The same stop path as ``POST /abort`` (``api.do_abort``).
+
+        This handler used to have its own: ``docker rm -f`` by a guessed
+        container name on THIS instance (wrong name for Terraform containers,
+        wrong host on a control-plane pod), ABORTED written to the newest
+        RUNNING row without waiting for the containers, the task list wiped.
+        The API path asks the owning runner, closes a row only after its
+        containers are gone and reports the jobs Docker could not stop."""
+        from ..controller import api as _api
+
+        if session_may(PERM_WRITE) is False:
+            ui.notify("You do not have the permission to abort pipelines.", type="negative")
+            return
+        ctx.log.warning(f"UI: ABORT SEQUENCE INITIATED BY USER '{session_username() or '?'}'.")
+        ui.notify("Aborting execution and stopping the runner containers...", type="negative")
+        try:
+            result = await _api.do_abort()
+        except Exception as exc:
+            ui.notify(f"Abort failed: {getattr(exc, 'detail', None) or exc}", type="negative")
+            return
+        unstopped = result.get("unstopped_jobs") or []
+        if unstopped:
+            ui.notify(
+                "Docker on the runner did not answer: the containers of "
+                + ", ".join(f"#{j}" for j in unstopped)
+                + " could not be stopped yet. The abort is retried; until then these jobs stay RUNNING.",
+                type="warning", multi_line=True)
+        ui.notify(f"Execution aborted ({len(result.get('aborted_jobs') or [])} job(s)).", type="info")
         
     # Live viewer state. ``offset`` is the byte position we have already streamed,
     # so each poll reads ONLY the new bytes (append-only log) instead of re-reading
@@ -377,7 +380,7 @@ async def render_dashboard(ctx, service):
 
                                             with ui.row().classes('w-full justify-between items-center gap-2'):
                                                 ui.button(icon='history', on_click=lambda n=name: [svc_history_title.set_text(f"Deployment History: {n}"), setattr(svc_history_table, 'rows', engine.db.get_service_history(n)), svc_history_dialog.open()]).props('flat round size=sm color=zinc-500').tooltip("View Deployment History")
-                                                ui.button('Deploy', icon='rocket', on_click=lambda n=name, b=branch: ctx.emit("iac:webhook_verified", {"pipeline_type": "single_service", "service_name": n, "service_branch": b, "manual": True})).props('unelevated rounded size=sm color=indigo')
+                                                ui.button('Deploy', icon='rocket', on_click=lambda n=name, b=branch: ui_submit(service, {"pipeline_type": "single_service", "service_name": n, "service_branch": b, "manual": True})).props('unelevated rounded size=sm color=indigo')
 
                     catalog_search.on('update:model-value', render_catalog_cards)
                     render_catalog_cards()
@@ -392,9 +395,9 @@ async def render_dashboard(ctx, service):
                     with ui.row().classes('gap-2 items-center'):
                         search_input = ui.input('Search Host or Service...').props('outlined dense clearable').classes('w-64')
                         ui.button(icon='refresh', on_click=lambda: assignment_container.refresh()).props('flat round color=zinc-500')
-                        ui.button('Global Bootstrap', icon='verified_user', color='sky', on_click=lambda: ctx.emit("iac:webhook_verified", {"pipeline_type": "bootstrap_compliance", "limit": "all", "manual": True})).props('flat rounded size=sm').bind_enabled_from(state, 'is_running', backward=lambda x: not x).tooltip("Run compliance/baseline (as root) across ALL hosts")
-                        ui.button('Global Adopt', icon='move_to_inbox', color='amber-7', on_click=lambda: ctx.emit("iac:webhook_verified", {"pipeline_type": "adopt_host", "limit": "all", "manual": True})).props('flat rounded size=sm').bind_enabled_from(state, 'is_running', backward=lambda x: not x).tooltip("Import every managed container (all sites) into Terraform state")
-                        ui.button('Global Rollout', icon='public', color='emerald', on_click=lambda: ctx.emit("iac:webhook_verified", {"pipeline_type": "rollout", "limit": "all", "manual": True})).props('unelevated rounded size=sm').bind_enabled_from(state, 'is_running', backward=lambda x: not x).tooltip("Trigger full infrastructure rollout")
+                        ui.button('Global Bootstrap', icon='verified_user', color='sky', on_click=lambda: ui_submit(service, {"pipeline_type": "bootstrap_compliance", "limit": "all", "manual": True})).props('flat rounded size=sm').bind_enabled_from(state, 'is_running', backward=lambda x: not x).tooltip("Run compliance/baseline (as root) across ALL hosts")
+                        ui.button('Global Adopt', icon='move_to_inbox', color='amber-7', on_click=lambda: ui_submit(service, {"pipeline_type": "adopt_host", "limit": "all", "manual": True})).props('flat rounded size=sm').bind_enabled_from(state, 'is_running', backward=lambda x: not x).tooltip("Import every managed container (all sites) into Terraform state")
+                        ui.button('Global Rollout', icon='public', color='emerald', on_click=lambda: ui_submit(service, {"pipeline_type": "rollout", "limit": "all", "manual": True})).props('unelevated rounded size=sm').bind_enabled_from(state, 'is_running', backward=lambda x: not x).tooltip("Trigger full infrastructure rollout")
 
                 @ui.refreshable
                 def assignment_container():
@@ -427,9 +430,9 @@ async def render_dashboard(ctx, service):
                                         ui.icon('domain', size='24px').classes('text-[var(--lx-text-muted)]')
                                         ui.label(site.upper()).classes('text-xl font-black tracking-widest text-[var(--lx-text)]')
                                         ui.space()
-                                        ui.button('Site Bootstrap', icon='verified_user', on_click=lambda s=site: ctx.emit("iac:webhook_verified", {"pipeline_type": "bootstrap_compliance", "limit": s, "manual": True})).props('flat rounded size=sm color=sky').bind_enabled_from(state, 'is_running', backward=lambda x: not x).tooltip(f"Run compliance/baseline (as root) across all {site.upper()} hosts")
-                                        ui.button('Site Adopt', icon='move_to_inbox', on_click=lambda s=site: ctx.emit("iac:webhook_verified", {"pipeline_type": "adopt_host", "limit": s, "manual": True})).props('flat rounded size=sm color=amber-7').bind_enabled_from(state, 'is_running', backward=lambda x: not x).tooltip(f"Import all managed {site.upper()} containers into Terraform state")
-                                        ui.button('Site Rollout', icon='rocket_launch', on_click=lambda s=site: ctx.emit("iac:webhook_verified", {"pipeline_type": "rollout", "limit": s, "manual": True})).props('flat rounded size=sm color=slate').bind_enabled_from(state, 'is_running', backward=lambda x: not x).tooltip(f"Rollout all hosts in {site.upper()}")
+                                        ui.button('Site Bootstrap', icon='verified_user', on_click=lambda s=site: ui_submit(service, {"pipeline_type": "bootstrap_compliance", "limit": s, "manual": True})).props('flat rounded size=sm color=sky').bind_enabled_from(state, 'is_running', backward=lambda x: not x).tooltip(f"Run compliance/baseline (as root) across all {site.upper()} hosts")
+                                        ui.button('Site Adopt', icon='move_to_inbox', on_click=lambda s=site: ui_submit(service, {"pipeline_type": "adopt_host", "limit": s, "manual": True})).props('flat rounded size=sm color=amber-7').bind_enabled_from(state, 'is_running', backward=lambda x: not x).tooltip(f"Import all managed {site.upper()} containers into Terraform state")
+                                        ui.button('Site Rollout', icon='rocket_launch', on_click=lambda s=site: ui_submit(service, {"pipeline_type": "rollout", "limit": s, "manual": True})).props('flat rounded size=sm color=slate').bind_enabled_from(state, 'is_running', backward=lambda x: not x).tooltip(f"Rollout all hosts in {site.upper()}")
 
                                     for stage, items in sorted(stages.items()):
                                         with ui.column().classes('w-full pl-4 md:pl-6 border-l-2 border-[var(--lx-border-soft)] mt-2 gap-3'):
@@ -448,11 +451,11 @@ async def render_dashboard(ctx, service):
                                                                     ui.icon('dns', size='18px').classes('text-[var(--lx-text-muted)]')
                                                                     ui.label(host).classes('text-md font-bold text-[var(--lx-text)] truncate max-w-[150px]').tooltip(host)
                                                                 with ui.row().classes('gap-1 items-center'):
-                                                                    ui.button('Adopt Host', icon='move_to_inbox', on_click=lambda h=host: ctx.emit("iac:webhook_verified", {"pipeline_type": "adopt_host", "host_name": h, "manual": True})).props('unelevated rounded size=sm color=amber-7').tooltip(f"Import the existing container for {host} into Terraform state (import + plan, no apply)").bind_enabled_from(state, 'is_running', backward=lambda x: not x)
-                                                                    ui.button('Init Host', icon='dns', on_click=lambda h=host: ctx.emit("iac:webhook_verified", {"pipeline_type": "init_host", "host_name": h, "manual": True})).props('unelevated rounded size=sm color=deep-purple').tooltip(f"Provision the container for {host} via Terraform only (no Ansible, no services)").bind_enabled_from(state, 'is_running', backward=lambda x: not x)
-                                                                    ui.button('Bootstrap Host', icon='verified_user', on_click=lambda h=host: ctx.emit("iac:webhook_verified", {"pipeline_type": "bootstrap_compliance", "host_name": h, "manual": True})).props('unelevated rounded size=sm color=sky').tooltip(f"Run the initial compliance/baseline playbook as root on {host} (creates the ansible-agent account)").bind_enabled_from(state, 'is_running', backward=lambda x: not x)
-                                                                    ui.button('Compliance Host', icon='fact_check', on_click=lambda h=host: ctx.emit("iac:webhook_verified", {"pipeline_type": "compliance", "host_name": h, "manual": True})).props('unelevated rounded size=sm color=teal').tooltip(f"Re-run the compliance baseline as the svc user (ansible-agent) on {host} — no service deployment").bind_enabled_from(state, 'is_running', backward=lambda x: not x)
-                                                                    ui.button('Deploy Services', icon='rocket', on_click=lambda h=host: ctx.emit("iac:webhook_verified", {"pipeline_type": "rollout", "limit": h, "manual": True})).props('unelevated rounded size=sm color=indigo').tooltip(f"Deploy this host's services to {host}").bind_enabled_from(state, 'is_running', backward=lambda x: not x)
+                                                                    ui.button('Adopt Host', icon='move_to_inbox', on_click=lambda h=host: ui_submit(service, {"pipeline_type": "adopt_host", "host_name": h, "manual": True})).props('unelevated rounded size=sm color=amber-7').tooltip(f"Import the existing container for {host} into Terraform state (import + plan, no apply)").bind_enabled_from(state, 'is_running', backward=lambda x: not x)
+                                                                    ui.button('Init Host', icon='dns', on_click=lambda h=host: ui_submit(service, {"pipeline_type": "init_host", "host_name": h, "manual": True})).props('unelevated rounded size=sm color=deep-purple').tooltip(f"Provision the container for {host} via Terraform only (no Ansible, no services)").bind_enabled_from(state, 'is_running', backward=lambda x: not x)
+                                                                    ui.button('Bootstrap Host', icon='verified_user', on_click=lambda h=host: ui_submit(service, {"pipeline_type": "bootstrap_compliance", "host_name": h, "manual": True})).props('unelevated rounded size=sm color=sky').tooltip(f"Run the initial compliance/baseline playbook as root on {host} (creates the ansible-agent account)").bind_enabled_from(state, 'is_running', backward=lambda x: not x)
+                                                                    ui.button('Compliance Host', icon='fact_check', on_click=lambda h=host: ui_submit(service, {"pipeline_type": "compliance", "host_name": h, "manual": True})).props('unelevated rounded size=sm color=teal').tooltip(f"Re-run the compliance baseline as the svc user (ansible-agent) on {host} — no service deployment").bind_enabled_from(state, 'is_running', backward=lambda x: not x)
+                                                                    ui.button('Deploy Services', icon='rocket', on_click=lambda h=host: ui_submit(service, {"pipeline_type": "rollout", "limit": h, "manual": True})).props('unelevated rounded size=sm color=indigo').tooltip(f"Deploy this host's services to {host}").bind_enabled_from(state, 'is_running', backward=lambda x: not x)
 
                                                             with ui.row().classes('gap-1.5 pt-1'):
                                                                 for svc in svcs:

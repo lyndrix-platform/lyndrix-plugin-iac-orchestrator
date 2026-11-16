@@ -19,9 +19,10 @@ from iac_plugin.app.model.models import Base, IaCJob
 
 
 @pytest.fixture
-def q(monkeypatch):
-    engine = create_engine("sqlite://", connect_args={"check_same_thread": False},
-                           poolclass=__import__("sqlalchemy.pool", fromlist=["StaticPool"]).StaticPool)
+def q(monkeypatch, tmp_path):
+    # A file: worker threads need their own connections (see conftest.sqlite_queue).
+    engine = create_engine(f"sqlite:///{tmp_path / 'jobs.db'}",
+                           connect_args={"check_same_thread": False, "timeout": 30})
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine)
     monkeypatch.setattr(queue_mod.db_instance, "is_connected", True, raising=False)
@@ -59,9 +60,10 @@ def test_rollout_conflict_rules():
 def test_enqueue_claim_and_duplicate(q):
     jid = q.enqueue({"pipeline_type": "single_service", "service_name": "Svc-A", "manual": True}, requested_by="ui")
     assert jid > 0
+    # a queued job that does something else (dry-run) is neither merged nor replaced: first wins
     with pytest.raises(DuplicateJob) as exc:
-        q.enqueue({"pipeline_type": "single_service", "service_name": "svc-a"})
-    assert exc.value.existing_id == jid
+        q.enqueue({"pipeline_type": "single_service", "service_name": "svc-a", "dry_run": True})
+    assert exc.value.existing_id == jid and "something else" in exc.value.reason
 
     claimed = q.claim_next("runner-1")
     assert claimed is not None
@@ -75,13 +77,12 @@ def test_enqueue_claim_and_duplicate(q):
         assert row.pipeline_type.startswith("single_service")
         assert row.heartbeat_at is not None
 
-    # still a duplicate while RUNNING, free again once it finished
-    with pytest.raises(DuplicateJob):
-        q.enqueue({"pipeline_type": "single_service", "service_name": "svc-a"})
+    # free again once it finished (the busy-target cases: tests/test_follow_up_jobs.py)
     with queue_mod.db_instance.SessionLocal() as s:
         s.execute(update(IaCJob).where(IaCJob.id == jid).values(status="SUCCESS"))
         s.commit()
-    assert q.enqueue({"pipeline_type": "single_service", "service_name": "svc-a"}) > jid
+    res = q.enqueue_ex({"pipeline_type": "single_service", "service_name": "svc-a"})
+    assert res.job_id > jid and res.waiting_for is None and not res.coalesced
 
 
 def test_claim_is_fifo_and_exclusive(q):
@@ -101,25 +102,6 @@ def test_abort_queued_and_running_summary(q):
     assert [r["id"] for r in running] == [a] and running[0]["owner_instance"] == "r1"
 
 
-# --- heartbeat / orphans --------------------------------------------------------
-
-def test_heartbeat_and_orphan_sweep(q):
-    a = q.enqueue({"pipeline_type": "connectivity"})
-    b = q.enqueue({"pipeline_type": "connectivity"})
-    q.claim_next("r1")
-    q.claim_next("r2")
-    # r2 is dead (not alive) → b fails; a keeps running
-    assert q.fail_orphans({"r1"}) == [b]
-    # stale heartbeat without instance knowledge → fails too
-    with queue_mod.db_instance.SessionLocal() as s:
-        s.execute(update(IaCJob).where(IaCJob.id == a).values(heartbeat_at=datetime.now() - timedelta(minutes=10)))
-        s.commit()
-    q.heartbeat("r1", [a])  # fresh heartbeat protects it
-    assert q.fail_orphans(None, stale_seconds=180) == []
-    with queue_mod.db_instance.SessionLocal() as s:
-        s.execute(update(IaCJob).where(IaCJob.id == a).values(heartbeat_at=datetime.now() - timedelta(minutes=10)))
-        s.commit()
-    assert q.fail_orphans(None, stale_seconds=180) == [a]
 
 
 # --- runner snapshots -----------------------------------------------------------
@@ -214,58 +196,19 @@ def test_worker_claims_and_runs_jobs(q):
 
 # --- orphan sweep: never own jobs, finalize hook first --------------------------
 
-def test_orphan_candidates_skip_own_instance_and_mark_failed(q):
+def test_mark_failed_is_conditional_on_running(q):
     a = q.enqueue({"pipeline_type": "connectivity"})
     b = q.enqueue({"pipeline_type": "connectivity"})
     q.claim_next("me")
     q.claim_next("other")
-    # "other" is not alive; "me" is excluded by self_instance even though not in the alive set
-    cands = q.orphan_candidates({"someone-else"}, 180, self_instance="me")
-    assert [c["id"] for c in cands] == [b]
-    assert q.mark_failed(b, "Runner 'other' lost") is True
-    assert q.mark_failed(b, "again") is False  # no longer RUNNING
+    assert q.mark_failed(b, "Runner 'other' lost", token=_row(b).claim_token) is True
+    assert q.mark_failed(b, "again", token=_row(b).claim_token) is False  # no longer RUNNING
     with queue_mod.db_instance.SessionLocal() as s:
         assert s.get(IaCJob, a).status == "RUNNING" and s.get(IaCJob, b).status == "FAILED"
 
 
-def test_worker_sweep_uses_finalize_hook_before_failing(q):
-    a = q.enqueue({"pipeline_type": "connectivity"})
-    b = q.enqueue({"pipeline_type": "connectivity"})
-    q.claim_next("dead-1")
-    q.claim_next("dead-2")
-    finalized = []
-
-    async def finalize(job_id, owner):
-        finalized.append((job_id, owner))
-        if job_id == a:  # pretend a's containers were found and closed
-            with queue_mod.db_instance.SessionLocal() as s:
-                s.execute(update(IaCJob).where(IaCJob.id == a).values(status="SUCCESS"))
-                s.commit()
-            return True
-        return False
-
-    async def noop(payload, job_id):
-        return None
-
-    async def scenario():
-        w = JobWorker(_Ctx(), q, noop, finalize_orphan=finalize)
-        return await w.sweep_orphans()
-
-    failed = asyncio.run(scenario())
-    assert failed == [b] and sorted(finalized) == sorted([(a, "dead-1"), (b, "dead-2")])
-    with queue_mod.db_instance.SessionLocal() as s:
-        assert s.get(IaCJob, a).status == "SUCCESS" and s.get(IaCJob, b).status == "FAILED"
 
 
-def test_alive_set_untrusted_until_it_lists_this_instance(q):
-    class _Ctx2(_Ctx):
-        cluster_instances = [{"instance_id": "someone", "roles": ["api"], "alive": True, "is_self": False}]
-
-    async def noop(payload, job_id):
-        return None
-
-    assert JobWorker(_Ctx2(), q, noop)._alive_instances() is None
-    assert JobWorker(_Ctx(), q, noop)._alive_instances() == {"runner-x"}
 
 
 # --- maintenance windows (1.6): SCHEDULED, park/promote, coalesce, overrides ------
@@ -301,7 +244,7 @@ def test_park_releases_claim_and_due_claim_takes_it_again(q):
     assert q.park(jid, not_before=future, window_ci_ids=[], reason="again") is False  # not RUNNING any more
     assert q.claim_next("r2") is None                       # not due
     assert q.scheduled_count() == 1 and q.queued_count() == 0
-    assert q.orphan_candidates(set(), 0) == []              # no owner → never an orphan
+    assert q.sweep_candidates() == []                       # no owner → never an orphan
     sched = q.job_schedule(jid)
     assert sched["status"] == "SCHEDULED" and sched["window_ci_ids"] == ["u-s", "u-h"]
     assert sched["not_before"] == from_queue_clock(to_queue_clock(from_queue_clock(future)))
@@ -364,9 +307,14 @@ def test_ui_deploy_promotes_scheduled_job(q):
     assert res.job_id == jid and res.promoted and not res.coalesced
     row = _row(jid)
     assert row.status == "QUEUED" and row.not_before is None and '"force": true' in row.payload
-    # QUEUED now → a further trigger is a duplicate again (first wins, as before)
+    # QUEUED now and it runs at once: a further webhook for the same branch adds
+    # nothing (merged, payload untouched); one for another branch is not merged.
+    before = row.payload
+    merged = q.enqueue_ex(WEBHOOK)
+    assert merged.job_id == jid and merged.coalesced and _row(jid).payload == before
     with pytest.raises(DuplicateJob):
-        q.enqueue(WEBHOOK)
+        q.enqueue({**WEBHOOK, "service_branch": "release-2"})
+    assert _row(jid).payload == before
 
 
 def test_abort_queued_keeps_scheduled_unless_asked(q):
@@ -434,6 +382,39 @@ def test_override_bookkeeping_and_terminal_hook(q):
     ended = []
     q.on_terminal = ended.append
     q.set_override(a, "iac-job-x", [])
-    assert q.mark_failed(a, "Runner 'r1' lost") is True
+    assert q.mark_failed(a, "Runner 'r1' lost", token=_row(a).claim_token) is True
     assert ended == [a]
-    assert q.mark_failed(a, "again") is False and ended == [a]  # hook only on the real transition
+    assert q.mark_failed(a, "again", token=_row(a).claim_token) is False and ended == [a]  # hook only on the real transition
+
+
+def test_log_writer_keeps_order_when_a_flush_is_cancelled_mid_write(q):
+    """A flush whose awaiting task is cancelled while the thread still writes must
+    not make the next batch start at the same sequence number (reordered log)."""
+    import threading
+    import time as _time
+
+    a = q.enqueue({"pipeline_type": "connectivity"})
+    real_append = q.append_log
+    gate = threading.Event()
+
+    def slow_append(job_id, lines, start_seq):
+        gate.wait(2)                      # the first batch is "in flight"
+        _time.sleep(0.05)
+        return real_append(job_id, lines, start_seq)
+
+    q.append_log = slow_append
+
+    async def run():
+        w = JobLogWriter(q, a, interval=0.01)
+        w.start(lambda coro, name=None: asyncio.get_running_loop().create_task(coro))
+        for i in range(3):
+            w.append(f"first-{i}")
+        await asyncio.sleep(0.05)         # the timer task is now inside the write
+        w._task.cancel()                  # plugin reload: ctx.dispose() cancels every task
+        await asyncio.sleep(0)
+        w.append("after-cancel")
+        gate.set()
+        await w.close()
+
+    asyncio.run(run())
+    assert q.read_log(a, tail=100)["lines"] == ["first-0", "first-1", "first-2", "after-cancel"]

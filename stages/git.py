@@ -8,6 +8,8 @@ from core.logger import get_logger
 
 from .base import BaseStage
 from ..utils import StageResult
+from ..app.controller.offloop import off_loop
+from ..app.controller.subprocess_env import git_env, git_safety_args
 
 log = get_logger("IaC:Engine:Git")
 
@@ -46,25 +48,58 @@ class PublishInventoryStateStage(BaseStage):
         super().__init__("Commit & Push: inventory_state")
 
     async def run(self, engine, context: dict) -> StageResult:
-        from ..app.controller.state_publisher import publish_inventory_state
+        from ..app.controller.state_publisher import head_sha, publish_inventory_state
 
         repo = engine.base_git_dir / "inventory_state"
         payload = context.get("payload") or {}
+        # What was published before this run. The rule engine acts on everything
+        # between its marker and the state this run pins below (audit OC-06); the
+        # very first run records "before" as the marker, so even its own commit is
+        # not lost when the pipeline fails before the rule stage.
+        before = await head_sha(repo) if (repo / ".git").exists() else ""
+        # The controller commit this state was generated from, pinned while the
+        # state lock is held. A pending infrastructure plan records it, and its
+        # approval is only carried out while it is unchanged (audit OS-12).
+        controller_sha = await engine.repo_head_sha("iac_controller")
+        if controller_sha:
+            context["iac_controller_sha"] = controller_sha
         result = await publish_inventory_state(
             repo,
-            controller_sha=await engine.repo_head_sha("iac_controller"),
+            controller_sha=controller_sha,
             job_id=context.get("job_id"),
             pipeline=str(context.get("db_type") or payload.get("pipeline_type") or ""),
             trigger="Manual" if payload.get("manual") else "Webhook",
-            token=engine.repo_token("inventory_state"),
+            token=await off_loop(engine.repo_token, "inventory_state"),   # Vault
         )
         context["inventory_state_commit_status"] = result.status
         if result.files:
             context["inventory_state_commit_sha"] = result.commit_sha
+        if result.ok and result.commit_sha:
+            # Pinned inside the state lock — also when nothing was committed: a
+            # commit another pipeline publishes later is not this run's business.
+            context["inventory_state_head_sha"] = result.commit_sha
+            if before:
+                context["inventory_state_base_sha"] = before
+                await self._init_rules_marker(engine, before, context.get("job_id"))
         if result.ok:
             return StageResult(True, f"inventory_state: {result.status}"
                                + (f" ({len(result.files)} file(s), {result.commit_sha[:12]})" if result.files else ""))
         return StageResult(False, f"inventory_state publish {result.status}: {result.detail}")
+
+
+    @staticmethod
+    async def _init_rules_marker(engine, sha: str, job_id) -> None:
+        setter = getattr(getattr(engine, "db", None), "set_rules_marker", None)
+        if not callable(setter):
+            return
+        try:
+            if await off_loop(setter, sha, job_id=job_id, only_if_absent=True):
+                log.info(f"Rule engine: marker initialised at inventory_state@{sha[:12]} "
+                         "(everything published before counts as evaluated).")
+        except Exception as exc:
+            # Not fatal here: the rule stage reads the marker itself and refuses
+            # to guess when the database cannot be read.
+            log.warning(f"Rule engine: marker could not be initialised: {exc}")
 
 
 class CloneServiceRepoStage(BaseStage):
@@ -75,39 +110,24 @@ class CloneServiceRepoStage(BaseStage):
         self.payload = payload
 
     async def run(self, engine, context: dict) -> StageResult:
+        from ..app.controller.job_payload import is_safe_name
+
         services_dir = engine.config.services_dir
         services_dir.mkdir(parents=True, exist_ok=True)
+        # Last line of defence before `git clone -b` and rmtree (audit OS-09):
+        # the name and branch are plain tokens and the checkout is a direct child
+        # of services_dir — whatever put them into the job.
+        if not is_safe_name(self.service_name) or not is_safe_name(self.branch):
+            return StageResult(False, f"Refusing to sync: invalid service name or branch ({self.service_name!r}, {self.branch!r}).")
         target_dir = services_dir / self.service_name
-        repo_url = None
-        if not repo_url:
-            catalog_file = engine.base_git_dir / "iac_controller" / "environments" / "global" / "02_service_catalog.yml"
-            if catalog_file.exists():
-                try:
-                    with open(catalog_file, 'r') as f:
-                        catalog_data = yaml.safe_load(f) or {}
-                        catalog = catalog_data.get("service_catalog", {})
-                        git_mgmt = catalog.get("remote_git_management", {})
-                        services_list = catalog.get("services", [])
-                        matched_svc = next((s for s in services_list if s.get("name") == self.service_name), None)
-                        if matched_svc and git_mgmt.get("active"):
-                            base_url = git_mgmt.get("remote_git_repository_toplevel", "").rstrip("/")
-                            repo_name = matched_svc.get("repository_name", matched_svc.get("name"))
-                            if base_url:
-                                repo_url = f"{base_url}/{repo_name}.git"
-                except Exception as e:
-                    log.warning(f"Failed to parse source service_catalog: {e}")
-        if not repo_url:
-            repo_url = f"https://gitlab.int.fam-feser.de/aac-application-definitions/{self.service_name}.git"
-        raw_svc_config = engine.ctx.get_secret("repo_service_repos_config")
-        svc_token = None
-        if raw_svc_config:
-            try:
-                svc_config = json.loads(raw_svc_config)
-                token_key = svc_config.get("token_key")
-                if token_key:
-                    svc_token = engine.ctx.get_secret(token_key)
-            except Exception: pass
-        auth_env = os.environ.copy()
+        if target_dir.resolve().parent != services_dir.resolve():
+            return StageResult(False, f"Refusing to sync '{self.service_name}': path escapes the services directory.")
+        # Catalog YAML and three Vault round trips per service — a bulk sync does
+        # this for every service of the catalog. Off the loop (audit OC-08 B3/B6).
+        repo_url, svc_token, ssh_key = await off_loop(self._resolve_source, engine)
+        # git and its ssh/curl get what they need to reach the remote — not the
+        # core's environment (audit OS-06 D).
+        auth_env = git_env()
         # Supply the HTTPS token per-invocation via an HTTP auth header instead of
         # embedding it in the remote URL. Baking the token into the origin URL (the
         # old behaviour) persisted it in .git/config at clone time, so a *rotated*
@@ -120,7 +140,6 @@ class CloneServiceRepoStage(BaseStage):
             auth_env["GIT_CONFIG_COUNT"] = "1"
             auth_env["GIT_CONFIG_KEY_0"] = "http.extraHeader"
             auth_env["GIT_CONFIG_VALUE_0"] = f"Authorization: Basic {auth}"
-        ssh_key = engine.ctx.get_secret("ansible_ssh_key")
         if ssh_key:
             key_path = engine.config.security_dir / "ansible_id_rsa"
             os.makedirs(os.path.dirname(key_path), exist_ok=True)
@@ -128,9 +147,13 @@ class CloneServiceRepoStage(BaseStage):
                 f.write(ssh_key.replace('\\n', '\n').strip() + '\n')
             os.chmod(key_path, 0o600)
             auth_env["GIT_SSH_COMMAND"] = f"ssh -i {key_path} -o StrictHostKeyChecking=no"
+        # Every git command below trusts THIS checkout only and runs no program
+        # its config or hooks name (see git_safety_args).
+        safety = git_safety_args(target_dir)
+
         async def _run_git(cmd, cwd=None):
             proc = await asyncio.create_subprocess_exec(
-                *cmd, cwd=cwd, env=auth_env,
+                cmd[0], *safety, *cmd[1:], cwd=cwd, env=auth_env,
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
             )
             out, _ = await proc.communicate()
@@ -141,9 +164,12 @@ class CloneServiceRepoStage(BaseStage):
             # current user — the NFS/bind-mounted service dirs are owned by a squashed
             # uid, so every fetch failed with "detected dubious ownership", which used to
             # fall through to the silent stale fallback below and deploy a month-old
-            # checkout. Mark all repos safe up front (idempotent → single '*' entry),
-            # mirroring what the core git-manager already does for the IaC repos.
-            await _run_git(["git", "config", "--global", "--replace-all", "safe.directory", "*"])
+            # checkout. The checkout is marked safe per command (``-c
+            # safe.directory=<this checkout>`` in ``safety``). This stage used to
+            # write ``safe.directory=*`` into the GLOBAL git config instead — every
+            # repository on the host trusted, for every later git call (audit OS-06
+            # D). An entry an earlier version wrote is left alone: the core's own
+            # git service may rely on its global configuration.
             if (target_dir / ".git").exists():
                 git_cmds = [
                     # Reset origin to the clean (token-less) URL first: repos cloned by
@@ -185,6 +211,49 @@ class CloneServiceRepoStage(BaseStage):
             log.error(f"Git error for {self.service_name}: {e}{stale}")
             return StageResult(False, f"Service repo sync failed for {self.service_name}: {e}{stale}")
 
+    def _resolve_source(self, engine) -> tuple[str, str | None, str | None]:
+        """``(repo url, https token, ssh key)`` for this service. Synchronous
+        (YAML parse + Vault): call through ``off_loop``."""
+        repo_url = None
+        catalog_file = engine.base_git_dir / "iac_controller" / "environments" / "global" / "02_service_catalog.yml"
+        if catalog_file.exists():
+            try:
+                with open(catalog_file, 'r') as f:
+                    catalog_data = yaml.safe_load(f) or {}
+                    catalog = catalog_data.get("service_catalog", {})
+                    git_mgmt = catalog.get("remote_git_management", {})
+                    services_list = catalog.get("services", [])
+                    matched_svc = next((s for s in services_list if s.get("name") == self.service_name), None)
+                    if matched_svc and git_mgmt.get("active"):
+                        base_url = git_mgmt.get("remote_git_repository_toplevel", "").rstrip("/")
+                        repo_name = matched_svc.get("repository_name", matched_svc.get("name"))
+                        if base_url:
+                            repo_url = f"{base_url}/{repo_name}.git"
+            except Exception as e:
+                log.warning(f"Failed to parse source service_catalog: {e}")
+        if not repo_url:
+            repo_url = f"https://gitlab.int.fam-feser.de/aac-application-definitions/{self.service_name}.git"
+        raw_svc_config = engine.ctx.get_secret("repo_service_repos_config")
+        svc_token = None
+        if raw_svc_config:
+            try:
+                svc_config = json.loads(raw_svc_config)
+                token_key = svc_config.get("token_key")
+                if token_key:
+                    from ..app.controller.settings_schema import resolve_credential
+                    svc_token = resolve_credential(engine.ctx, token_key)
+            except Exception: pass
+        return repo_url, svc_token, engine.ctx.get_secret("ansible_ssh_key")
+
+
+def _catalog_services(catalog_file) -> tuple[list, dict]:
+    """``(services, remote_git_management)`` of the service catalog (sync YAML parse)."""
+    with open(catalog_file, 'r') as f:
+        catalog_data = yaml.safe_load(f) or {}
+    catalog = catalog_data.get("service_catalog", {})
+    return catalog.get("services", []), catalog.get("remote_git_management", {})
+
+
 class SyncAllServicesStage(BaseStage):
     def __init__(self):
         super().__init__("Bulk Sync Service Repositories")
@@ -194,11 +263,7 @@ class SyncAllServicesStage(BaseStage):
         if not catalog_file.exists():
             return StageResult(False, f"Source service_catalog.yml missing at {catalog_file}")
         try:
-            with open(catalog_file, 'r') as f:
-                catalog_data = yaml.safe_load(f) or {}
-                catalog = catalog_data.get("service_catalog", {})
-                services = catalog.get("services", [])
-                git_mgmt = catalog.get("remote_git_management", {})
+            services, git_mgmt = await off_loop(_catalog_services, catalog_file)
         except Exception as e:
             return StageResult(False, f"Raw catalog parse failed: {e}")
         if not services:

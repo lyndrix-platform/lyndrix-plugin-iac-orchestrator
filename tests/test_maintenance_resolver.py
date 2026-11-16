@@ -431,6 +431,26 @@ def test_service_policy_first_host_decides_and_notes_differences(tree):
     assert not mres.service_policy(items, "nope", ["host-own"]).found
 
 
+def test_service_policy_strictest_host_decides():
+    """OC-13: ``window`` beats ``immediate`` whatever the host names; among window
+    hosts one that HAS windows decides before one without."""
+    def item(host, policy, windows):
+        return {"kind": "service", "service": "svc", "host": host, "name": f"svc @ {host}", "tz": "UTC",
+                "deploy_policy": policy, "windows": mw.to_dicts(mw.parse_windows(windows, default_tz="UTC")),
+                "ci_id": f"u-{host}", "host_ci_id": None, "site": "onprem", "stage": "x"}
+
+    items = [item("aaa-dev", "immediate", []), item("mmm-prod", "window", []), item("zzz-prod", "window", [TUE])]
+    d = mres.service_policy(items, "svc", ["aaa-dev", "mmm-prod", "zzz-prod"])
+    assert d.host == "zzz-prod" and d.deploy_policy == "window" and d.windows[0]["days"] == ["tue"]
+    assert sorted(n.split(":")[0] for n in d.notes) == ["host aaa-dev", "host mmm-prod"]
+    assert d.ci_ids == ["u-aaa-dev", "u-mmm-prod", "u-zzz-prod"]          # every CI the deploy touches
+
+    d = mres.service_policy(items[:2], "svc", ["aaa-dev", "mmm-prod"])
+    assert d.host == "mmm-prod" and d.deploy_policy == "window" and d.schedules == []
+    d = mres.service_policy(items[:1], "svc", ["aaa-dev"])
+    assert d.host == "aaa-dev" and d.deploy_policy == "immediate" and d.notes == []
+
+
 def test_policy_applies_and_commit_guard():
     assert mres.policy_applies({"trigger": "gitlab-ci"})
     assert mres.policy_applies({"trigger": "webhook"})
@@ -533,3 +553,96 @@ def test_effective_state_of_item():
         ]
         is False
     )
+
+
+# --- services inherited through profiles (audit OC-12) ---------------------------------
+
+
+@pytest.fixture
+def profile_tree(tmp_path):
+    """Fleet services that hosts only get through ``profiles`` — the bulk of a real
+    controller tree (reverse proxy, agents) and invisible to the resolver before."""
+    ctrl = tmp_path / "ctrl"
+    _write(ctrl / "environments" / "global" / "03_profiles.yml", {"profiles": {
+        "docker_standard": {
+            "baseline_roles": ["docker"],
+            "services": [
+                {"name": "fleet-proxy", "deploy_type": "docker_compose", "state": "present"},
+                {"name": "fleet-agent", "deploy_type": "docker_compose", "maintenance": {"windows": [MON]}},
+            ],
+        },
+        "vpn": {"services": [{"name": "fleet-vpn"}, {"name": "fleet-proxy", "config": {"extra": True}}]},
+    }})
+    make_controller(
+        ctrl, "onprem", "prod",
+        site_vars={"timezone": "UTC"},
+        stage_vars={"maintenance_default": {"enabled": True, "windows": [TUE]}},
+        hosts={
+            "docker-a": {"profiles": ["docker_standard", "vpn"], "services": [{"name": "svc-direct"}]},
+            # overrides ONE key of a profile service; restates nothing else
+            "docker-b": {"profiles": ["docker_standard", "no-such-profile"],
+                         "services": [{"name": "fleet-agent", "maintenance": {"windows": [WED], "deploy_policy": "immediate"}}]},
+            "docker-c": {"services": [{"name": "svc-direct"}]},
+        },
+    )
+    make_controller(ctrl, "onprem", "dev", hosts={"docker-dev": {"profiles": ["docker_standard"]}})
+    return ctrl
+
+
+def _profile_items(ctrl, stage="prod", ci=None):
+    return mres.resolve("onprem", stage, mres.load_tree(ctrl, "onprem", stage), {}, ci or {},
+                        include_hypervisors=False)
+
+
+def test_effective_services_follow_the_generator_merge_rule(profile_tree):
+    profiles = mres.load_profiles(profile_tree)
+    hosts = mres.load_tree(profile_tree, "onprem", "prod")["hosts"]
+    a = mres.effective_services(hosts["docker-a"], profiles)
+    assert [e["name"] for e in a] == ["fleet-proxy", "fleet-agent", "fleet-vpn", "svc-direct"]   # each name once
+    assert a[0]["config"] == {"extra": True} and a[0]["deploy_type"] == "docker_compose"       # merged, not doubled
+    b = {e["name"]: e for e in mres.effective_services(hosts["docker-b"], profiles)}
+    assert b["fleet-agent"]["maintenance"]["deploy_policy"] == "immediate"                       # the host entry wins …
+    assert b["fleet-agent"]["deploy_type"] == "docker_compose"                                   # … key by key
+    assert set(b) == {"fleet-proxy", "fleet-agent"}                                              # unknown profile ignored
+    # nothing is written back into the tree or the profiles
+    assert profiles["docker_standard"]["services"][1]["maintenance"] == {"windows": [MON]}
+    assert hosts["docker-c"].get("profiles") is None
+    assert [e["name"] for e in mres.effective_services(hosts["docker-c"], profiles)] == ["svc-direct"]
+    assert mres.effective_services(None, None) == [] and mres.effective_services({"services": "x"}, {}) == []
+
+
+def test_profile_services_are_found_on_their_hosts(profile_tree):
+    assert mres.find_service_hosts(profile_tree, "fleet-proxy") == [
+        ("onprem", "dev", "docker-dev"), ("onprem", "prod", "docker-a"), ("onprem", "prod", "docker-b")]
+    assert mres.find_service_hosts(profile_tree, "Fleet-VPN", stage="prod") == [("onprem", "prod", "docker-a")]
+    assert mres.find_service_hosts(profile_tree, "fleet-agent", stage="dev") == [("onprem", "dev", "docker-dev")]
+    # a host without the profile does NOT get the service
+    assert ("onprem", "prod", "docker-c") not in mres.find_service_hosts(profile_tree, "fleet-proxy")
+    assert mres.find_service_hosts(profile_tree, "svc-direct") == [
+        ("onprem", "prod", "docker-a"), ("onprem", "prod", "docker-c")]
+
+
+def test_profile_services_get_policy_windows_and_are_published(profile_tree):
+    ci = {("host", "docker-a"): "u-ha", ("service", "docker-a", "fleet-proxy"): "u-proxy-a",
+          ("service", "docker-a", "fleet-agent"): "u-agent-a"}
+    items = _by_name(_profile_items(profile_tree, ci=ci))
+    proxy = items["fleet-proxy @ docker-a"]
+    assert proxy["deploy_policy"] == "window" and proxy["inherited_from"] == "stage_default"   # prod default
+    assert proxy["windows"][0]["days"] == ["tue"] and proxy["ci_id"] == "u-proxy-a" and proxy["host_ci_id"] == "u-ha"
+    assert items["fleet-agent @ docker-a"]["windows"][0]["days"] == ["mon"]                      # the profile's block
+    agent_b = items["fleet-agent @ docker-b"]
+    assert agent_b["windows"][0]["days"] == ["wed"] and agent_b["deploy_policy"] == "immediate"  # host override
+    assert "fleet-proxy @ docker-c" not in items and "fleet-vpn @ docker-b" not in items
+    assert _by_name(_profile_items(profile_tree, stage="dev"))["fleet-proxy @ docker-dev"]["deploy_policy"] == "immediate"
+
+    sent = {it["ci_id"] for it in mres.windows_published_payload(items.values())["items"]}
+    assert {"u-proxy-a", "u-agent-a"} <= sent
+
+    # the deploy of a profile-only service is governed by the policy (it used to be "no target host")
+    d = mres.service_policy(items.values(), "fleet-proxy", ["docker-a", "docker-b"])
+    assert d.found and d.deploy_policy == "window" and "u-proxy-a" in d.ci_ids and "u-ha" in d.ci_ids
+
+
+def test_tree_without_profiles_file_resolves_as_before(tree):
+    ctrl, _ = tree
+    assert mres.load_profiles(ctrl) == {} and mres.load_tree(ctrl, "onprem", "prod")["profiles"] == {}

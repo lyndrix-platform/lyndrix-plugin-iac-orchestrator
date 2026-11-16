@@ -1265,16 +1265,19 @@ function AdvancedSettings({ toast, confirm }: { toast: ToastFn; confirm: Confirm
   function saveCategory(category: string) {
     if (!schema) return
     const updates: Record<string, unknown> = {}
+    const secrets: Array<[string, string]> = []
     for (const f of schema.filter((x) => x.category === category)) {
       const v = values[f.key]
       if (f.sensitive) {
-        // Only transmit non-empty secrets; a blank field keeps the stored value.
-        if (typeof v === 'string' && v.trim() !== '') updates[f.key] = v
+        // Secret slots go through their own route (credentials permission);
+        // a blank field keeps the stored value.
+        if (typeof v === 'string' && v.trim() !== '') secrets.push([f.key, v])
       } else {
         updates[f.key] = v
       }
     }
-    iacApi.saveSettingsValues(updates)
+    Promise.all(secrets.map(([k, v]) => iacApi.setSecretSlot(k, v)))
+      .then(() => iacApi.saveSettingsValues(updates))
       .then((r) => { setValues(r.values); toast(t('settings.savedCategory', { defaultValue: '{{category}} gespeichert ({{count}} Feld(er)).', category, count: r.saved.length })) })
       .catch((e) => toast(e instanceof Error ? e.message : t('settings.saveError', { defaultValue: 'Speichern fehlgeschlagen' }), 'err'))
   }
@@ -1676,8 +1679,10 @@ function PendingPlanBanner({ statsTick, isRunning, confirm, toast, onLogs }: {
             <Button label={t('pendingPlan.reviewLogs', { defaultValue: 'Review Logs' })} icon="plagiarism" onClick={() => onLogs(plan.job_id as number)} />
           )}
           <Button label={t('pendingPlan.dismiss', { defaultValue: 'Dismiss' })} icon="close" onClick={dismiss} />
-          <Button label={t('pendingPlan.apply', { defaultValue: 'Apply Plan' })} icon="rocket_launch" variant="danger" disabled={isRunning} onClick={applyNow}
-            title={isRunning ? t('pendingPlan.busy', { defaultValue: 'A pipeline is running' }) : t('pendingPlan.applyTitle', { defaultValue: 'Approve and apply this plan fleet-wide' })} />
+          <Button label={t('pendingPlan.apply', { defaultValue: 'Apply Plan' })} icon="rocket_launch" variant="danger" disabled={isRunning || plan.approvable === false} onClick={applyNow}
+            title={plan.approvable === false
+              ? t('pendingPlan.notApprovable', { defaultValue: 'This plan was recorded without the iac-controller commit — run Check Env again, then approve the new plan.' })
+              : isRunning ? t('pendingPlan.busy', { defaultValue: 'A pipeline is running' }) : t('pendingPlan.applyTitle', { defaultValue: 'Approve and apply exactly this plan (it is refused if the controller or the plan changed since)' })} />
         </div>
       </div>
       <div style={{ display: 'grid', gap: 4, marginTop: 8 }}>
@@ -1747,7 +1752,17 @@ function Dashboard() {
       confirmLabel: t('dashboard.abortConfirmLabel', { defaultValue: 'Abort' }),
       onConfirm: () => {
         iacApi.abort()
-          .then((r) => toast(t('dashboard.aborted', { defaultValue: 'Execution aborted ({{count}} job(s)).', count: (r.aborted_jobs as number[] | undefined)?.length ?? 0 })))
+          .then((r) => {
+            toast(t('dashboard.aborted', { defaultValue: 'Execution aborted ({{count}} job(s)).', count: (r.aborted_jobs as number[] | undefined)?.length ?? 0 }))
+            // Docker on the runner did not answer: these jobs are NOT stopped yet (the runner retries).
+            const unstopped = (r.unstopped_jobs as number[] | undefined) ?? []
+            if (unstopped.length) {
+              toast(t('dashboard.abortUnstopped', {
+                defaultValue: 'Docker on the runner did not answer: the containers of {{jobs}} could not be stopped yet. The abort is retried; until then these jobs stay RUNNING.',
+                jobs: unstopped.map((j) => `#${j}`).join(', '),
+              }), 'err')
+            }
+          })
           .catch((e) => toast(e instanceof Error ? e.message : t('dashboard.abortError', { defaultValue: 'Abort fehlgeschlagen' }), 'err'))
       },
     })
@@ -1780,6 +1795,12 @@ function Dashboard() {
 
       {error && <ErrorBox msg={error} />}
 
+      {/* Jobs only queue while no runner executes them — say so instead of showing "running 0 %". */}
+      {snapshot && snapshot.runner_online === false && snapshot.runner_state !== 'unknown' && (
+        <ErrorBox msg={snapshot.runner_state === 'restarting'
+          ? t('dashboard.runnerRestarting', { defaultValue: 'The runner instance is restarting — queued pipelines start when it is back.' })
+          : t('dashboard.noRunner', { defaultValue: 'No runner instance online — pipelines are queued, not executed.' })} />
+      )}
       <PendingPlanBanner statsTick={statsTick} isRunning={isRunning} confirm={confirm} toast={toast} onLogs={setLogJob} />
 
       {tab !== 'overview' && <ViewHeader tab={tab} onBack={() => setTab('overview')} />}

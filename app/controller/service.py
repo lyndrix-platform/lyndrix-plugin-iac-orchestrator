@@ -6,15 +6,21 @@ entrypoint.py and the UI/API layers only ever deal with this object.
 """
 import asyncio
 import logging
+import time
+import uuid
 from core.api import db_instance
 
 from ..model.models import Base
 from ..model.database import JobDatabase
 from .config import IaCConfig
-from .engine import DeploymentEngine
-from .queue import JobQueue, JobWorker, DuplicateJob
+from .offloop import off_loop
+from .engine import ContainerStateUnknown, DeploymentEngine
+from .queue import JobQueue, JobWorker, DuplicateJob, EnqueueResult, SubmitResult
 from .socket_client import SocketBusClient
 from .gitlab_webhooks import sync_group_webhooks_from_ctx, WebhookConfigError
+from .job_payload import InvalidJobPayload, strip_unentitled, validate_structure
+from . import branch_policy
+from .orphan_sweep import LEASE_NAME as SWEEP_LEASE, OrphanSweeper
 
 log = logging.getLogger("IaC:Service")
 
@@ -41,15 +47,52 @@ class IaCService:
         self.socket_client = SocketBusClient(ctx)
         self.db = JobDatabase()
         self.queue = JobQueue()
+        # One claim registry for both stores: the runner-side writes of a claimed
+        # job are conditional on its claim token (fencing).
+        self.queue.claims = self.db.claims
+        # … and one registry of results that could not be written when a job
+        # ended (database away): the worker stores them later (review C5).
+        self.queue.unwritten_terminal = self.db.unwritten_terminal
+        self.queue.finish_terminal = self.db.finish_unwritten
+        # Identity of THIS plugin load: "<core boot nonce>:<nonce>". Claims are
+        # stamped with it, so a restarted runner (same instance id) can tell the
+        # jobs it claimed itself from what its predecessor left behind.
+        core_nonce = getattr(ctx, "incarnation", "")
+        self.incarnation = f"{core_nonce if isinstance(core_nonce, str) else ''}:{uuid.uuid4().hex[:12]}"
         self.engine = DeploymentEngine(ctx, self.state, self.db, self.config, self.socket_client)
         self.engine.queue = self.queue
+        # The engine's own hand-offs (host rollout after a provision) enter the
+        # queue through the same validated door as every other trigger.
+        self.engine.submit_job = self.submit_job
+        self.engine.submit_job_ex = self.submit_job_ex
         # Maintenance windows (1.6): a job the queue closes itself (orphan sweep →
         # mark_failed) still ends its maintenance override exactly once.
         self.queue.on_terminal = self.engine.end_override_for
+        # A closed job keeps a lock it did not release for as long as the orphan
+        # sweep would wait for its container (review C2).
+        self.queue.lock_takeover_grace = lambda: self.config.orphan_sweep_container_grace_seconds
         self.worker: JobWorker | None = None
+        # Jobs adopted from a previous incarnation whose containers are not known
+        # yet (Docker did not answer, review C1). They stay RUNNING and are
+        # heartbeated like executing jobs until Docker tells what exists.
+        self._unsettled: set[int] = set()
+        self._reconcile_task: asyncio.Task | None = None
+        # job id -> background retry of a container stop that Docker refused.
+        self._stop_retries: dict[int, asyncio.Task] = {}
+        # Orphan sweep (rD §3): started/stopped by the lease, see review_sweep_lease.
+        self.sweeper = OrphanSweeper(ctx, self.queue, self.db, self.config, notify=self._notify_orphaned,
+                                     notify_overdue=self._notify_overdue)
+        self._sweep_lease_wanted = False
+        # Runner presence: when a runner was last seen and when this service started.
+        self._runner_seen_at: float | None = None
+        self._started_at = time.monotonic()
 
-        # Restore the Auto-Apply setting from Vault/Config on boot
-        self.state["auto_apply_enabled"] = self.config.auto_apply
+        # Created by schedule_bootstrap, set when the first database bootstrap of
+        # this load has finished (or was skipped: database not connected yet).
+        self._bootstrapped: asyncio.Event | None = None
+        # The Auto-Apply flag shown by the UI is restored from Vault/config by
+        # bootstrap_async: a Vault round trip has no place in setup() (it runs on
+        # the event loop). Decisions never read this copy — they ask the config.
 
     # ------------------------------------------------------------------
     # Cluster roles
@@ -67,31 +110,134 @@ class IaCService:
         except Exception:
             return True
 
-    def runner_online(self) -> bool:
-        """Is any live instance a runner (this one included)? Older cores: assume yes."""
+    #: A runner that vanished is "restarting" for this long before it counts as absent
+    #: (core < 1.14 has no restarting state: a graceful stop deletes the row at once).
+    RUNNER_RESTART_GRACE_SECONDS = 120.0
+    #: After start-up the cluster view may be empty/fabricated for a while.
+    RUNNER_BOOT_GRACE_SECONDS = 60.0
+
+    def runner_state(self) -> str:
+        """``online`` | ``restarting`` | ``absent`` | ``unknown`` — is there a runner
+        that executes jobs? Uses the core's role state when it has one (API ≥ 1.14),
+        else ``has_live_role`` with a grace period, so one missed heartbeat or a
+        runner restart does not flip every instance to "no runner"."""
+        role_state = getattr(self.ctx, "role_state", None)
+        if callable(role_state):
+            try:
+                info = role_state("runner")
+                state = info.get("state") if isinstance(info, dict) else None
+            except Exception:
+                state = None
+            if state in ("alive", "draining"):
+                return "online"
+            if state == "restarting":
+                return "restarting"
+            if state == "dead":
+                return "absent"
+            if state == "unknown":
+                return "unknown"
         probe = getattr(self.ctx, "has_live_role", None)
+        now = time.monotonic()
+        seen: bool | None = None
         if callable(probe):
             try:
-                return bool(probe("runner"))
+                seen = bool(probe("runner"))
             except Exception:
-                pass
-        return self.is_runner
+                seen = None
+        if seen is None:
+            return "online" if self.is_runner else "unknown"
+        if seen:
+            self._runner_seen_at = now
+            return "online"
+        if self._runner_seen_at is not None:
+            return "restarting" if now - self._runner_seen_at < self.RUNNER_RESTART_GRACE_SECONDS else "absent"
+        return "unknown" if now - self._started_at < self.RUNNER_BOOT_GRACE_SECONDS else "absent"
+
+    def runner_online(self) -> bool:
+        """Is a runner online right now? (``runner_state`` has the nuance.)"""
+        return self.runner_state() == "online"
+
+    # -- orphan sweep placement (rD §3.1) ------------------------------------------
+    def _other_control_plane_alive(self) -> bool:
+        """Is a live instance WITHOUT the runner role around (besides this one)?"""
+        instances = getattr(self.ctx, "cluster_instances", None)
+        if not isinstance(instances, (list, tuple)):
+            return False
+        me = getattr(self.ctx, "instance_id", None)
+        try:
+            return any(i.get("alive") and i.get("instance_id") != me and "runner" not in (i.get("roles") or [])
+                       for i in instances)
+        except Exception:
+            return False
+
+    def review_sweep_lease(self) -> None:
+        """Contend for the sweep lease on control-plane instances; a runner only
+        while no other instance is alive (single mode: always). Called at setup
+        and by the presence watcher, so placement follows the cluster."""
+        want = (not self.is_runner) or not self._other_control_plane_alive()
+        on_lease = getattr(self.ctx, "on_lease", None)
+        if not callable(on_lease):
+            # Core without leases = one instance: sweep here.
+            if want and not self.sweeper.running:
+                self.sweeper.start()
+            return
+        if want and not self._sweep_lease_wanted:
+            on_lease(SWEEP_LEASE, acquired=self._start_sweeper, lost=self.sweeper.stop)
+            self._sweep_lease_wanted = True
+        elif not want and self._sweep_lease_wanted:
+            release = getattr(self.ctx, "release_lease", None)
+            if callable(release):
+                release(SWEEP_LEASE)        # fires ``lost`` → the sweeper stops
+                self._sweep_lease_wanted = False
+
+    def _notify_orphaned(self, job_id: int, reason: str, row: dict) -> None:
+        self.ctx.notify(
+            "job_orphaned",
+            payload={"job_id": job_id, "reason": reason, "owner_instance": row.get("owner_instance"),
+                     "message": f"Pipeline #{job_id} was closed as FAILED: {reason}."},
+            notification_id=f"job_{job_id}",
+            title=f"❌ Pipeline #{job_id} — runner lost",
+            body=f"{reason}. Nothing is re-run automatically — re-trigger the pipeline.",
+            severity="error",
+        )
+
+    def _notify_overdue(self, job_id: int, text: str, row: dict, closed: bool) -> None:
+        """A job exceeded the maximum runtime (review C4): one sticky bell entry,
+        updated when the sweep had to close the job itself."""
+        self.ctx.notify(
+            "job_timed_out",
+            payload={"job_id": job_id, "owner_instance": row.get("owner_instance"), "closed_by_sweep": closed,
+                     "runtime_seconds": row.get("runtime"), "message": f"Pipeline #{job_id}: {text}"},
+            notification_id=f"job_{job_id}",
+            title=f"❌ Pipeline #{job_id} — maximum runtime exceeded",
+            body=text,
+            severity="error",
+        )
 
     def enqueue_pipeline(self, payload: dict, *, requested_by: str | None = None) -> int:
-        """Queue a pipeline for a runner. Raises :class:`DuplicateJob` when the same
-        target is already queued or running. Wakes the runners via the cluster bus.
+        """:meth:`enqueue_pipeline_ex` for callers that only need the job id."""
+        return self.enqueue_pipeline_ex(payload, requested_by=requested_by).job_id
 
-        Maintenance windows (1.6): a SCHEDULED job for the same target absorbs a
-        newer webhook trigger (coalesced — nothing to wake) or is promoted to QUEUED
-        when the trigger must run now (UI deploy / ``force``)."""
+    def enqueue_pipeline_ex(self, payload: dict, *, requested_by: str | None = None) -> EnqueueResult:
+        """Queue a pipeline for a runner and wake the runners via the cluster bus.
+
+        The trigger becomes a new job, a follow-up behind a busy target, or is
+        absorbed by a job for the same target that has not started (queued and
+        identical, or SCHEDULED — coalesced, or promoted when the trigger must run
+        now). Raises :class:`DuplicateJob` when it cannot be queued (see
+        ``JobQueue.enqueue_ex``)."""
         result = self.queue.enqueue_ex(payload, requested_by=requested_by)
         job_id = result.job_id
+        what = payload.get("service_name") or payload.get("pipeline_type")
         if result.coalesced:
-            log.info(f"ENQUEUE: trigger for '{payload.get('service_name') or payload.get('pipeline_type')}' "
-                     f"coalesced into scheduled job #{job_id}.")
-            return job_id
+            # Nothing to wake: the absorbing job is already waiting for a runner
+            # (or for its maintenance window).
+            log.info(f"ENQUEUE: trigger for '{what}' coalesced into job #{job_id}.")
+            return result
         if result.promoted:
             log.info(f"ENQUEUE: scheduled job #{job_id} promoted to run now ({requested_by}).")
+        if result.waiting_for:
+            log.info(f"ENQUEUE: job #{job_id} for '{what}' waits for job #{result.waiting_for} (same target).")
         if job_id > 0:
             try:
                 self.ctx.emit("iac:job_queued", {"job_id": job_id}, cluster=True)
@@ -101,54 +247,306 @@ class IaCService:
                 log.debug(f"iac:job_queued not emitted: {exc}")
             if self.worker is not None:
                 self.worker.wake()
-        return job_id
+        return result
 
-    def start_runner(self) -> None:
+    def start_runner(self, max_parallel: int | None = None) -> None:
         """Start the job worker (runner instances only)."""
         if self.worker is not None or not self.is_runner:
             return
-        try:
-            max_parallel = int(str(self.ctx.get_secret("iac_max_parallel_jobs") or "3").strip() or "3")
-        except (ValueError, Exception):
-            max_parallel = 3
+        if max_parallel is None:
+            try:
+                max_parallel = int(str(self.ctx.get_secret("iac_max_parallel_jobs") or "3").strip() or "3")
+            except (ValueError, Exception):
+                max_parallel = 3
         self.worker = JobWorker(self.ctx, self.queue, self.run_claimed, max_parallel=max_parallel,
-                                finalize_orphan=self._finalize_orphan)
+                                incarnation=self.incarnation,
+                                on_fenced=self._on_fenced, extra_attended=self.attended_job_ids)
         self.worker.start()
         log.info(f"IaC Orchestrator: job worker started on '{getattr(self.ctx, 'instance_id', 'local')}' "
                  f"(max {max_parallel} parallel).")
+
+    async def run_runner_boot(self) -> None:
+        """Runner start-up in a fixed order (audit OC-04): first settle what a
+        previous incarnation left behind, then start claiming. The worker used to
+        start first — and the reconciliation then FAILED the jobs it had just
+        claimed. The worker starts in any case, also when reconciling raised."""
+        # The schema (claim/fencing columns) must exist before anything is listed
+        # or claimed; the bootstrap runs off the loop since review C3.
+        await self.wait_bootstrapped()
+        try:
+            await self.run_startup_reconciliation()
+        except Exception as exc:
+            log.error(f"IaC Orchestrator: startup reconciliation failed: {exc}")
+        try:
+            raw = await off_loop(self.ctx.get_secret, "iac_max_parallel_jobs")
+            max_parallel = int(str(raw or "3").strip() or "3")
+        except Exception:
+            max_parallel = 3
+        self.start_runner(max_parallel)
+
+    def attended_job_ids(self) -> set[int]:
+        """Jobs this process answers for besides the worker's own tasks: jobs with
+        re-attached containers and adopted jobs still waiting for Docker."""
+        return set(self.engine.attended_job_ids()) | set(self._unsettled)
+
+    async def _on_fenced(self, job_id: int) -> None:
+        """A job this runner executes was closed or taken over elsewhere: stop its
+        containers here. No status write — the row is not ours any more."""
+        await self.stop_containers(job_id)
+
+    # -- container stops that must not be lost (review C1) -------------------------
+    #: Pauses between two attempts to reach Docker again; the last one repeats.
+    DOCKER_RETRY_DELAYS = (5.0, 10.0, 20.0, 40.0, 60.0)
+    #: Retries of a container stop for a job that is closed already (~30 min with
+    #: the delays above); after that the operator is told and the next runner
+    #: start picks the containers up again.
+    CONTAINER_STOP_RETRY_ATTEMPTS = 33
+
+    def _docker_retry_delay(self, attempt: int) -> float:
+        delays = self.DOCKER_RETRY_DELAYS
+        return float(delays[min(max(0, attempt), len(delays) - 1)])
+
+    def _job_note(self, job_id: int, line: str) -> None:
+        """One ``[SYSTEM]`` line straight into the job log (sync — call in a thread)."""
+        try:
+            self.queue.append_log(job_id, [f"[SYSTEM] {line}"], self.queue.last_seq(job_id))
+        except Exception as exc:
+            log.debug(f"job note for #{job_id} not written: {exc}")
+
+    async def _stop_once(self, job_id: int, abort: bool, close: dict | None = None) -> None:
+        if abort:
+            await self.engine.abort_job(job_id, **(close or {}))
+        else:
+            await self.engine.stop_job_containers(job_id)
+        # Docker answered and the containers are gone: the job's locks are free
+        # for the next job now, not only after the takeover grace (review C2).
+        await off_loop(self.queue.release_job_locks, job_id)
+        # Whatever waited for Docker on behalf of this job is settled now.
+        if job_id in self._unsettled:
+            self._unsettled.discard(job_id)
+            self.db.claims.pop(job_id, None)
+
+    async def stop_containers(self, job_id: int, *, abort: bool = False, close: dict | None = None) -> bool:
+        """Stop the containers of ``job_id`` on this host (``abort``: and close its
+        row — as ABORTED, or as ``close = {"status", "reason"}`` says). ``False``
+        when Docker did not answer: nothing is assumed about the containers, the
+        stop is retried in the background (bounded) and the job log says so — a
+        failed stop is never a silent no-op."""
+        try:
+            await self._stop_once(job_id, abort, close)
+            return True
+        except ContainerStateUnknown as exc:
+            log.warning(f"IaC Orchestrator: containers of job #{job_id} could not be stopped ({exc}) — retrying.")
+            await off_loop(
+                self._job_note, job_id,
+                f"The runner containers of this job could not be stopped: {exc}. They may still be running; "
+                "the stop is retried.")
+            task = self._stop_retries.get(job_id)
+            if task is None or task.done():
+                self._stop_retries[job_id] = self.ctx.create_task(
+                    self._retry_container_stop(job_id, abort, close), name=f"iac:stop_retry:{job_id}")
+            return False
+
+    async def _retry_container_stop(self, job_id: int, abort: bool, close: dict | None = None) -> None:
+        last = "unknown"
+        try:
+            for attempt in range(self.CONTAINER_STOP_RETRY_ATTEMPTS):
+                await asyncio.sleep(self._docker_retry_delay(attempt))
+                try:
+                    await self._stop_once(job_id, abort, close)
+                except ContainerStateUnknown as exc:
+                    last = str(exc)
+                    continue
+                log.info(f"IaC Orchestrator: containers of job #{job_id} stopped after {attempt + 1} retr(ies).")
+                await off_loop(self._job_note, job_id, "The runner containers of this job were stopped.")
+                return
+            log.error(f"IaC Orchestrator: giving up stopping the containers of job #{job_id}: {last}")
+            await off_loop(
+                self._job_note, job_id,
+                f"Giving up: the runner containers of this job could not be stopped ({last}). "
+                "Check Docker on the runner host; a runner restart retries.")
+            self.engine._notify(
+                f"Pipeline #{job_id} — containers not stopped",
+                f"Docker on the runner did not answer ({last}). Containers of job #{job_id} may still be running — "
+                "check the runner host.", "negative", notification_id=f"job_{job_id}_containers")
+        finally:
+            if self._stop_retries.get(job_id) is asyncio.current_task():
+                self._stop_retries.pop(job_id, None)
 
     async def stop_runner(self) -> None:
         if self.worker is not None:
             await self.worker.stop()
             self.worker = None
 
-    async def _finalize_orphan(self, job_id: int, owner: str | None) -> bool:
-        """Orphan sweep hook: the dead owner may have been THIS host's previous
-        process (restart, self-deploy, or the former combined api+runner instance)
-        — its runner containers are still here, so close the job from them."""
-        return await self.engine.finalize_from_containers(job_id, reason=f"restarted (owner '{owner}')")
+    async def shutdown(self, reason: str = "plugin reload", budget: float = 12.0) -> None:
+        """Clean stop for teardown (plugin reload/disable/upgrade) and for a
+        draining instance (audit OC-10). Never touches a container and never
+        writes a terminal status for a job whose containers still run:
+
+        1. stop the lease-held loops and stop CLAIMING;
+        2. cancel the job tasks and wait (bounded) — they detach: step
+           "Runner reloading — detached at stage i/n", row stays RUNNING, the
+           maintenance override stays;
+        3. flush the job-log writers and runner snapshots.
+
+        The next incarnation re-attaches to the containers by label and closes
+        each job from all of them (run_startup_reconciliation → recover_job).
+        """
+        if getattr(self, "_shutting_down", False):
+            return
+        self._shutting_down = True
+        deadline = time.monotonic() + max(1.0, budget)
+        self.engine.detaching = reason
+        self.stop_webhook_sync()
+        self.sweeper.stop()
+        # Jobs still waiting for Docker stay RUNNING for the next incarnation.
+        for task in (self._reconcile_task, *self._stop_retries.values()):
+            if task is not None:
+                task.cancel()
+        worker, self.worker = self.worker, None
+        if worker is not None:
+            await worker.shutdown(max(0.5, deadline - time.monotonic() - 2.0))
+        await self.engine.flush_for_shutdown(max(0.5, deadline - time.monotonic()))
+        log.info(f"IaC Orchestrator: runner stopped cleanly ({reason}).")
 
     async def run_claimed(self, payload: dict, job_id: int):
-        """Execute a job this instance's worker claimed."""
+        """Execute a job this instance's worker claimed.
+
+        The row was written by whichever instance enqueued it — the payload is
+        validated again before anything acts on it (audit OS-09)."""
+        try:
+            payload = validate_structure(payload)
+        except InvalidJobPayload as exc:
+            log.error(f"WORKER: job #{job_id} rejected at claim — invalid payload: {exc}")
+            await off_loop(self._reject_claimed, job_id, str(exc))
+            return
         await self.ensure_runtime_paths()
         await self.engine.run_pipeline(payload, job_id=job_id)
 
-    async def enqueue_from_event(self, payload: dict) -> int | None:
-        """``iac:webhook_verified`` handler body: queue the pipeline, tell the user
-        when the same target is already queued/running (the old engine guard did
-        this silently with a toast — keep the toast)."""
+    def _reject_claimed(self, job_id: int, reason: str) -> None:
+        step = f"Rejected: invalid job payload ({reason})"[:250]
         try:
-            return await asyncio.to_thread(self.enqueue_pipeline, payload,
-                                           requested_by=payload.get("trigger") or ("ui" if payload.get("manual") else "webhook"))
+            self.queue.append_log(job_id, [f"[SYSTEM] {step} — nothing was executed."], self.queue.last_seq(job_id))
+        except Exception as exc:
+            log.debug(f"reject log line for #{job_id} not written: {exc}")
+        self.db.update_progress(job_id, progress=None, current_step=step)
+        self.db.update_job(job_id, "FAILED")
+
+    async def submit_job(self, payload: dict, *, entitlements=(), requested_by: str | None = None) -> int | None:
+        """:meth:`submit_job_ex` for callers that only need the job id (``None``
+        when the trigger was not queued)."""
+        return (await self.submit_job_ex(payload, entitlements=entitlements, requested_by=requested_by)).job_id
+
+    async def submit_job_ex(self, payload: dict, *, entitlements=(),
+                            requested_by: str | None = None) -> SubmitResult:
+        """The one way a trigger becomes a job.
+
+        ``entitlements`` names the privileged fields the calling code path may
+        set (``job_payload.ENT_*``); everything else is stripped, then the
+        payload is validated. Returns what became of the trigger — a new job, a
+        follow-up behind a busy target, merged into an identical queued job, or
+        NOT queued (``outcome == "duplicate"``) — so the caller can tell whoever
+        triggered the truth (audit OC-05). Raises :class:`InvalidJobPayload`.
+        """
+        clean, dropped = strip_unentitled(payload or {}, entitlements)
+        if dropped:
+            log.warning(f"ENQUEUE: dropped privileged field(s) {dropped} from a "
+                        f"'{clean.get('pipeline_type')}' trigger without entitlement.")
+        clean = validate_structure(clean)
+        # A trigger that arrives while this load still prepares the tables waits
+        # for that (bounded) instead of failing on a missing column.
+        await self.wait_bootstrapped(timeout=30.0)
+        # Branch → target (audit OS-05), for every trigger source: this is the
+        # one door. Without a policy to judge by (no checkout here and no
+        # snapshot yet) the runner decides — it checks again in any case.
+        if clean.get("pipeline_type") == "single_service":
+            refused = branch_policy.violation(await off_loop(self.branch_policy), clean)
+            if refused:
+                log.warning(f"ENQUEUE: trigger refused — {refused}.")
+                raise InvalidJobPayload(refused)
+        who = requested_by or clean.get("trigger") or ("ui" if clean.get("manual") else "webhook")
+        target = clean.get("service_name") or clean.get("host_name") or clean.get("limit") or clean.get("pipeline_type")
+        try:
+            res = await off_loop(self.enqueue_pipeline_ex, clean, requested_by=who)
         except DuplicateJob as exc:
-            target = payload.get("service_name") or payload.get("host_name") or payload.get("limit") or payload.get("pipeline_type")
-            log.warning(f"ENQUEUE: duplicate pipeline ignored for '{target}' (job #{exc.existing_id} active).")
+            reason = exc.reason or "a run for this target is already queued or running"
+            log.warning(f"ENQUEUE: trigger for '{target}' NOT queued — {reason} (job #{exc.existing_id}).")
+            self._notify_trigger("Pipeline Ignored",
+                                 f"A run for {target} was not queued: {reason} (job #{exc.existing_id}).", "warning")
+            return SubmitResult(None, "duplicate", duplicate_of=exc.existing_id, reason=reason)
+        if not res.job_id or res.job_id < 0:
+            return SubmitResult(None, "unavailable", reason="the job database is not connected")
+        if res.waiting_for:
+            self._notify_trigger("Pipeline Queued",
+                                 f"The run for {target} is queued as job #{res.job_id}; it starts when job "
+                                 f"#{res.waiting_for} for the same target is done.", "info")
+            return SubmitResult(res.job_id, "follow_up", waiting_for=res.waiting_for)
+        if res.coalesced:
+            if clean.get("manual"):
+                # An operator's click must not vanish without a trace; a CI trigger
+                # learns it from the response.
+                self._notify_trigger("Pipeline Queued",
+                                     f"A run for {target} is already waiting as job #{res.job_id} — nothing was added.",
+                                     "info")
+            return SubmitResult(res.job_id, "coalesced")
+        return SubmitResult(res.job_id, "promoted" if res.promoted else "queued")
+
+    #: Snapshot (``iac_orchestrator_state``) the runner publishes the policy under.
+    BRANCH_POLICY_SNAPSHOT = "snapshot:branch_policy"
+
+    def branch_policy(self) -> dict | None:
+        """The branch → target policy of the service catalog: from the
+        iac-controller checkout on an instance that has one (the runner), else
+        from the snapshot the runner published. ``None`` when neither exists.
+        Synchronous (YAML / database): call it off the loop."""
+        try:
+            policy = branch_policy.load(self.config.git_repos_dir)
+            if policy is not None:
+                return policy
+        except Exception as exc:
+            log.warning(f"IaC Orchestrator: service catalog unreadable for the branch policy: {exc}")
+        try:
+            record = self.db.get_state(self.BRANCH_POLICY_SNAPSHOT) or {}
+            items = (record.get("data") or {}).get("items")
+            return items if isinstance(items, dict) and items.get("prod") else None
+        except Exception as exc:
+            log.debug(f"IaC Orchestrator: branch policy snapshot unreadable: {exc}")
+            return None
+
+    def _notify_trigger(self, title: str, message: str, level: str) -> None:
+        try:
+            self.engine._notify(title, message, level)
+        except Exception as exc:
+            log.debug(f"trigger notification not sent: {exc}")
+
+    def submit_from_ui(self, payload: dict, *, entitlements=(), requested_by: str | None = None) -> None:
+        """Trigger from the plugin's own in-process (NiceGUI) pages: sync wrapper
+        around :meth:`submit_job`.
+
+        ``entitlements`` are those of the SESSION USER (``app/ui/access.py``
+        derives them from the user's permissions, audit OS-17). They used to be
+        ``ALL_ENTITLEMENTS`` for whoever could open the page — and the page
+        checked nothing: any logged-in user could queue a fleet apply with
+        ``approve``. A caller that passes none gets an untrusted trigger."""
+        async def _go():
             try:
-                self.engine._notify("Pipeline Ignored",
-                                    f"A run for {target} is already queued or running (job #{exc.existing_id}).",
-                                    "warning")
-            except Exception:
-                pass
+                await self.submit_job(payload, entitlements=entitlements, requested_by=requested_by)
+            except InvalidJobPayload as exc:
+                log.warning(f"ENQUEUE: UI trigger rejected: {exc}")
+            except Exception as exc:
+                log.error(f"ENQUEUE: UI trigger failed: {exc}")
+
+        self.ctx.create_task(_go(), name="iac:ui_submit")
+
+    async def enqueue_from_event(self, payload: dict) -> int | None:
+        """``iac:webhook_verified`` handler body. The bus has no sender identity —
+        any plugin can emit this topic — so the payload is UNTRUSTED: no
+        ``approve``, no ``force``, no self-declared trigger, strict validation.
+        The plugin's own triggers do not come this way (they call submit_job)."""
+        try:
+            return await self.submit_job(payload or {}, entitlements=())
+        except InvalidJobPayload as exc:
+            log.warning(f"ENQUEUE: bus trigger rejected — {exc}")
             return None
         except Exception as exc:
             log.error(f"ENQUEUE: failed to queue pipeline: {exc}")
@@ -160,7 +558,7 @@ class IaCService:
         try:
             from . import api as _api
 
-            counts = await asyncio.to_thread(_api.publish_repo_snapshots)
+            counts = await off_loop(_api.publish_repo_snapshots)
             if counts:
                 log.info(f"IaC Orchestrator: repo snapshots published {counts}.")
         except Exception as exc:
@@ -218,8 +616,22 @@ class IaCService:
 
     # -- webhook auto-sync: one instance (lease) -----------------------------
     def start_webhook_sync(self) -> None:
+        # A lease can be granted while this incarnation is already shutting down
+        # (cluster-wide disable: the peer that held it releases first, our
+        # interest is still registered until dispose). A loop started now is
+        # new work in the middle of teardown — the core then waits its whole
+        # teardown budget for it (staging 2026-11-15: 15 s, "cancelling 1 task").
+        if getattr(self, "_shutting_down", False):
+            return
         if getattr(self, "_webhook_sync_task", None) is None:
             self._webhook_sync_task = self.ctx.create_task(self.run_webhook_sync_loop(), name="iac:webhook_sync_loop")
+
+    def _start_sweeper(self) -> None:
+        """Lease callback for the orphan sweep: never start it during shutdown
+        (see :meth:`start_webhook_sync`)."""
+        if getattr(self, "_shutting_down", False):
+            return
+        self.sweeper.start()
 
     def stop_webhook_sync(self) -> None:
         task = getattr(self, "_webhook_sync_task", None)
@@ -227,51 +639,114 @@ class IaCService:
             task.cancel()
             self._webhook_sync_task = None
 
-    async def watch_runner_presence(self, interval: float = 30.0):
-        """Cluster: surface 'no runner online' as a non-blocking degraded status."""
+    async def watch_runner_presence(self, interval: float = 30.0, settle: float = 15.0):
+        """Surface 'no runner' as a non-blocking degraded status — after TWO
+        consecutive ``absent`` checks, never for ``restarting``/``unknown`` — and
+        keep the orphan-sweep lease on the right kind of instance. Only a status
+        this watcher set is reset."""
         set_status = getattr(self.ctx, "set_status", None)
-        if not callable(set_status):
-            return
         degraded = False
-        await asyncio.sleep(15)  # let the coordinator learn the live instances first
+        misses = 0
+        await asyncio.sleep(settle)  # let the coordinator learn the live instances first
         while True:
             try:
-                online = self.runner_online()
-                if not online and not degraded:
-                    set_status("degraded", message="No runner instance online — pipelines are queued, not executed",
-                               blocking=False)
-                    degraded = True
-                elif online and degraded:
-                    set_status("ready")
-                    degraded = False
+                self.review_sweep_lease()
+                state = self.runner_state()
+                misses = misses + 1 if state == "absent" else 0
+                if callable(set_status):
+                    if misses >= 2 and not degraded:
+                        set_status("degraded", message="No runner instance online — pipelines are queued, not executed",
+                                   blocking=False)
+                        degraded = True
+                    elif state in ("online", "restarting") and degraded:
+                        set_status("ready")
+                        degraded = False
             except Exception as exc:
                 log.debug(f"runner watch: {exc}")
             await asyncio.sleep(interval)
 
-    async def on_abort_requested(self, payload: dict | None = None):
-        """``iac:job_abort_requested`` (local or relayed): abort the jobs this instance runs."""
+    async def on_abort_requested(self, payload: dict | None = None) -> list[int]:
+        """``iac:job_abort_requested`` (local or relayed): abort the jobs this instance runs.
+
+        Returns the ids whose containers could NOT be stopped (Docker did not
+        answer, review C1): their abort is retried in the background and the
+        caller must not report them as stopped.
+
+        ``final_status: "FAILED"`` + ``reason`` (the sweep's maximum-runtime stop,
+        review C4): the same stop, but the job is closed as FAILED with that
+        reason instead of ABORTED "Aborted by User". The bus has no sender
+        identity — the fields only choose between two terminal labels for a job
+        that this topic could always stop."""
         ids = [int(j) for j in ((payload or {}).get("job_ids") or []) if str(j).isdigit()]
-        if not ids:
-            return
+        close: dict | None = None
+        if (payload or {}).get("final_status") == "FAILED":
+            close = {"status": "FAILED",
+                     "reason": str((payload or {}).get("reason") or "Stopped (maximum runtime exceeded)")[:250]}
+        unstopped: list[int] = []
         for job_id in ids:
             owned = self.worker.owns(job_id) if self.worker else False
             if owned:
+                # Only a requested stop makes a cancellation terminal (ABORTED, or
+                # FAILED for the runtime limit); every other cancellation detaches
+                # the job (engine, OC-10).
+                self.engine.request_abort(job_id, **(close or {}))
                 await self.worker.cancel(job_id)
-            if owned or any(
+            if owned or job_id in self._unsettled or any(
                 isinstance(t, dict) and t.get("job_id") == job_id
                 for t in (self.state.get("active_tasks") or {}).values()
             ):
                 try:
-                    await self.engine.abort_job(job_id)
+                    if not await self.stop_containers(job_id, abort=True, close=close):
+                        unstopped.append(job_id)
                 except Exception as exc:
                     log.warning(f"abort of job #{job_id} failed: {exc}")
+        return unstopped
 
     # ------------------------------------------------------------------
     # DB bootstrap
     # ------------------------------------------------------------------
 
+    #: How long the runner boot waits for the first bootstrap (the bootstrap lock
+    #: can be contended for up to ~55 s while several instances start together).
+    BOOTSTRAP_WAIT_SECONDS = 120.0
+
+    def schedule_bootstrap(self, base=None) -> None:
+        """``setup()``: start the first bootstrap of this load as a task. From
+        here on the runner boot and the trigger path wait for it."""
+        self._bootstrapped = asyncio.Event()
+        self.ctx.create_task(self.bootstrap_async(base), name="iac:bootstrap_db")
+
+    async def bootstrap_async(self, base=None) -> None:
+        """:meth:`bootstrap_db` off the event loop (audit OC-08 B7): ``create_all``,
+        the column inspection and ``GET_LOCK('lyndrix_bootstrap')`` — up to ~55 s
+        when several instances boot together — used to run inside ``setup()`` and
+        the ``db:connected`` handler, i.e. on the loop. Also restores the
+        Auto-Apply flag for the UI (a Vault read). Never raises."""
+        try:
+            await off_loop(self.bootstrap_db, base)
+            self.state["auto_apply_enabled"] = bool(await off_loop(lambda: self.config.auto_apply))
+        except Exception as exc:
+            log.error(f"IaC Orchestrator: database bootstrap failed: {exc}")
+        finally:
+            if self._bootstrapped is not None:
+                self._bootstrapped.set()
+
+    async def wait_bootstrapped(self, timeout: float | None = None) -> bool:
+        """Wait (bounded) for the first bootstrap of this load. ``False`` on a
+        timeout — the caller goes on and meets the database as it is."""
+        event = getattr(self, "_bootstrapped", None)
+        if event is None or event.is_set():
+            return True
+        try:
+            await asyncio.wait_for(event.wait(), timeout=self.BOOTSTRAP_WAIT_SECONDS if timeout is None else timeout)
+            return True
+        except asyncio.TimeoutError:
+            log.warning("IaC Orchestrator: the database bootstrap has not finished yet — continuing without it.")
+            return False
+
     def bootstrap_db(self, base=None):
-        """Create ORM tables if the DB is connected. Safe to call multiple times."""
+        """Create ORM tables if the DB is connected. Safe to call multiple times.
+        Synchronous (DDL, advisory lock): call it through :meth:`bootstrap_async`."""
         if base is None:
             base = Base
         if not db_instance.is_connected or not db_instance.engine:
@@ -333,58 +808,155 @@ class IaCService:
         await self.engine.run_pipeline(payload)
 
     async def run_startup_reconciliation(self):
-        """Reconcile orphaned runners and resume interrupted jobs after a restart.
+        """Settle the RUNNING jobs a previous incarnation of this runner left behind.
 
-        Runner instances only, and only for jobs THIS instance owned (plus legacy
-        rows without an owner): in a cluster another runner's RUNNING jobs are
-        alive and must not be touched — the orphan sweep handles dead owners.
+        Runner instances only, and only rows this instance id owned (plus legacy
+        rows without an owner) that were NOT claimed by the current incarnation:
+        another runner's jobs are alive, and a job the current worker claimed is
+        executing (audit OC-04). Each row is adopted first (new claim token,
+        conditional on the old one), so everything written afterwards is fenced
+        and a row somebody else closed meanwhile is skipped.
+
+        A job with containers on this host (Ansible or Terraform, found by label)
+        is handed to ``engine.recover_job``, which follows ALL of them and then
+        closes the job; a job without any is closed as FAILED now. Nothing is
+        resumed. Containers of jobs that were closed elsewhere while this runner
+        was away (orphan sweep, abort) are stopped — their job must not go on.
+
+        All of that needs Docker's answer. While the listing fails or times out
+        (daemon slow after a host reboot, socket gone for a moment) the container
+        situation is UNKNOWN (review C1): the adopted jobs stay RUNNING and
+        heartbeated, nothing is closed and no lock is given up; the listing is
+        retried in the background until Docker answers.
         """
         if not self.is_runner:
             return
+        me = getattr(self.ctx, "instance_id", None)
+        # Listed before anything else happens in this process.
+        previous = await off_loop(self.queue.previous_incarnation_jobs, me, self.incarnation)
         await self.ensure_runtime_paths()
         await asyncio.sleep(2)  # Give the DB a moment to wake up
+        for row in previous:
+            job_id = row["id"]
+            token = await off_loop(self.queue.adopt, job_id, me, self.incarnation, row["claim_token"])
+            if token is None:
+                continue  # closed or taken over meanwhile — its containers are leftovers (below)
+            self.db.claims[job_id] = token
+            self._unsettled.add(job_id)
+
         log.info("IaC Orchestrator: Checking for surviving Docker runners...")
         try:
-            await asyncio.wait_for(self.engine.reconcile_orphaned_runners(), timeout=20)
-        except asyncio.TimeoutError:
-            log.warning("IaC Orchestrator: Runner reconciliation timed out after 20s, continuing startup.")
+            containers = await self.engine._list_job_containers()
         except Exception as exc:
-            log.error(f"IaC Orchestrator: Runner reconciliation failed: {exc}")
-        finally:
-            log.info("IaC Orchestrator: Startup reconciliation scan finished.")
+            waiting = sorted(self._unsettled)
+            log.error(f"IaC Orchestrator: Runner reconciliation could not list containers ({exc}) — "
+                      f"job(s) {waiting or 'none'} stay RUNNING until Docker answers.")
+            step = "Runner restarted — container state unknown (Docker not reachable), retrying"
+            for job_id in waiting:
+                await off_loop(self._job_note, job_id, f"{step}: {exc}. Nothing is closed or released.")
+                await off_loop(self.db.update_progress, job_id, None, step)
+            if waiting:
+                self.engine._notify(
+                    "IaC runner — Docker not reachable",
+                    f"The runner restarted but Docker did not answer ({exc}). Job(s) "
+                    f"{', '.join(f'#{j}' for j in waiting)} stay RUNNING until it does.",
+                    "warning", notification_id="iac_reconcile_docker")
+            self._reconcile_task = self.ctx.create_task(
+                self._reconcile_when_docker_answers(), name="iac:reconcile_retry")
+            return
+        try:
+            await self._settle_adopted(containers)
+        except Exception as exc:
+            # A job left in ``_unsettled`` must not stay there unwatched.
+            log.error(f"IaC Orchestrator: Startup reconciliation incomplete ({exc}) — retrying.")
+            self._reconcile_task = self.ctx.create_task(
+                self._reconcile_when_docker_answers(), name="iac:reconcile_retry")
+            return
+        log.info("IaC Orchestrator: Startup reconciliation scan finished.")
 
-        # Resume any pending tasks in the database queue — own jobs + ownerless legacy rows.
-        me = getattr(self.ctx, "instance_id", None)
-        interrupted_jobs = [
-            j for j in self.db.get_jobs_by_status("RUNNING")
-            if getattr(j, "owner_instance", None) in (None, "", me)
-        ]
-        for job in interrupted_jobs:
-            remaining_services = self.db.get_pending_tasks(job.id)
-            if remaining_services:
-                self.ctx.create_task(
-                    self.engine.resume_bulk_rollout(job.id, remaining_services),
-                    name=f"iac:resume:{job.id}",
-                )
-            elif not any(
-                t.get("job_id") == job.id
-                for t in self.engine.state.get("active_tasks", {}).values()
-            ):
-                # The runner process died mid-job (restart / self-deploy). Its containers
-                # may have finished meanwhile — close the job from their exit codes
-                # before giving up on it.
-                try:
-                    if await self.engine.finalize_from_containers(job.id, reason="restarted"):
-                        continue
-                except Exception as exc:
-                    log.debug(f"IaC Orchestrator: container recovery for job #{job.id} failed: {exc}")
-                log.warning(
-                    f"IaC Orchestrator: Job #{job.id} is RUNNING but has no active runners. Marking as FAILED."
-                )
-                self.db.update_job(job.id, "FAILED")
-                self.db.update_progress(job.id, progress=None, current_step="System Restart (Aborted)")
-                self.engine.end_override_for(job.id)
-                self.state["last_deployment"] = "FAILED"
+    async def _reconcile_when_docker_answers(self) -> None:
+        """Retry the container listing (bounded pauses, at most one per minute)
+        until Docker answers, then settle what start-up could not. This loop has
+        no bound of its own: closing a job without knowing its containers is
+        exactly the defect. The bound is the job's maximum runtime (review C4):
+        the sweep then closes the row as FAILED "containers may still be
+        running" and keeps its locks reserved for the container grace; this loop
+        finds the row closed, stops the leftovers once Docker answers and ends.
+        With ``job_max_runtime_seconds = 0`` the way out is Docker coming back
+        or an operator's abort."""
+        attempt = 0
+        while True:
+            await asyncio.sleep(self._docker_retry_delay(attempt))
+            attempt += 1
+            try:
+                containers = await self.engine._list_job_containers()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning(f"IaC Orchestrator: Docker still not reachable (attempt {attempt}): {exc}")
+                continue
+            try:
+                await self._settle_adopted(containers)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning(f"IaC Orchestrator: deferred reconciliation failed, retrying: {exc}")
+                continue
+            if not self._unsettled:
+                log.info(f"IaC Orchestrator: deferred startup reconciliation finished after {attempt} attempt(s).")
+                return
+
+    async def _settle_adopted(self, containers: list[dict]) -> None:
+        """Decide the adopted jobs from a container listing Docker really gave."""
+        by_job: dict[int, list[dict]] = {}
+        for container in containers:
+            by_job.setdefault(container["job_id"], []).append(container)
+
+        for job_id in sorted(self._unsettled):
+            if job_id in self._stop_retries:
+                by_job.pop(job_id, None)
+                continue  # an abort/stop for it is being retried — that path settles it
+            if await off_loop(self.queue.job_status, job_id) != "RUNNING":
+                # Closed elsewhere while we waited for Docker: its containers are leftovers.
+                self._unsettled.discard(job_id)
+                self.db.claims.pop(job_id, None)
+                continue
+            mine = by_job.pop(job_id, [])
+            if mine:
+                log.info(f"IaC Orchestrator: job #{job_id} — re-attaching to {len(mine)} container(s).")
+                self.engine.register_recovered(job_id, mine)   # attended through its tasks from here on
+                self._unsettled.discard(job_id)
+                self.ctx.create_task(self.engine.recover_job(job_id, mine), name=f"iac:recover:{job_id}")
+                continue
+            log.warning(
+                f"IaC Orchestrator: Job #{job_id} is RUNNING but has no active runners. Marking as FAILED."
+            )
+            reason = await self.engine.interrupted_reason(job_id) or "System Restart (Aborted)"
+            self.engine._log_line(job_id, f"[SYSTEM] {reason}.")
+            await self.engine._close_log_writer(job_id)
+            await off_loop(self.db.update_progress, job_id, None, reason[:250])
+            await off_loop(self.db.update_job, job_id, "FAILED")
+            # Docker listed no container for it: nothing can still use its locks.
+            await off_loop(self.queue.release_job_locks, job_id)
+            self.db.claims.pop(job_id, None)
+            self._unsettled.discard(job_id)
+            await off_loop(self.engine.end_override_for, job_id)
+            # Its inventory snapshot and scratch directory (.job_snapshots/job_<id>)
+            # go with the job, as on every other terminal path — they were left
+            # on the runner's disk for good (staging 2026-11-15: job_4, job_7).
+            await off_loop(self.engine._cleanup_inventory_snapshot, job_id)
+            self.state["last_deployment"] = "FAILED"
+
+        # Containers whose job is no longer RUNNING: the job was closed while this
+        # runner was away (rD §3.4) — stop them instead of letting them finish.
+        for job_id in by_job:
+            try:
+                status = await off_loop(self.queue.job_status, job_id)
+            except Exception:
+                continue
+            if status != "RUNNING":
+                log.warning(f"IaC Orchestrator: job #{job_id} is {status or 'gone'} but has containers here — stopping them.")
+                await self.stop_containers(job_id)
 
     async def emit_monitoring_inventory_sync(self):
         """Delegate to the engine."""
@@ -402,11 +974,13 @@ class IaCService:
         without anyone clicking "Webhooks registrieren" in Settings. iac-controller
         CI can additionally hit POST /api/iac/webhook/sync for an immediate run.
         """
-        if str(self.ctx.get_secret("iac_webhook_autosync_enabled") or "true").lower() == "false":
+        enabled, raw_interval = await off_loop(lambda: (
+            self.ctx.get_secret("iac_webhook_autosync_enabled"),
+            self.ctx.get_secret("iac_webhook_sync_interval_seconds") or ""))
+        if str(enabled or "true").lower() == "false":
             self.ctx.log.info("IaC Orchestrator: webhook auto-sync disabled.")
             return
 
-        raw_interval = self.ctx.get_secret("iac_webhook_sync_interval_seconds") or ""
         try:
             interval = max(300, int(str(raw_interval).strip() or "1800"))
         except ValueError:
@@ -415,7 +989,7 @@ class IaCService:
         await asyncio.sleep(30)  # let Vault hydrate and boot settle
         while True:
             try:
-                result = await asyncio.to_thread(sync_group_webhooks_from_ctx, self.ctx)
+                result = await off_loop(sync_group_webhooks_from_ctx, self.ctx)
                 self.ctx.log.info(
                     f"IaC Orchestrator: webhook auto-sync ok "
                     f"(projects={result['projects_total']}, created={result['created']}, "
@@ -427,9 +1001,18 @@ class IaCService:
                 self.ctx.log.warning(f"IaC Orchestrator: webhook auto-sync failed — {exc}")
             await asyncio.sleep(interval)
 
+    #: After a failed mount resolution the next attempt waits this long (a job
+    #: must not pay the socket timeout every time while the socket manager is down).
+    RUNTIME_PATH_RETRY_SECONDS = 300.0
+
     async def ensure_runtime_paths(self):
-        """Resolve host bind mounts from the core socket manager once per boot."""
+        """Resolve host bind mounts from the core socket manager — once per boot
+        when it worked. A failure (socket manager not up yet, timeout) is no
+        longer final: it used to pin the configured fallback paths until the
+        next restart (audit OC-21); now it is retried after a pause."""
         if getattr(self, "_runtime_paths_resolved", False):
+            return
+        if time.monotonic() < getattr(self, "_runtime_paths_retry_at", 0.0):
             return
         try:
             mounts = await self.socket_client.resolve_runtime_mounts(
@@ -442,8 +1025,14 @@ class IaCService:
             )
             if mounts:
                 self.config.apply_runtime_mount_paths(mounts)
+                self._runtime_paths_resolved = True
                 self.ctx.log.info("IaC Orchestrator: Resolved runtime host mounts via socket manager.")
+                return
+            reason = "no mounts reported"
         except Exception as exc:
-            self.ctx.log.warning(f"IaC Orchestrator: Runtime mount resolution failed, using configured paths: {exc}")
-        finally:
-            self._runtime_paths_resolved = True
+            reason = str(exc)
+        self._runtime_paths_retry_at = time.monotonic() + self.RUNTIME_PATH_RETRY_SECONDS
+        self.ctx.log.warning(
+            f"IaC Orchestrator: Runtime mount resolution failed ({reason}) — using the configured paths, "
+            f"retrying in {int(self.RUNTIME_PATH_RETRY_SECONDS)}s."
+        )

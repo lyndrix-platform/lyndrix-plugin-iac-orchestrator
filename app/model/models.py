@@ -34,6 +34,25 @@ class IaCJob(Base):
     claimed_at = Column(DateTime(timezone=True), nullable=True)
     heartbeat_at = Column(DateTime(timezone=True), nullable=True)
     runners = Column(LONGTEXT, nullable=True)            # live runner/task snapshot (JSON) for every instance's UI
+    # Fencing (audit OC-03/OC-04/OC-09): every claim gets a fresh token; the claimant's
+    # writes are conditional on it, so a runner that was declared lost (or a previous
+    # incarnation of the same instance id) can never overwrite what happened since.
+    claim_token = Column(String(64), nullable=True)
+    owner_incarnation = Column(String(64), nullable=True)  # "<core boot nonce>:<plugin load nonce>" of the claimant
+    # Heartbeat on the DATABASE clock in UTC — what the orphan sweep ages (the
+    # naive ``heartbeat_at`` above is the runner's local wall clock).
+    heartbeat_utc = Column(DateTime, nullable=True)
+    # When the current run was claimed, on the DATABASE clock in UTC (review C4):
+    # the maximum runtime is measured from here. Set by the claim, kept across an
+    # adoption by a restarted runner, cleared when the job goes back to the queue.
+    claimed_utc = Column(DateTime, nullable=True)
+    # Where the job is (JSON: stage index/count/name, "last" stage flag). Written with
+    # every stage start so a restarted runner knows whether a re-attached container
+    # belonged to the pipeline's last stage or stages are still missing (audit OC-10).
+    exec_state = Column(LONGTEXT, nullable=True)
+    # Who triggered the job (audit OS-13): the authenticated username for API/UI
+    # triggers, the trigger name for token/CI/engine triggers.
+    requested_by = Column(String(100), nullable=True)
 
     # --- MAINTENANCE WINDOWS (plugin 1.6): a deploy parked for its window ---
     # Status SCHEDULED: the runner evaluated the service's deploy_policy and parked the job
@@ -44,6 +63,26 @@ class IaCJob(Base):
     window_ci_ids = Column(LONGTEXT, nullable=True)      # JSON list of Entity-Registry UUIDs the deploy touches
     override_id = Column(String(64), nullable=True)      # maintenance:override_started id while the deploy runs
     schedule_reason = Column(String(255), nullable=True) # why the job was parked (operator-facing)
+
+
+class IaCLock(Base):
+    """Named mutex held by a JOB (audit OC-01).
+
+    ``tf:<site>_<stage>`` serialises every OpenTofu run on one environment state:
+    the S3 backend has no state locking, and the per-process semaphore neither
+    survives a plugin reload nor knows about a second runner. A lock is valid
+    while its job row is RUNNING. A holder that was closed without releasing it
+    (crash, abort, orphan sweep) keeps it until its runner has stopped the
+    containers and gives it back, or until the takeover grace is over — its
+    tofu container may still be running (``JobQueue.acquire_lock``).
+    """
+    __tablename__ = "iac_orchestrator_locks"
+
+    lock_key = Column(String(190), primary_key=True)
+    job_id = Column(Integer, nullable=False)
+    token = Column(String(64), nullable=False)
+    owner_instance = Column(String(100), nullable=True)
+    acquired_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
 class IaCJobLog(Base):

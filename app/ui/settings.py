@@ -4,6 +4,7 @@ import asyncio
 from nicegui import ui
 from ui.theme import UIStyles
 from ..controller.gitlab_webhooks import sync_group_webhooks_from_ctx, WebhookConfigError
+from .access import SETTINGS_PERMISSIONS, may_use_settings, ui_submit
 
 
 def _safe_int(value, default: int) -> int:
@@ -14,7 +15,23 @@ def _safe_int(value, default: int) -> int:
 
 
 def render_settings_ui(ctx, service):
-    """Renders the settings interface for the IaC Orchestrator."""
+    """Renders the settings interface for the IaC Orchestrator.
+
+    The core embeds this panel in its own dialogs for whoever opens them. It
+    writes settings, credentials, the webhook token and the apply gates, so it
+    renders only for a session that holds every admin permission of the plugin
+    (audit OS-17) — like the API routes that do the same work.
+
+    # TODO(agent): the handlers below still write Vault keys directly; route
+    # them through OrchestratorSettings.save_values (validation + per-field
+    # tiers, audit OS-02) and then gate per field instead of the whole panel.
+    """
+    if service is None or not may_use_settings():
+        ui.label(
+            "The IaC Orchestrator settings need the IaC administrator permissions "
+            f"({', '.join(':'.join(p.split(':')[-2:]) for p in SETTINGS_PERMISSIONS)})."
+        ).classes("text-xs text-[var(--lx-text-muted)]")
+        return
     state = service.state
     current_config = {
         "auto_apply": state.get("auto_apply_enabled", False),
@@ -139,7 +156,7 @@ def render_settings_ui(ctx, service):
                             def _run_test_deploy():
                                 hosts = _allowlisted_hosts()
                                 for hn in hosts:
-                                    ctx.emit('iac:webhook_verified', {
+                                    ui_submit(service, {
                                         'pipeline_type': 'host_provision',
                                         'host_name': hn,
                                         'approve': True,
@@ -205,7 +222,12 @@ def render_settings_ui(ctx, service):
                                 ui.notify(f"Sync command sent for {slug}. Check logs.", type="info")
 
                             with ui.row().classes('w-full justify-end mt-2 gap-4'):
-                                ui.button('Test Sync', on_click=trigger_test, icon='sync', color='warning').props('unelevated rounded size=sm outline')
+                                # A test sync resets that repository's working tree on the shared
+                                # checkout — not while a pipeline may be using it (audit OC-14).
+                                # TODO(agent): run the test against a scratch clone instead of the live checkout.
+                                ui.button('Test Sync', on_click=trigger_test, icon='sync', color='warning').props('unelevated rounded size=sm outline') \
+                                    .bind_enabled_from(service.state, 'is_running', backward=lambda x: not x) \
+                                    .tooltip('Syncs this repository now. Disabled while a pipeline is running.')
                                 ui.button('Save Role', on_click=lambda r=role, u=url_input, t=token_select: save_repo_config(r['slug'], u.value, t.value), icon='save', color='secondary').props('unelevated rounded size=sm')
 
         # --- [SECTION 3: NATIVE ANSIBLE CONFIG] ---
@@ -216,7 +238,7 @@ def render_settings_ui(ctx, service):
                     ui.label('Ansible Docker Configuration').classes('text-sm font-bold uppercase tracking-widest text-[var(--lx-text-muted)]')
                 ui.label('Configure the ephemeral Docker container and Registry Auth for Ansible Playbooks.').classes(UIStyles.TEXT_MUTED)
 
-                default_img = "registry.gitlab.int.fam-feser.de/iac-environment/iac-platform-assets/ansible-ci-image:latest"
+                default_img = "registry.gitlab.int.fam-feser.de/aac-application-definitions/aac-template-engine:latest"
                 img_input = ui.input('Docker Image', value=ctx.get_secret("ansible_docker_image") or default_img).props('outlined dense').classes('w-full')
 
                 key_exists = bool(ctx.get_secret("ansible_ssh_key"))
@@ -466,12 +488,16 @@ def render_settings_ui(ctx, service):
                             '(IaC Controller, Inventory State, Config Engine, AaC Factory). '
                             'Runs automatically on every deployment.'
                         ).classes(UIStyles.TEXT_MUTED + ' text-xs max-w-lg')
-                    ui.button(
-                        'Resync Repositories', icon='sync',
-                        on_click=lambda: ctx.create_task(
-                            service.engine.sync_core_repos(), name='iac:sync_core_repos'
-                        ),
-                    ).props('unelevated rounded size=sm color=blue-6') \
+                    def resync_repositories():
+                        # As a repo_sync JOB on the runner, like the React UI does — not
+                        # in this process: the instance that serves the page shares the
+                        # checkout directory with the runner, and a sync from here reset
+                        # the working trees under a running pipeline (audit OC-14).
+                        ui_submit(service, {"pipeline_type": "repo_sync", "manual": True})
+                        ui.notify("Repository sync queued — see the job history.", type="info")
+
+                    ui.button('Resync Repositories', icon='sync', on_click=resync_repositories) \
+                     .props('unelevated rounded size=sm color=blue-6') \
                      .bind_enabled_from(service.state, 'is_running', backward=lambda x: not x)
 
                 ui.separator().classes('bg-[var(--lx-border-soft)] my-1')

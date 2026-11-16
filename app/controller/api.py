@@ -25,14 +25,23 @@ import time
 import re
 import secrets
 import asyncio
+from collections import OrderedDict, deque
 from pathlib import Path
 
 from fastapi import Request, Header, HTTPException
 from pydantic import BaseModel, Field
 
-from .settings_schema import OrchestratorSettings
-from .queue import DuplicateJob as _DuplicateJob
+from .settings_schema import (
+    OrchestratorSettings, SettingsPermissionError, SettingsValidationError,
+    TIER_CREDENTIALS, TIER_INFRA_APPLY, TIER_OPERATOR, TIER_SETTINGS,
+    is_valid_credential_alias,
+)
+from .queue import DuplicateJob as _DuplicateJob, SubmitResult
+from .job_payload import ENT_APPROVE, ENT_TRIGGER, InvalidJobPayload
+from . import branch_policy, plan_binding
 from . import maintenance_resolver as _mres
+from .offloop import off_loop
+from .public_projection import public_catalog_entry, public_scalar
 
 # Internal references to be set by init_api
 _ctx = None
@@ -92,16 +101,240 @@ def _emit_webhook_verified(event_payload: dict) -> None:
         _ctx.log.debug(f"NOTIFY: webhook_verified notify failed: {exc}")
 
 
-def _require_gitlab_token(x_gitlab_token: str | None):
+
+def _actor(identity) -> str | None:
+    """Name recorded as the job's ``requested_by`` for an authenticated caller."""
+    name = getattr(identity, "username", None)
+    return str(name)[:100] if isinstance(name, str) and name else None
+
+
+async def _submit(payload: dict, *entitlements: str, actor: str | None = None) -> SubmitResult:
+    """Queue a trigger of this API (validated, with the entitlements of the calling
+    route) and return what became of it; an invalid payload is a 400. Triggers no
+    longer travel over the bus: the bus topic ``iac:webhook_verified`` has no
+    sender identity (audit OS-09).
+
+    The "webhook verified" notification is sent only for a trigger that was
+    queued — a refused one already produced "Pipeline Ignored"."""
+    if not _service:
+        raise HTTPException(status_code=503, detail="Orchestrator not initialized")
+    try:
+        # ``actor`` = authenticated username (recorded with the job, audit OS-13);
+        # token/CI triggers are recorded under their trigger name.
+        result = await _service.submit_job_ex(payload, entitlements=entitlements, requested_by=actor)
+    except InvalidJobPayload as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid job payload: {exc}")
+    if result.queued:
+        _emit_webhook_verified(payload)
+    return result
+
+
+def _trigger_response(result: SubmitResult, message: str, **extra) -> dict:
+    """Body of a trigger endpoint. It used to say ``accepted`` / "… queued" whatever
+    happened, also for a trigger that was dropped (audit OC-05). Now:
+
+    * ``status``: ``accepted`` when a job will run the trigger; ``duplicate`` (or
+      ``unavailable``) when it was NOT queued. HTTP stays 200 — GitLab disables a
+      hook that answers 4xx and the existing CI template only looks at the code;
+      what happened is in the body;
+    * ``job_id``: the job to poll — also for a trigger merged into a queued job
+      (``outcome: coalesced``) or waiting behind a running one (``follow_up``,
+      ``waiting_for``); ``queued`` false and ``duplicate_of`` when refused.
+    """
+    return {
+        "status": "accepted" if result.queued else result.outcome,
+        "message": result.describe(message),
+        **result.as_dict(),
+        **extra,
+    }
+
+# ── Webhook token check (public routes) ──────────────────────────────────────
+# Runs BEFORE authentication succeeded, for anyone who reaches the port. It used
+# to do a synchronous, uncached Vault round trip on the event loop per request
+# (audit OS-11): a loop of bogus calls stalled every other request and — on the
+# runner — the cluster heartbeat. Now the expected token is cached for a short
+# time and read off the loop; a mismatch may trigger ONE fresh read every few
+# seconds (so a token rotated on another instance is picked up quickly), never
+# one per request.
+_TOKEN_TTL_SECONDS = 30.0
+_TOKEN_REFRESH_MIN_SECONDS = 5.0
+_token_cache: dict = {"value": None, "at": 0.0, "forced_at": 0.0, "loaded": False, "purpose": {}}
+
+# ── One token per purpose (audit OS-04, option A — backward compatible) ───────
+# The ONE shared token (``gitlab_webhook_token``) sits in every project hook and
+# in two CI variables and authorised every public action: a token leaked from a
+# hook could deploy. Each purpose now has its own secret slot. While a slot is
+# empty the shared token keeps authorising that purpose exactly as before (with
+# a deprecation warning); once it is set, ONLY that token is accepted for the
+# purpose — not the shared one, not the token of another purpose. Nothing here
+# ever writes, moves or deletes the shared token.
+SHARED_SLOT = "gitlab_webhook_token"
+PURPOSE_HOOK = "hook"                    # POST /webhook/gitlab (group hooks: merge request events)
+PURPOSE_SERVICE_CI = "service_ci"        # deploy/service/<svc>/gitlab (+ status)
+PURPOSE_CONTROLLER_CI = "controller_ci"  # infra/plan/gitlab, webhook/sync, test-host, infra/apply/gitlab
+PURPOSE_TOKEN_KEYS = {
+    PURPOSE_HOOK: "gitlab_hook_token",
+    PURPOSE_SERVICE_CI: "gitlab_service_ci_token",
+    PURPOSE_CONTROLLER_CI: "gitlab_controller_ci_token",
+}
+MODE_DEDICATED, MODE_SHARED = "dedicated", "shared"
+#: The "shared token still in use" warning is logged once per purpose per hour.
+_DEPRECATION_LOG_SECONDS = 3600.0
+_deprecation_logged: dict[str, float] = {}
+
+# ── Failure rate limit per source address ──────────────────────────────────────
+# Counts REJECTED calls only, and a valid token is always accepted whatever the
+# count: the limit cannot be turned into a lock-out of the legitimate CI (all
+# GitLab runners share one egress address — one project with a stale token
+# variable polling the status route must not stop every other pipeline). What
+# the limit does: after ``_FAIL_LIMIT`` rejected calls within
+# ``_FAIL_WINDOW_SECONDS`` from one address, further rejected calls from it are
+# answered 429 + Retry-After and are not logged one by one (the Vault re-read
+# is limited for the whole instance anyway). In-process and bounded (``_FAIL_TRACKED_ADDRESSES``, least recently
+# failing address dropped first); each instance counts for itself.
+_FAIL_LIMIT = 20
+_FAIL_WINDOW_SECONDS = 60.0
+_FAIL_TRACKED_ADDRESSES = 2048
+_failures_by_address: "OrderedDict[str, deque]" = OrderedDict()
+#: Rejected token-route calls on this instance (health/diagnostics, audit OC-16:
+#: a rotated token that CI still uses otherwise fails without a trace).
+webhook_auth_failures: dict = {"count": 0, "last_at": None}
+
+
+def _reset_token_cache(value: str | None = None) -> None:
+    _token_cache.update(value=value, at=time.monotonic() if value else 0.0, loaded=bool(value))
+
+
+def _read_tokens() -> tuple[str | None, dict]:
+    """The shared token and the purpose tokens from Vault (sync: thread)."""
+    def read(key: str) -> str | None:
+        value = _ctx.get_secret(key)
+        return value if isinstance(value, str) and value else None
+
+    return read(SHARED_SLOT), {purpose: read(key) for purpose, key in PURPOSE_TOKEN_KEYS.items()}
+
+
+async def _load_tokens(*, force: bool = False) -> tuple[str | None, dict]:
+    """``(shared token, {purpose: dedicated token | None})`` — cached, read off
+    the event loop in one go."""
+    now = time.monotonic()
+    if not force and _token_cache["loaded"] and now - _token_cache["at"] < _TOKEN_TTL_SECONDS:
+        return _token_cache["value"], _token_cache.get("purpose") or {}
+    shared, dedicated = await off_loop(_read_tokens)
+    _token_cache.update(value=shared, purpose=dedicated, at=time.monotonic(), loaded=True)
+    return shared, dedicated
+
+
+async def _expected_webhook_token(*, force: bool = False) -> str | None:
+    """The shared webhook token (kept for callers that need only that)."""
+    return (await _load_tokens(force=force))[0]
+
+
+def _token_matches(presented: str | None, expected: str | None) -> bool:
+    if not presented or not expected:
+        return False
+    # Bytes, so a non-ASCII header is a plain mismatch (compare_digest raises on
+    # non-ASCII str — that used to be a 500).
+    return hmac.compare_digest(str(presented).encode("utf-8", "replace"), str(expected).encode("utf-8", "replace"))
+
+
+def _accepted_token(purpose: str | None, shared: str | None, dedicated: dict) -> tuple[str | None, str]:
+    """``(the one token accepted for this purpose, mode)``. A purpose whose slot
+    is set accepts that token only; an empty slot (or no purpose) the shared one."""
+    own = (dedicated or {}).get(purpose) if purpose else None
+    return (own, MODE_DEDICATED) if own else (shared, MODE_SHARED)
+
+
+def _source_address(request) -> str:
+    try:
+        return str(request.client.host or "unknown")[:64]
+    except Exception:
+        return "unknown"
+
+
+def _failures_in_window(address: str, now: float) -> int:
+    stamps = _failures_by_address.get(address)
+    if not stamps:
+        return 0
+    while stamps and now - stamps[0] > _FAIL_WINDOW_SECONDS:
+        stamps.popleft()
+    if not stamps:
+        _failures_by_address.pop(address, None)
+        return 0
+    return len(stamps)
+
+
+def _record_failure(address: str, now: float) -> None:
+    stamps = _failures_by_address.get(address)
+    if stamps is None:
+        stamps = _failures_by_address[address] = deque(maxlen=_FAIL_LIMIT)
+        while len(_failures_by_address) > _FAIL_TRACKED_ADDRESSES:
+            _failures_by_address.popitem(last=False)
+    stamps.append(now)
+    _failures_by_address.move_to_end(address)
+
+
+def _warn_shared_token(purpose: str) -> None:
+    now = time.monotonic()
+    last = _deprecation_logged.get(purpose)
+    if last is not None and now - last < _DEPRECATION_LOG_SECONDS:
+        return
+    _deprecation_logged[purpose] = now
+    _ctx.log.warning(
+        f"DEPRECATED: a '{purpose}' call was authorised by the shared webhook token. Store a token of its own "
+        f"in the secret slot '{PURPOSE_TOKEN_KEYS[purpose]}' (documentation.md → Webhook-Tokens); from then on "
+        "only that token is accepted for this purpose.")
+
+
+async def token_modes() -> dict:
+    """``{purpose: "dedicated" | "shared" | "unconfigured"}`` — for the plugin health."""
+    try:
+        shared, dedicated = await _load_tokens()
+    except Exception:
+        return {purpose: "unknown" for purpose in PURPOSE_TOKEN_KEYS}
+    return {purpose: (MODE_DEDICATED if dedicated.get(purpose) else (MODE_SHARED if shared else "unconfigured"))
+            for purpose in PURPOSE_TOKEN_KEYS}
+
+
+async def _require_gitlab_token(x_gitlab_token: str | None, purpose: str | None = None, request=None) -> str:
+    """Authorise a call of a public route for ``purpose``. Returns the mode it
+    was accepted in (``dedicated`` — the purpose's own token — or ``shared``).
+    Raises 401, 429 for an address over the failure limit, 500 when no token is
+    configured at all."""
     if not _ctx:
         raise HTTPException(status_code=500, detail="API Context not initialized")
-    expected_token = _ctx.get_secret("gitlab_webhook_token")
-    if not expected_token:
+    shared, dedicated = await _load_tokens()
+    expected, mode = _accepted_token(purpose, shared, dedicated)
+    address, now = _source_address(request), time.monotonic()
+    throttled = _failures_in_window(address, now) >= _FAIL_LIMIT
+    if not _token_matches(x_gitlab_token, expected) \
+            and now - _token_cache["forced_at"] >= _TOKEN_REFRESH_MIN_SECONDS:
+        # Unknown or changed? One fresh read at most every few seconds (for the
+        # whole instance, whoever asks) — so a token rotated on another instance
+        # is accepted quickly, also from an address that is over its failure limit.
+        _token_cache["forced_at"] = now
+        shared, dedicated = await _load_tokens(force=True)
+        expected, mode = _accepted_token(purpose, shared, dedicated)
+    if _token_matches(x_gitlab_token, expected):
+        if mode == MODE_SHARED and purpose in PURPOSE_TOKEN_KEYS:
+            _warn_shared_token(purpose)
+        return mode
+    if not expected:
         _ctx.log.error("SECURITY HALT: Webhook token missing in Vault.")
         raise HTTPException(status_code=500, detail="Configuration Error")
-    if not x_gitlab_token or not hmac.compare_digest(x_gitlab_token, expected_token):
-        _ctx.log.warning("SECURITY REJECTION: Unauthorized webhook attempt.")
-        raise HTTPException(status_code=401, detail="Unauthorized")
+    webhook_auth_failures["count"] += 1
+    webhook_auth_failures["last_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    if throttled:
+        retry_after = max(1, int(_FAIL_WINDOW_SECONDS - (now - _failures_by_address[address][0])) + 1)
+        raise HTTPException(status_code=429, detail="Too many rejected calls from this address",
+                            headers={"Retry-After": str(retry_after)})
+    _record_failure(address, now)
+    if _failures_in_window(address, now) >= _FAIL_LIMIT:
+        _ctx.log.warning(f"SECURITY REJECTION: {_FAIL_LIMIT} unauthorized webhook attempts from {address} within "
+                         f"{int(_FAIL_WINDOW_SECONDS)}s — further rejected calls from it get 429.")
+    else:
+        _ctx.log.warning(f"SECURITY REJECTION: Unauthorized webhook attempt ({purpose or 'token'} route, {address}).")
+    raise HTTPException(status_code=401, detail="Unauthorized")
 
 
 def _resolve_stream_identity(token: str | None):
@@ -131,20 +364,6 @@ def _resolve_stream_identity(token: str | None):
         return None
 
 
-def _validate_stream_token(token: str | None, permission: str = "api:read") -> bool:
-    """Validate a stream/raw-log ``?token=`` and enforce a permission scope.
-
-    Mirrors the authorization the rest of the API enforces via
-    ``require_permission`` — a syntactically valid key is not enough; the resolved
-    identity must also be *granted* ``permission`` (``api:read`` by default). This
-    closes the gap where any low-privilege key could stream live state or download
-    raw logs that the equivalent ``require_permission("api:read")`` REST route
-    would deny.
-    """
-    identity = _resolve_stream_identity(token)
-    return identity is not None and identity.allows(permission)
-
-
 # ── Short-lived stream tickets ───────────────────────────────────────────────
 # Signing key for stream tickets. Derived from STORAGE_SECRET so a ticket minted
 # on one cluster instance validates on every other one (the load balancer may
@@ -162,56 +381,80 @@ def _stream_ticket_key() -> bytes:
 
 _STREAM_TICKET_KEY = _stream_ticket_key()
 _STREAM_TICKET_TTL = 60  # seconds
+#: Ticket scopes: ``api:read`` = the job stream (status, progress); ``logs`` = job
+#: output (log lines in the stream, raw log download) — needs PERM_LOGS.
+SCOPE_READ = "api:read"
+SCOPE_LOGS = "logs"
 
 
-def issue_stream_ticket(permission: str = "api:read") -> str:
+def issue_stream_ticket(permission: str = "api:read", *, logs: bool = False) -> str:
     """Mint a short-lived, signed ticket authorizing a stream/raw-log read.
 
     Minted only after the caller has already passed ``require_permission`` on the
-    authed endpoint, so the granted scope is baked into the ticket. EventSource
-    and browser tab/download requests then present this opaque ticket as
-    ``?ticket=`` instead of the long-lived bearer token, keeping the real
-    credential out of URLs, reverse-proxy access logs and browser history.
+    authed endpoint, so the granted scopes are baked into the ticket (``logs``
+    only for a caller holding the log permission). EventSource and browser
+    tab/download requests then present this opaque ticket as ``?ticket=`` instead
+    of the long-lived bearer token, keeping the real credential out of URLs,
+    reverse-proxy access logs and browser history.
     """
     import base64
     exp = int(time.time()) + _STREAM_TICKET_TTL
-    body = f"{exp}:{permission}"
+    scopes = permission + (f"+{SCOPE_LOGS}" if logs else "")
+    body = f"{exp}:{scopes}"
     sig = hmac.new(_STREAM_TICKET_KEY, body.encode(), "sha256").hexdigest()
     return base64.urlsafe_b64encode(f"{body}:{sig}".encode()).decode()
 
 
-def _validate_stream_ticket(ticket: str | None, permission: str = "api:read") -> bool:
-    """Constant-time verify a stream ticket and check it is unexpired and in-scope."""
+def _ticket_scopes(ticket: str | None) -> set[str]:
+    """Scopes of a valid, unexpired ticket (constant-time signature check); empty
+    for anything else."""
     if not ticket:
-        return False
+        return set()
     try:
         import base64
         raw = base64.urlsafe_b64decode(ticket.encode()).decode()
         # Split from the right once to isolate the sig, then split from the left
-        # once for exp — the permission may itself contain colons (e.g. "api:read").
+        # once for exp — the scope string itself contains colons ("api:read").
         body, sig = raw.rsplit(":", 1)
-        exp_s, perm = body.split(":", 1)
+        exp_s, scopes = body.split(":", 1)
         expected = hmac.new(_STREAM_TICKET_KEY, body.encode(), "sha256").hexdigest()
-        if not hmac.compare_digest(sig, expected):
-            return False
+        if not hmac.compare_digest(sig.encode("utf-8", "replace"), expected.encode()):
+            return set()
         if int(exp_s) < int(time.time()):
-            return False
-        return perm == permission
+            return set()
+        return {part for part in scopes.split("+") if part}
     except Exception:
-        return False
+        return set()
+
+
+def _validate_stream_ticket(ticket: str | None, permission: str = "api:read") -> bool:
+    """Is ``ticket`` valid and does it carry scope ``permission``?"""
+    return permission in _ticket_scopes(ticket)
+
+
+def _stream_access(token: str | None, ticket: str | None) -> tuple[bool, bool]:
+    """``(may_read, may_see_logs)`` for a stream/raw-log request.
+
+    A short-lived ticket (preferred — the React client mints one via
+    ``POST /stream/ticket``) carries its scopes; the bearer-token path is kept for
+    non-browser callers and resolves both permissions from the identity.
+    """
+    scopes = _ticket_scopes(ticket)
+    if SCOPE_READ in scopes:
+        return True, SCOPE_LOGS in scopes
+    identity = _resolve_stream_identity(token)
+    if identity is None:
+        return False, False
+    try:
+        return bool(identity.allows("api:read")), bool(identity.allows(PERM_LOGS))
+    except Exception:
+        return False, False
 
 
 def _authorize_stream_request(token: str | None, ticket: str | None,
                               permission: str = "api:read") -> bool:
-    """Accept either a short-lived stream ticket (preferred) or a bearer token.
-
-    The React client now mints a ticket via ``POST /stream/ticket`` and passes it
-    as ``?ticket=``; the bearer-token path is retained for non-browser/API callers
-    that cannot pre-mint a ticket. Both paths enforce ``permission``.
-    """
-    if _validate_stream_ticket(ticket, permission):
-        return True
-    return _validate_stream_token(token, permission)
+    """Compatibility wrapper: may the caller read the job stream?"""
+    return _stream_access(token, ticket)[0]
 
 
 def _prune_recent_events(now: float):
@@ -519,6 +762,9 @@ def publish_repo_snapshots() -> dict:
         ("assignments", _load_assignments_from_disk),
         ("terraform_hosts", _collect_terraform_hosts_from_disk),
         ("inventory_hosts", lambda: sorted(_load_generated_inventory_hosts())),
+        # Branch → target policy of the catalog (audit OS-05): instances without a
+        # checkout judge a trigger's branch by it.
+        ("branch_policy", lambda: branch_policy.load(_engine.config.git_repos_dir) or {}),
     ):
         try:
             items = loader()
@@ -531,23 +777,39 @@ def publish_repo_snapshots() -> dict:
 
 # ── Handler logic (router-agnostic) ─────────────────────────────────────────
 
+_HEALTH_TTL_SECONDS = 5.0
+_health_cache: dict = {"at": 0.0, "value": None}
+
+
 async def do_health():
-    """Returns a lightweight health snapshot for the orchestrator plugin."""
+    """Public liveness snapshot (``GET /api/iac/health``, no authentication).
+
+    Minimal on purpose and cheap for the instance (audit OS-11): no version, no
+    instance id, no queue depth for anonymous callers; built off the event loop
+    and cached for a few seconds, so hammering it costs nothing. The detailed
+    health is the authenticated plugin health of the core.
+    """
     if not _ctx or not _engine:
         raise HTTPException(status_code=503, detail="Orchestrator not initialized")
-    live = _live_summary()
-    return {
-        "status": "healthy",
-        "version": getattr(_ctx.manifest, "version", "unknown"),
-        "db_connected": bool(getattr(_engine.db, "engine", None)),
-        "vault_ready": _ctx.get_secret("iac_auto_apply") is not None,
-        "active_workers": len(live.get("active_tasks") or {}),
-        "queued_jobs": live.get("queued", 0),
-        "scheduled_jobs": live.get("scheduled", 0),
-        "runner_online": bool(_service.runner_online()) if _service else True,
-        "is_runner": bool(_service.is_runner) if _service else True,
-        "instance_id": getattr(_ctx, "instance_id", None),
-    }
+    now = time.monotonic()
+    if _health_cache["value"] is not None and now - _health_cache["at"] < _HEALTH_TTL_SECONDS:
+        return _health_cache["value"]
+
+    def _probe() -> dict:
+        db_ok = True
+        try:
+            _engine.db.get_recent_jobs(1)
+        except Exception:
+            db_ok = False
+        return {
+            "status": "healthy" if db_ok else "degraded",
+            "db_connected": db_ok,
+            "runner_online": bool(_service.runner_online()) if _service else True,
+        }
+
+    value = await off_loop(_probe)
+    _health_cache.update(at=time.monotonic(), value=value)
+    return value
 
 
 async def do_gitlab_webhook(request: Request, x_gitlab_token: str | None):
@@ -555,12 +817,24 @@ async def do_gitlab_webhook(request: Request, x_gitlab_token: str | None):
     if not _ctx:
         raise HTTPException(status_code=500, detail="API Context not initialized")
 
-    _require_gitlab_token(x_gitlab_token)
+    mode = await _require_gitlab_token(x_gitlab_token, PURPOSE_HOOK, request)
 
     try:
         payload = await request.json()
         project_name = payload.get("project", {}).get("name", "unknown")
         _ctx.log.info(f"WEBHOOK: Verified push for project '{project_name}'.")
+        if mode == MODE_DEDICATED and str(payload.get("object_kind") or "").lower() == "pipeline":
+            # The dedicated hook token is for what the group hooks really send:
+            # merge request events (gitlab_webhooks registers them with
+            # pipeline_events/push_events/job_events off). A ``pipeline`` body on
+            # this route is hand-built — it could start a deploy, which is the
+            # service CI's job with its own token. 200, so a hook that does send
+            # one is not disabled by GitLab; nothing is triggered or announced.
+            _ctx.log.warning(f"WEBHOOK: pipeline event for '{project_name}' ignored — the hook token does not "
+                             "trigger deployments.")
+            return {"status": "accepted", "triggered": False,
+                    "reason": "pipeline events are not accepted with the hook token; deployments are triggered "
+                              "by the service CI"}
 
         now = time.time()
         _prune_recent_events(now)
@@ -584,10 +858,20 @@ async def do_gitlab_webhook(request: Request, x_gitlab_token: str | None):
             )
             return {"status": "accepted", "triggered": False, "reason": event_reason}
 
-        _ctx.emit("iac:webhook_verified", event_payload)
-        _emit_webhook_verified(event_payload)
-
-        return {"status": "accepted", "triggered": True, "reason": f"{reason}; {event_reason}"}
+        try:
+            result = await _submit(event_payload, ENT_TRIGGER)
+        except HTTPException as exc:
+            if exc.status_code != 400:
+                raise
+            # A refused event (e.g. a pipeline of a branch that may not be
+            # deployed, audit OS-05) is still a delivered hook: 200, not triggered.
+            _ctx.log.warning(f"WEBHOOK: event not triggered — {exc.detail}")
+            return {"status": "accepted", "triggered": False, "reason": str(exc.detail)}
+        # Always 200 for GitLab (a hook that answers 4xx gets disabled); whether a
+        # job runs the event is in ``triggered`` / ``outcome``.
+        return {"status": "accepted", "triggered": result.queued,
+                "reason": f"{reason}; {event_reason}" if result.queued else result.describe(""),
+                **{k: v for k, v in result.as_dict().items() if k != "reason"}}
     except HTTPException:
         raise
     except Exception as e:
@@ -595,14 +879,14 @@ async def do_gitlab_webhook(request: Request, x_gitlab_token: str | None):
         raise HTTPException(status_code=400, detail="Malformed JSON payload")
 
 
-async def do_sync_webhooks(x_gitlab_token: str | None):
+async def do_sync_webhooks(x_gitlab_token: str | None, request=None):
     """Token-protected, idempotent re-registration of the group webhooks."""
     if not _ctx:
         raise HTTPException(status_code=500, detail="API Context not initialized")
-    _require_gitlab_token(x_gitlab_token)
+    await _require_gitlab_token(x_gitlab_token, PURPOSE_CONTROLLER_CI, request)
     from .gitlab_webhooks import sync_group_webhooks_from_ctx, WebhookConfigError
     try:
-        result = await asyncio.to_thread(sync_group_webhooks_from_ctx, _ctx)
+        result = await off_loop(sync_group_webhooks_from_ctx, _ctx)
     except WebhookConfigError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
@@ -620,7 +904,10 @@ def _read_catalog_from_disk() -> list:
     if catalog_file.exists():
         with open(catalog_file, 'r') as f:
             data = yaml.safe_load(f) or {}
-            return data.get("service_catalog", {}).get("services", []) or []
+            # Allowlisted fields only: the result is stored as a snapshot and
+            # served to every reader — never pass raw SSoT entries through.
+            entries = (data.get("service_catalog") or {}).get("services") or []
+            return [e for e in (public_catalog_entry(x) for x in entries) if e]
     return []
 
 
@@ -633,7 +920,8 @@ async def do_get_catalog():
     return _snapshot_items("catalog") or []
 
 
-async def do_trigger_service_deployment(service_name: str, payload: DeployRequest, *, trigger: str = "ui"):
+async def do_trigger_service_deployment(service_name: str, payload: DeployRequest, *, trigger: str = "ui",
+                                        identity=None, prod_only: bool = False):
     """Triggers a targeted single-service deployment.
 
     ``trigger`` tells the maintenance policy stage where the deploy comes from:
@@ -645,6 +933,21 @@ async def do_trigger_service_deployment(service_name: str, payload: DeployReques
         raise HTTPException(status_code=500, detail="Context offline")
     normalized_service = str(service_name or "").strip().lower()
     branch = str(payload.branch or "main").strip() or "main"
+    require_prod = False
+    if prod_only:
+        # The dedicated service-CI token deploys the catalog's production branch
+        # of the service and nothing else (audit OS-04/OS-05): the branch in the
+        # body is not a choice the token holder has. Without a policy on this
+        # instance yet, the runner enforces it (``require_prod_branch``).
+        policy = await off_loop(_service.branch_policy) if _service is not None else None
+        if policy:
+            forced = branch_policy.prod_branch(policy, normalized_service)
+            if forced != branch:
+                _ctx.log.info(f"API: service-CI trigger for '{normalized_service}' asked for branch '{branch}' — "
+                              f"deploying the production branch '{forced}'.")
+            branch = forced
+        else:
+            require_prod = True
     if not _is_safe_git_ref_token(normalized_service):
         raise HTTPException(
             status_code=400,
@@ -670,11 +973,11 @@ async def do_trigger_service_deployment(service_name: str, payload: DeployReques
     }
     if payload.dry_run:
         event_payload["dry_run"] = True
-    _ctx.emit("iac:webhook_verified", event_payload)
-    _emit_webhook_verified(event_payload)
+    if require_prod:
+        event_payload["require_prod_branch"] = True
+    result = await _submit(event_payload, ENT_TRIGGER, actor=_actor(identity))
     kind = "Dry-run (--check)" if payload.dry_run else "Deployment"
-    return {"status": "accepted", "dry_run": bool(payload.dry_run),
-            "message": f"{kind} queued for {normalized_service}"}
+    return _trigger_response(result, f"{kind} queued for {normalized_service}", dry_run=bool(payload.dry_run))
 
 
 def map_service_status(job: dict | None, *, accept: str | None = None) -> dict:
@@ -718,7 +1021,8 @@ async def do_get_service_status(service_name: str, since_epoch: int = 0, accept:
         raise HTTPException(status_code=500, detail="Engine offline")
     normalized_service = str(service_name or "").strip().lower()
     pipeline_type = f"single_service:{normalized_service}"
-    job = _engine.db.get_latest_job_for_pipeline_type(pipeline_type, since_epoch=since_epoch)
+    # Polled every 10 s by each running CI job — never on the event loop.
+    job = await off_loop(_engine.db.get_latest_job_for_pipeline_type, pipeline_type, since_epoch)
     if not job:
         return {
             "status": "pending",
@@ -757,7 +1061,7 @@ async def do_list_schedules():
     """Parked (SCHEDULED) deploys waiting for their maintenance window."""
     if not _service:
         raise HTTPException(status_code=503, detail="Orchestrator not initialized")
-    rows = await asyncio.to_thread(_service.queue.scheduled_jobs)
+    rows = await off_loop(_service.queue.scheduled_jobs)
     for r in rows:
         r["not_before"] = _iso(r.get("not_before"))
         r["start_time"] = _iso(r.get("start_time"))
@@ -769,7 +1073,7 @@ async def do_run_schedule_now(job_id: int):
     The maintenance override is announced when the job actually runs."""
     if not _service:
         raise HTTPException(status_code=503, detail="Orchestrator not initialized")
-    ok = await asyncio.to_thread(_service.promote_scheduled, int(job_id))
+    ok = await off_loop(_service.promote_scheduled, int(job_id))
     if not ok:
         raise HTTPException(status_code=404, detail=f"Job #{job_id} is not a scheduled deployment")
     return {"status": "ok", "job_id": int(job_id), "message": f"Scheduled job #{job_id} queued to run now"}
@@ -779,7 +1083,7 @@ async def do_cancel_schedule(job_id: int):
     """Cancel a parked deploy (SCHEDULED → ABORTED)."""
     if not _service:
         raise HTTPException(status_code=503, detail="Orchestrator not initialized")
-    ok = await asyncio.to_thread(_service.queue.abort_scheduled, int(job_id))
+    ok = await off_loop(_service.queue.abort_scheduled, int(job_id))
     if not ok:
         raise HTTPException(status_code=404, detail=f"Job #{job_id} is not a scheduled deployment")
     return {"status": "ok", "job_id": int(job_id), "message": f"Scheduled job #{job_id} cancelled"}
@@ -830,7 +1134,7 @@ async def do_maintenance_windows(site: str | None = None, stage: str | None = No
         raise HTTPException(status_code=500, detail="Engine offline")
     from core.api import maintenance as _mw
 
-    snap = await asyncio.to_thread(_maintenance_snapshot)
+    snap = await off_loop(_maintenance_snapshot)
     items = [it for it in (snap.get("items") or []) if isinstance(it, dict)]
     term = str(q or "").strip().lower()
     if site:
@@ -842,7 +1146,7 @@ async def do_maintenance_windows(site: str | None = None, stage: str | None = No
     if term:
         items = [it for it in items if term in str(it.get("name") or "").lower()
                  or term in str(it.get("host") or "").lower()]
-    overrides = await asyncio.to_thread(_running_overrides)
+    overrides = await off_loop(_running_overrides)
     now = _mw.utcnow()
     horizon = int(_engine.config.maintenance_schedule_horizon_days)
     out = []
@@ -867,7 +1171,7 @@ async def do_maintenance_default():
     (decision C — changed in the iac-controller repo, never from here)."""
     if not _engine:
         raise HTTPException(status_code=500, detail="Engine offline")
-    snap = await asyncio.to_thread(_maintenance_snapshot)
+    snap = await off_loop(_maintenance_snapshot)
     return {
         "defaults": [d for d in (snap.get("defaults") or []) if isinstance(d, dict)],
         "published_at": snap.get("published_at"),
@@ -877,10 +1181,11 @@ async def do_maintenance_default():
     }
 
 
-async def do_trigger_test_host_deployment(host_name: str, payload: TestHostDeployRequest):
+async def do_trigger_test_host_deployment(host_name: str, payload: TestHostDeployRequest, identity=None):
     """Triggers a guarded host_provision run for exactly one allow-listed host."""
     if not _ctx or not _engine:
         raise HTTPException(status_code=500, detail="Orchestrator offline")
+    _require_infra_apply(identity, "host_provision")
 
     host = str(host_name or "").strip()
     if not host or not _HOST_LIMIT_PATTERN.fullmatch(host):
@@ -916,17 +1221,14 @@ async def do_trigger_test_host_deployment(host_name: str, payload: TestHostDeplo
         "trigger": "manual_test_host",
         "test_host": host,
     }
-    _ctx.emit("iac:webhook_verified", event_payload)
-    _emit_webhook_verified(event_payload)
-    return {
-        "status": "accepted",
-        "message": f"Host provisioning queued for host '{host}'.",
-        "host_name": host,
-        "services": [str(s).strip() for s in (payload.services or []) if str(s).strip()],
-    }
+    result = await _submit(event_payload, ENT_TRIGGER, actor=_actor(identity))
+    return _trigger_response(
+        result, f"Host provisioning queued for host '{host}'.", host_name=host,
+        services=[str(s).strip() for s in (payload.services or []) if str(s).strip()],
+    )
 
 
-async def do_trigger_host_bootstrap(host_name: str, payload: TestHostDeployRequest):
+async def do_trigger_host_bootstrap(host_name: str, payload: TestHostDeployRequest, identity=None):
     """Triggers a guarded compliance/bootstrap run for exactly one allow-listed host."""
     if not _ctx or not _engine:
         raise HTTPException(status_code=500, detail="Orchestrator offline")
@@ -964,26 +1266,40 @@ async def do_trigger_host_bootstrap(host_name: str, payload: TestHostDeployReque
         "manual": True,
         "trigger": "manual_bootstrap",
     }
-    _ctx.emit("iac:webhook_verified", event_payload)
-    _emit_webhook_verified(event_payload)
-    return {
-        "status": "accepted",
-        "message": f"Compliance bootstrap queued for host '{host}'.",
-        "host_name": host,
-    }
+    result = await _submit(event_payload, ENT_TRIGGER, actor=_actor(identity))
+    return _trigger_response(result, f"Compliance bootstrap queued for host '{host}'.", host_name=host)
 
 
-async def do_trigger_infra_plan():
+async def do_trigger_infra_plan(identity=None):
     """Triggers a read-only whole-infrastructure Terraform plan ("Check Env")."""
     if not _ctx:
         raise HTTPException(status_code=500, detail="Context offline")
     infra_plan_payload = {"pipeline_type": "infra_plan", "manual": True, "trigger": "manual_infra_plan"}
-    _ctx.emit("iac:webhook_verified", infra_plan_payload)
-    _emit_webhook_verified(infra_plan_payload)
-    return {"status": "accepted", "message": "Infrastructure plan (Check Env) queued."}
+    result = await _submit(infra_plan_payload, ENT_TRIGGER, actor=_actor(identity))
+    return _trigger_response(result, "Infrastructure plan (Check Env) queued.")
 
 
-async def do_trigger_infra_apply():
+async def do_trigger_infra_apply_by_token(x_gitlab_token: str | None, request=None):
+    """``POST /api/iac/infra/apply/gitlab``: fleet apply for a token holder.
+
+    Disabled unless ``token_infra_apply_enabled`` is set (audit OS-03): the one
+    static webhook token sits in every project hook and CI variable, and no CI
+    pipeline calls this route — the reviewed path is plan → approve in the
+    dashboard. Checked before the token so a disabled route costs nothing.
+    """
+    if not _ctx or not _engine:
+        raise HTTPException(status_code=500, detail="Context offline")
+    enabled = await off_loop(lambda: bool(_engine.config.token_infra_apply_enabled))
+    if not enabled:
+        raise HTTPException(
+            status_code=404,
+            detail="Token-triggered infrastructure apply is disabled (setting token_infra_apply_enabled).",
+        )
+    await _require_gitlab_token(x_gitlab_token, PURPOSE_CONTROLLER_CI, request)
+    return await do_trigger_infra_apply()
+
+
+async def do_trigger_infra_apply(identity=None):
     """Triggers a whole-infrastructure Terraform apply ("Deploy Infra")."""
     if not _ctx:
         raise HTTPException(status_code=500, detail="Context offline")
@@ -993,9 +1309,9 @@ async def do_trigger_infra_apply():
         "manual": True,
         "trigger": "manual_infra_apply",
     }
-    _ctx.emit("iac:webhook_verified", infra_apply_payload)
-    _emit_webhook_verified(infra_apply_payload)
-    return {"status": "accepted", "message": "Infrastructure deploy queued."}
+    # Only the two apply routes (permission api:infra_apply) may set ``approve``.
+    result = await _submit(infra_apply_payload, ENT_TRIGGER, ENT_APPROVE, actor=_actor(identity))
+    return _trigger_response(result, "Infrastructure deploy queued.")
 
 
 # ── Pending infra plan (review-and-approve flow) ────────────────────────────
@@ -1007,7 +1323,7 @@ async def do_get_pending_plan():
     """Returns the pending infra plan awaiting operator approval (if any)."""
     if not _engine:
         raise HTTPException(status_code=503, detail="Orchestrator not initialized")
-    record = await asyncio.to_thread(_engine.db.get_state, "pending_infra_plan")
+    record = await off_loop(_engine.db.get_state, "pending_infra_plan")
     data = (record or {}).get("data") or {}
     if not data.get("envs"):
         return {"pending": False}
@@ -1016,46 +1332,71 @@ async def do_get_pending_plan():
         "job_id": data.get("job_id"),
         "planned_at": data.get("planned_at"),
         "envs": data.get("envs") or {},
+        # What an approval is bound to (audit OS-12). ``approvable`` is False for a
+        # plan recorded without the controller commit: plan again before approving.
+        "controller_sha": data.get("controller_sha") or None,
+        "approvable": plan_binding.approval_payload(data) is not None,
     }
 
 
-async def do_apply_pending_plan():
+async def do_apply_pending_plan(identity=None):
     """Approves the pending plan: triggers the fleet apply (approve=True)."""
     if not _ctx or not _engine:
         raise HTTPException(status_code=503, detail="Orchestrator not initialized")
-    record = await asyncio.to_thread(_engine.db.get_state, "pending_infra_plan")
+    record = await off_loop(_engine.db.get_state, "pending_infra_plan")
     data = (record or {}).get("data") or {}
     if not data.get("envs"):
         raise HTTPException(status_code=409, detail="No pending infrastructure plan to apply")
-    payload = {
-        "pipeline_type": "infra_apply",
-        "approve": True,
-        "manual": True,
-        "trigger": "pending_plan_approval",
-        "plan_job_id": data.get("job_id"),
-    }
-    _ctx.emit("iac:webhook_verified", payload)
-    _emit_webhook_verified(payload)
-    return {
-        "status": "accepted",
-        "message": "Approved — infrastructure deploy queued.",
-        "plan_job_id": data.get("job_id"),
-    }
+    # The approval names the plan that was reviewed — controller commit and a
+    # fingerprint per environment. The runner applies that plan or nothing
+    # (audit OS-12: it used to apply whatever the controller was by then).
+    payload = plan_binding.approval_payload(data)
+    if payload is None:
+        raise HTTPException(
+            status_code=409,
+            detail="The pending plan does not record the iac-controller commit it was made from (it was created "
+                   "by an older plugin version) and cannot be approved. Run Check Env again and approve that plan.")
+    result = await _submit(payload, ENT_TRIGGER, ENT_APPROVE, actor=_actor(identity))
+    return _trigger_response(result, "Approved — infrastructure deploy queued.", plan_job_id=data.get("job_id"),
+                             plan_controller_sha=payload["plan_controller_sha"])
 
 
 async def do_dismiss_pending_plan():
     """Dismisses the pending plan without applying it."""
     if not _engine:
         raise HTTPException(status_code=503, detail="Orchestrator not initialized")
-    await asyncio.to_thread(_engine.db.update_state, "pending_infra_plan", {}, "latest")
+    await off_loop(_engine.db.update_state, "pending_infra_plan", {}, "latest")
     return {"status": "ok"}
+
+
+#: Upper bounds of the list/tail parameters (a reader must not be able to make the
+#: instance load an arbitrary amount of rows).
+_JOBS_LIMIT_MAX = 500
+_LOG_TAIL_MAX = 5000
+
+
+def _with_wait_hints(jobs: list, runner_state: str) -> list:
+    """QUEUED jobs say what they are waiting for while no runner executes them —
+    instead of looking like a job that hangs at 0 % ("Queued by gitlab-ci")."""
+    if runner_state not in ("absent", "restarting"):
+        return jobs
+    hint = "Waiting for runner (restarting)" if runner_state == "restarting" else "Waiting for runner — none online"
+    out = []
+    for job in jobs:
+        if isinstance(job, dict) and job.get("status") == "QUEUED":
+            job = {**job, "waiting_for": "runner",
+                   "current_step": f"{hint} · {job.get('current_step') or 'Queued'}"[:250]}
+        out.append(job)
+    return out
 
 
 async def do_list_jobs(limit: int = 20):
     """Returns a list of recent and active jobs."""
     if not _engine:
         raise HTTPException(status_code=500, detail="Engine offline")
-    return _engine.db.get_recent_jobs(limit)
+    limit = max(1, min(int(limit or 20), _JOBS_LIMIT_MAX))
+    jobs = await off_loop(_engine.db.get_recent_jobs, limit)
+    return _with_wait_hints(jobs, _service.runner_state()) if _service else jobs
 
 
 # Default amount of trailing log to seed an offset=0 tail request with, so the UI
@@ -1091,6 +1432,7 @@ async def do_job_logs(
     """
     if not _engine:
         raise HTTPException(status_code=500, detail="Engine offline")
+    tail = max(1, min(int(tail or 200), _LOG_TAIL_MAX))
 
     # Cluster: the executing runner streams every line into the shared database;
     # serve from there first so any instance can answer, regardless of which host
@@ -1098,11 +1440,11 @@ async def do_job_logs(
     queue = getattr(_service, "queue", None)
     if queue is not None:
         try:
-            has_db_log = await asyncio.to_thread(queue.has_log, job_id)
+            has_db_log = await off_loop(queue.has_log, job_id)
         except Exception:
             has_db_log = False
         if has_db_log:
-            res = await asyncio.to_thread(
+            res = await off_loop(
                 queue.read_log, job_id, offset=offset, tail=max(1, tail or 600), grep=grep, grep_max=_LOG_GREP_MAX,
             )
             return {
@@ -1209,7 +1551,7 @@ async def do_job_log_raw(job_id: int, download: bool = False):
 
     # Shared database log (cluster): stream it in chunks from whichever instance answers.
     queue = getattr(_service, "queue", None)
-    if queue is not None and await asyncio.to_thread(queue.has_log, job_id):
+    if queue is not None and await off_loop(queue.has_log, job_id):
         def _iter():
             for line in queue.iter_log(job_id):
                 yield line + "\n"
@@ -1244,27 +1586,30 @@ def _live_summary() -> dict:
     return summary
 
 
-async def do_job_runners(job_id: int):
-    """Return the runner tasks attributed to a job (shared DB snapshot, local state on the runner)."""
+async def do_job_runners(job_id: int, include_logs: bool = True):
+    """Return the runner tasks attributed to a job (shared DB snapshot, local state on the runner).
+    ``include_logs=False`` (caller without the log permission) strips the log tails."""
     if not _engine:
         raise HTTPException(status_code=500, detail="Engine offline")
     runners: dict = {}
     queue = getattr(_service, "queue", None)
     if queue is not None:
         try:
-            runners = await asyncio.to_thread(queue.runners_for, job_id)
+            runners = await off_loop(queue.runners_for, job_id)
         except Exception:
             runners = {}
     active = (_engine.state or {}).get("active_tasks", {}) or {}
     for name, data in active.items():
         if isinstance(data, dict) and data.get("job_id") == job_id:
             runners[name] = data
-    return {"job_id": job_id, "runners": runners}
+    if not include_logs:
+        runners = _without_logs(runners)
+    return {"job_id": job_id, "runners": runners, "logs_included": bool(include_logs)}
 
 
 # ── Generic operation trigger / abort ───────────────────────────────────────
 
-async def do_run_pipeline(payload: PipelineRequest):
+async def do_run_pipeline(payload: PipelineRequest, identity=None):
     """Generic operation trigger replacing the ~10 NiceGUI global/site/host buttons.
 
     Ports the exact path those handlers use: emit ``iac:webhook_verified`` with the
@@ -1291,6 +1636,8 @@ async def do_run_pipeline(payload: PipelineRequest):
         raise HTTPException(status_code=400, detail="Invalid host_name token.")
     if limit and not _HOST_LIMIT_PATTERN.fullmatch(limit):
         raise HTTPException(status_code=400, detail="Invalid limit token.")
+    if pipeline_type in _APPLY_CAPABLE_TYPES and not payload.dry_run:
+        _require_infra_apply(identity, pipeline_type)
 
     event_payload: dict = {"pipeline_type": pipeline_type, "manual": True, "trigger": "ui_pipeline"}
     if limit:
@@ -1300,18 +1647,35 @@ async def do_run_pipeline(payload: PipelineRequest):
     if payload.dry_run:
         event_payload["dry_run"] = True
 
-    _ctx.emit("iac:webhook_verified", event_payload)
-    _emit_webhook_verified(event_payload)
+    result = await _submit(event_payload, ENT_TRIGGER, actor=_actor(identity))
     target = host or limit
     suffix = " (dry-run, --check)" if payload.dry_run else ""
-    return {
-        "status": "accepted",
-        "message": f"Pipeline '{pipeline_type}' queued for '{target}'{suffix}.",
-        "dry_run": bool(payload.dry_run),
-        "pipeline_type": pipeline_type,
-        "limit": limit or None,
-        "host_name": host or None,
-    }
+    return _trigger_response(
+        result, f"Pipeline '{pipeline_type}' queued for '{target}'{suffix}.",
+        dry_run=bool(payload.dry_run), pipeline_type=pipeline_type, limit=limit or None, host_name=host or None,
+    )
+
+
+def _close_aborted_row(job_id: int) -> None:
+    """ABORTED for a RUNNING job nobody executes any more (sync: thread)."""
+    if _engine.db.update_job(job_id, "ABORTED"):
+        _engine.db.update_progress(job_id, progress=None, current_step="Aborted by User")
+    _engine.end_override_for(job_id)  # maintenance override of a dead runner's job
+
+
+def _forget_stopped_tasks(state: dict, stopped_job_ids) -> None:
+    """Remove the in-memory runner tasks of ``stopped_job_ids`` (and entries that
+    belong to no job) from ``state["active_tasks"]``; everything else stays."""
+    stopped = {int(j) for j in stopped_job_ids}
+    tasks = state.get("active_tasks")
+    if not isinstance(tasks, dict):
+        tasks = state["active_tasks"] = {}
+    for name in list(tasks):
+        task = tasks[name]
+        job_id = task.get("job_id") if isinstance(task, dict) else None
+        if not job_id or job_id == -1 or job_id in stopped:
+            tasks.pop(name, None)
+    state["is_running"] = bool(tasks) or int(state.get("running_jobs") or 0) > 0
 
 
 async def do_abort():
@@ -1331,7 +1695,7 @@ async def do_abort():
     # 1. Nothing executes a QUEUED job yet — close those rows directly.
     if queue is not None:
         try:
-            aborted.extend(await asyncio.to_thread(queue.abort_queued))
+            aborted.extend(await off_loop(queue.abort_queued))
         except Exception as exc:
             _ctx.log.debug(f"ABORT: abort_queued failed: {exc}")
 
@@ -1339,7 +1703,7 @@ async def do_abort():
     #    containers. Ask every instance (cluster bus; the local bus delivers to this
     #    process too), and close rows whose owner is no longer alive ourselves.
     try:
-        running = await asyncio.to_thread(queue.running_jobs) if queue is not None else [
+        running = await off_loop(queue.running_jobs) if queue is not None else [
             {"id": getattr(j, "id", None), "owner_instance": getattr(j, "owner_instance", None)}
             for j in _engine.db.get_jobs_by_status("RUNNING")
         ]
@@ -1351,7 +1715,9 @@ async def do_abort():
             _ctx.emit("iac:job_abort_requested", {"job_ids": running_ids}, cluster=True)
         except TypeError:
             _ctx.emit("iac:job_abort_requested", {"job_ids": running_ids})
-        await _service.on_abort_requested({"job_ids": running_ids})
+        # Jobs whose containers Docker would not stop (review C1): their abort is
+        # being retried by the runner — the row stays as it is until then.
+        unstopped = set(await _service.on_abort_requested({"job_ids": running_ids}) or [])
         alive = None
         instances = getattr(_ctx, "cluster_instances", None)
         if instances:
@@ -1364,11 +1730,15 @@ async def do_abort():
             owner = r.get("owner_instance")
             local = any(isinstance(t, dict) and t.get("job_id") == job_id
                         for t in (state.get("active_tasks") or {}).values())
+            if job_id in unstopped:
+                continue
             if local or not owner or (alive is not None and owner not in alive):
-                _engine.db.update_job(job_id, "ABORTED")
-                _engine.db.update_progress(job_id, progress=None, current_step="Aborted by User")
-                _engine.end_override_for(job_id)  # maintenance override of a dead runner's job
-        aborted.extend(running_ids)
+                # Conditional on the row still being RUNNING: a job its owner
+                # finished meanwhile keeps its result. Off the loop (database).
+                await off_loop(_close_aborted_row, job_id)
+        aborted.extend(j for j in running_ids if j not in unstopped)
+    else:
+        unstopped = set()
 
     if aborted:
         try:
@@ -1386,9 +1756,18 @@ async def do_abort():
         except Exception as exc:
             _ctx.log.debug(f"ABORT: notification failed: {exc}")
 
-    state["is_running"] = False
-    state["active_tasks"] = {}
-    return {"status": "ok", "aborted_jobs": aborted}
+    # Forget the tasks of the jobs that were stopped — and only those. This used
+    # to be ``state["active_tasks"] = {}``: on the runner that also dropped the
+    # tasks of jobs whose containers could NOT be stopped (and of a job that
+    # started meanwhile). Those tasks are what keeps such a job attended and
+    # heartbeated; without them the worker closed it as "lost track" while its
+    # containers were still running.
+    _forget_stopped_tasks(state, aborted)
+    result: dict = {"status": "ok", "aborted_jobs": aborted}
+    if unstopped:
+        # Additive field: Docker on the runner did not answer, the abort is retried.
+        result["unstopped_jobs"] = sorted(unstopped)
+    return result
 
 
 # ── Infrastructure inventory (assignments + terraform hosts) ─────────────────
@@ -1571,14 +1950,14 @@ def _collect_terraform_hosts_from_disk() -> list:
                     state = "unknown"
                     state_from_jobs = True
                 else:
-                    provider = tf.get("provider", "—")
-                    resource = tf.get("resource", tf.get("type", "—"))
-                    state = tf.get("state", "unknown")
+                    provider = public_scalar(tf.get("provider")) or "—"
+                    resource = public_scalar(tf.get("resource", tf.get("type"))) or "—"
+                    state = public_scalar(tf.get("state")) or "unknown"
                 results.append({
                     "site": site, "stage": stage, "host": host_name,
-                    "ansible_host": host_data.get("ansible_host") or host_data.get("address") or "—",
+                    "ansible_host": public_scalar(host_data.get("ansible_host") or host_data.get("address")) or "—",
                     "managed": managed, "provider": provider, "resource": resource,
-                    "workspace": tf.get("workspace", "default"), "state": state,
+                    "workspace": public_scalar(tf.get("workspace")) or "default", "state": state,
                     "_state_from_jobs": state_from_jobs,
                 })
         except (ValueError, IndexError):
@@ -1595,7 +1974,7 @@ async def do_terraform_hosts():
         raise HTTPException(status_code=500, detail="Engine offline")
     # Disk scan + job-window read (STATS_JOB_WINDOW rows) are sync — keep them off the loop.
     try:
-        return await asyncio.to_thread(_scan_terraform_hosts)
+        return await off_loop(_scan_terraform_hosts)
     except Exception as exc:
         _ctx and _ctx.log.error(f"API: terraform host scan failed: {exc}")
         raise HTTPException(status_code=500, detail="Terraform host scan failed")
@@ -1610,14 +1989,14 @@ async def do_get_stats():
     from . import stats as _stats
     # Sync DB reads + aggregation run off the event loop (window is 5000 rows now).
     try:
-        jobs = await asyncio.to_thread(_engine.db.get_jobs_for_stats, _stats.STATS_JOB_WINDOW)
+        jobs = await off_loop(_engine.db.get_jobs_for_stats, _stats.STATS_JOB_WINDOW)
     except Exception:
         jobs = []
     try:
-        tasks = await asyncio.to_thread(_engine.db.get_job_tasks_for_stats, _stats.STATS_TASK_WINDOW)
+        tasks = await off_loop(_engine.db.get_job_tasks_for_stats, _stats.STATS_TASK_WINDOW)
     except Exception:
         tasks = []
-    s = await asyncio.to_thread(_stats.compute, jobs, tasks)
+    s = await off_loop(_stats.compute, jobs, tasks)
 
     def _ser_recent(j: dict) -> dict:
         return {
@@ -1689,36 +2068,13 @@ async def do_get_settings():
     }
 
 
-async def do_save_settings(payload: SettingsRequest):
-    """Persist the orchestrator settings to Vault. Ports settings.py writes."""
+async def do_save_settings(payload: SettingsRequest, identity=None):
+    """Persist the general settings. Same validation, tiers and "only what changed"
+    rule as :func:`do_save_settings_values` (the keys are schema keys)."""
     if not _ctx or not _service:
         raise HTTPException(status_code=503, detail="Orchestrator not initialized")
-
-    if payload.auto_apply is not None:
-        _service.state["auto_apply_enabled"] = bool(payload.auto_apply)
-        _ctx.set_secret("iac_auto_apply", str(bool(payload.auto_apply)))
-    if payload.test_deploy_allowed_hosts is not None:
-        _ctx.set_secret(
-            "iac_test_deploy_allowed_hosts",
-            str(payload.test_deploy_allowed_hosts or "").strip(),
-        )
-    if payload.gitlab_url is not None:
-        _ctx.set_secret("iac_gitlab_url", str(payload.gitlab_url or "").strip())
-    if payload.group_id is not None:
-        _ctx.set_secret("iac_gitlab_group_id", str(payload.group_id or "").strip())
-    if payload.lyndrix_base_url is not None:
-        _ctx.set_secret("iac_lyndrix_base_url", str(payload.lyndrix_base_url or "").strip())
-    if payload.gitlab_token_key is not None:
-        _ctx.set_secret("iac_gitlab_api_token_key", str(payload.gitlab_token_key or "").strip())
-    if payload.autosync_enabled is not None:
-        _ctx.set_secret(
-            "iac_webhook_autosync_enabled",
-            "true" if payload.autosync_enabled else "false",
-        )
-    if payload.sync_interval is not None:
-        interval = max(300, _safe_int(payload.sync_interval, 1800))
-        _ctx.set_secret("iac_webhook_sync_interval_seconds", str(interval))
-
+    values = {k: v for k, v in payload.model_dump().items() if v is not None}
+    await _save_settings(values, identity)
     return await do_get_settings()
 
 
@@ -1739,21 +2095,92 @@ class CredentialRequest(BaseModel):
     secret: str
 
 
+class SecretSlotRequest(BaseModel):
+    value: str
+
+
 # Git credential aliases double as Vault keys, so they are constrained to a safe
-# character set and may not collide with the plugin's own security-critical
-# secrets. Any ``iac_*`` key (engine configuration) is additionally reserved.
-# Aliases become Vault KV data-dict keys, which safely allow letters, digits,
-# underscores and hyphens. Hyphens matter here because the operator's whole
-# GitLab namespace is hyphenated (e.g. "gitlab-int", "aac-template-engine"), so
-# forbidding them made natural credential names impossible to save.
+# character set (letters, digits, underscore, hyphen — the operator's GitLab
+# namespace is hyphenated) and may not be the name of anything else the plugin
+# stores: every setting/secret slot and any ``iac_*`` key is reserved
+# (settings_schema.is_valid_credential_alias — one helper for every surface).
 _CREDENTIAL_ALIAS_RE = re.compile(r"^[A-Za-z0-9_-]+$")
-_RESERVED_CREDENTIAL_KEYS = frozenset({
-    "gitlab_webhook_token",
-    "ansible_ssh_key",
-    "iac_tf_ssh_private_key",
-    "iac_token_registry",
-    "system_api_key",
-})
+
+# Permission ids behind the settings tiers. They are custom permissions on
+# purpose: the core grants ``plugin:<id>:api:write`` to every INT_USER and lets
+# the global ``api:write`` satisfy it, so "write" cannot protect anything that
+# decides which image runs with the fleet key or where tokens are sent.
+_PLUGIN_PERM = "plugin:lyndrix.plugin.iac_orchestrator:"
+PERM_SETTINGS_ADMIN = _PLUGIN_PERM + "iac:settings_admin"
+PERM_CREDENTIALS_ADMIN = _PLUGIN_PERM + "iac:credentials_admin"
+PERM_INFRA_APPLY = _PLUGIN_PERM + "api:infra_apply"
+# Job output (log lines) — its own permission: logs can contain what the tools
+# print about the managed systems, and plain api:read is every viewer (OS-07).
+PERM_LOGS = _PLUGIN_PERM + "iac:logs_read"
+_TIER_PERMISSIONS = {
+    TIER_SETTINGS: PERM_SETTINGS_ADMIN,
+    TIER_CREDENTIALS: PERM_CREDENTIALS_ADMIN,
+    TIER_INFRA_APPLY: PERM_INFRA_APPLY,
+}
+
+
+def _allowed_tiers(identity) -> set[str] | None:
+    """Settings tiers ``identity`` may change (``None`` = trusted in-process caller)."""
+    if identity is None:
+        return None
+    tiers = {TIER_OPERATOR}
+    for tier, permission in _TIER_PERMISSIONS.items():
+        try:
+            if identity.allows(permission):
+                tiers.add(tier)
+        except Exception:
+            pass
+    return tiers
+
+
+# Pipeline types whose purpose is to create or change infrastructure through
+# Terraform. Triggering them for real needs the apply permission; a dry-run
+# (plan only, enforced by the executor) stays available to every operator.
+_APPLY_CAPABLE_TYPES = frozenset({"init_host", "host_provision"})
+
+
+def _require_infra_apply(identity, what: str) -> None:
+    """403 unless ``identity`` holds the infra-apply permission (``None`` = trusted
+    in-process caller). Used wherever an action can lead to a Terraform apply
+    without passing the gated /infra/apply routes (audit OS-03)."""
+    if identity is None:
+        return
+    allowed = False
+    try:
+        allowed = bool(identity.allows(PERM_INFRA_APPLY))
+    except Exception:
+        allowed = False
+    if not allowed:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Missing required permission: {PERM_INFRA_APPLY} — {what} can apply infrastructure changes "
+                   "(a dry-run only plans and does not need it).",
+        )
+
+
+async def _save_settings(values: dict, identity) -> dict:
+    """Validated, authorised, all-or-nothing settings write (off the event loop)."""
+    mgr = _settings_mgr()
+    try:
+        result = await off_loop(mgr.save_values, values, allowed_tiers=_allowed_tiers(identity))
+    except SettingsValidationError as exc:
+        raise HTTPException(status_code=422, detail=f"Invalid setting — {exc}")
+    except SettingsPermissionError as exc:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Missing required permission: {_TIER_PERMISSIONS.get(exc.tier, exc.tier)} — {exc}",
+        )
+    if result["saved"]:
+        _ctx.log.info(
+            f"SETTINGS: {getattr(identity, 'username', None) or 'internal'} changed "
+            f"{', '.join(result['saved'])}"
+        )
+    return result
 
 
 def _settings_mgr() -> OrchestratorSettings:
@@ -1774,15 +2201,17 @@ async def do_get_settings_values():
     return {"values": mgr.get_values()}
 
 
-async def do_save_settings_values(payload: SettingsValuesRequest):
-    """Persist provided settings. Unknown keys ignored; blank secrets keep existing.
+async def do_save_settings_values(payload: SettingsValuesRequest, identity=None):
+    """Persist provided settings (validated per key, all or nothing). Unknown keys
+    and unchanged values are ignored; secret slots are refused here (422 — they
+    have their own route); a change outside the caller's tiers is a 403.
 
     Settings shadowed by an OS env var are NOT written (env always wins) and are
     reported in ``locked`` with a ``warning`` status so the UI never claims a
     no-op succeeded.
     """
     mgr = _settings_mgr()
-    result = mgr.save_values(payload.values or {})
+    result = await _save_settings(payload.values or {}, identity)
     saved = result["saved"]
     locked = result["locked"]
     return {
@@ -1794,6 +2223,18 @@ async def do_save_settings_values(payload: SettingsValuesRequest):
         ),
         "values": mgr.get_values(),
     }
+
+
+async def do_set_secret_slot(key: str, payload: SecretSlotRequest, identity=None):
+    """Store secret material (SSH key, password, token) in its slot. The value is
+    never echoed; the route requires the credentials permission."""
+    mgr = _settings_mgr()
+    try:
+        await off_loop(mgr.set_secret_slot, key, payload.value)
+    except SettingsValidationError as exc:
+        raise HTTPException(status_code=422, detail=f"Invalid setting — {exc}")
+    _ctx.log.info(f"SETTINGS: {getattr(identity, 'username', None) or 'internal'} replaced secret slot '{key}'")
+    return {"status": "ok", "key": key, "configured": True}
 
 
 async def do_list_credentials():
@@ -1819,10 +2260,9 @@ async def do_add_credential(payload: CredentialRequest):
             status_code=422,
             detail="Alias must match ^[A-Za-z0-9_-]+$ (letters, digits, underscore, hyphen).",
         )
-    # Compare case-insensitively so an alias like "Iac_foo" or "Gitlab_Webhook_Token"
-    # cannot slip past the reserved-key / "iac_" guard by varying letter case.
-    alias_lc = alias.lower()
-    if alias_lc in _RESERVED_CREDENTIAL_KEYS or alias_lc.startswith("iac_"):
+    # Reserved = every Vault key the plugin uses for a setting or secret slot plus
+    # the "iac_" prefix, compared case-insensitively ("Iac_foo" must not slip past).
+    if not is_valid_credential_alias(alias):
         raise HTTPException(
             status_code=409,
             detail=f"Alias '{alias}' is reserved for engine configuration and cannot be used.",
@@ -1866,46 +2306,49 @@ async def do_get_webhook_token():
     }
 
 
-async def do_generate_webhook_token():
+async def do_generate_webhook_token(identity=None):
     """Generate + store a new GitLab webhook token. Returns the raw value once."""
     if not _ctx:
         raise HTTPException(status_code=503, detail="Context offline")
     new_token = secrets.token_urlsafe(32)
     _ctx.set_secret("gitlab_webhook_token", new_token)
-    _ctx.log.info("API: New GitLab webhook token generated and stored in Vault.")
+    _reset_token_cache(new_token)
+    _ctx.log.info(f"API: New GitLab webhook token generated by {_actor(identity) or 'internal'} and stored in Vault.")
     return {"status": "ok", "token": new_token}
 
 
-async def do_clear_stats():
+async def do_clear_stats(identity=None):
     """Clear job history records (keeps RUNNING jobs intact) and reset last_deployment state."""
     if not _service or not _engine:
         raise HTTPException(status_code=503, detail="Orchestrator not initialized")
-    deleted = await asyncio.to_thread(_engine.db.clear_all_jobs, True)
+    deleted = await off_loop(_engine.db.clear_all_jobs, True)
     if deleted < 0:
         raise HTTPException(status_code=500, detail="Failed to clear statistics (see logs)")
+    _ctx.log.warning(f"API: job history cleared by {_actor(identity) or 'internal'} ({deleted} job record(s) and their logs).")
     _service.state["last_deployment"] = "N/A"
     return {"status": "ok", "deleted": deleted}
 
 
-async def do_clear_failed_jobs():
+async def do_clear_failed_jobs(identity=None):
     """Delete only failed/errored/aborted job records, leaving successful and running jobs intact."""
     if not _service or not _engine:
         raise HTTPException(status_code=503, detail="Orchestrator not initialized")
-    deleted = await asyncio.to_thread(_engine.db.clear_failed_jobs)
+    deleted = await off_loop(_engine.db.clear_failed_jobs)
     if deleted < 0:
         raise HTTPException(status_code=500, detail="Failed to clear failed jobs (see logs)")
+    _ctx.log.warning(f"API: failed job records cleared by {_actor(identity) or 'internal'} ({deleted} record(s) and their logs).")
     return {"status": "ok", "deleted": deleted}
 
 
-async def do_sync_repos():
+async def do_sync_repos(identity=None):
     """Trigger a background sync of all core repositories (iac_controller, inventory_state, …)."""
     if not _ctx or not _service or not _engine:
         raise HTTPException(status_code=503, detail="Orchestrator not initialized")
     # Runs on a runner instance (the one with the working trees) via the queue, like
     # every other piece of execution; the job shows up in the history as "repo_sync".
     try:
-        job_id = await asyncio.to_thread(_service.enqueue_pipeline, {"pipeline_type": "repo_sync", "manual": True},
-                                         requested_by="ui")
+        job_id = await off_loop(_service.enqueue_pipeline, {"pipeline_type": "repo_sync", "manual": True},
+                                         requested_by=_actor(identity) or "ui")
     except _DuplicateJob as exc:
         raise HTTPException(status_code=409, detail=f"A repository sync is already queued/running (job #{exc.existing_id})")
     return {"status": "accepted", "message": "Repository sync queued", "job_id": job_id}
@@ -1917,7 +2360,7 @@ async def do_sync_webhooks_authed():
         raise HTTPException(status_code=500, detail="API Context not initialized")
     from .gitlab_webhooks import sync_group_webhooks_from_ctx, WebhookConfigError
     try:
-        result = await asyncio.to_thread(sync_group_webhooks_from_ctx, _ctx)
+        result = await off_loop(sync_group_webhooks_from_ctx, _ctx)
     except WebhookConfigError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
@@ -1926,11 +2369,17 @@ async def do_sync_webhooks_authed():
     return {"status": "ok", **result}
 
 
+def _without_logs(tasks: dict) -> dict:
+    """Runner tasks without their log tails (status only)."""
+    return {name: ({**info, "logs": []} if isinstance(info, dict) else info) for name, info in (tasks or {}).items()}
+
+
 def _job_stream_snapshot() -> dict:
     """Build a single live snapshot of orchestrator state for the SSE stream."""
     if not _engine:
         return {"jobs": [], "active_tasks": {}, "is_running": False, "ts": time.time()}
-    jobs = _engine.db.get_recent_jobs(30)
+    runner_state = _service.runner_state() if _service else "online"
+    jobs = _with_wait_hints(_engine.db.get_recent_jobs(30), runner_state)
     live = _live_summary()
     return {
         "jobs": jobs,
@@ -1938,9 +2387,32 @@ def _job_stream_snapshot() -> dict:
         "is_running": bool(live.get("is_running", False)),
         "queued": live.get("queued", 0),
         "scheduled": live.get("scheduled", 0),
-        "runner_online": bool(_service.runner_online()) if _service else True,
+        "runner_online": runner_state == "online",
+        "runner_state": runner_state,
         "ts": time.time(),
     }
+
+
+_SNAPSHOT_MAX_AGE_SECONDS = 0.9
+_snapshot_cache: dict = {"at": 0.0, "value": None, "task": None}
+
+
+async def _shared_job_stream_snapshot() -> dict:
+    """The live snapshot for the SSE streams: built at most about once per second
+    per process, in a worker thread, and shared by every open stream (audit
+    OC-08 B1). Before, each dashboard tab ran its own five synchronous queries
+    on the event loop every second — a slow database froze the instance, a dead
+    pooled socket stopped its cluster heartbeat. Treat the result as read-only."""
+    now = time.monotonic()
+    if _snapshot_cache["value"] is not None and now - _snapshot_cache["at"] < _SNAPSHOT_MAX_AGE_SECONDS:
+        return _snapshot_cache["value"]
+    task = _snapshot_cache["task"]
+    if task is None or task.done():
+        task = asyncio.ensure_future(off_loop(_job_stream_snapshot))
+        _snapshot_cache["task"] = task
+    value = await asyncio.shield(task)
+    _snapshot_cache.update(at=time.monotonic(), value=value)
+    return value
 
 
 async def stream_jobs(request: Request, token: str | None, ticket: str | None = None):
@@ -1950,11 +2422,13 @@ async def stream_jobs(request: Request, token: str | None, ticket: str | None = 
     state changes, plus a ~1s keep-alive tick. Authorization is validated
     in-handler because EventSource cannot send an Authorization header — it
     accepts a short-lived ``ticket`` (preferred) or a bearer ``token``, and both
-    must carry the ``api:read`` permission.
+    must carry the ``api:read`` permission. The log tails of running tasks are
+    only included for a caller with the log permission (ticket scope ``logs``).
     """
     from fastapi.responses import StreamingResponse
 
-    if not _authorize_stream_request(token, ticket, "api:read"):
+    may_read, may_see_logs = _stream_access(token, ticket)
+    if not may_read:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     async def generator():
@@ -1964,7 +2438,10 @@ async def stream_jobs(request: Request, token: str | None, ticket: str | None = 
             while True:
                 if await request.is_disconnected():
                     break
-                snapshot = _job_stream_snapshot()
+                snapshot = dict(await _shared_job_stream_snapshot())   # shared: copy before changing
+                if not may_see_logs:
+                    snapshot["active_tasks"] = _without_logs(snapshot.get("active_tasks") or {})
+                    snapshot["logs_included"] = False
                 # Hash on everything except the wall-clock timestamp so we only
                 # push a new frame when the orchestrator state actually changes.
                 change_key = json.dumps(

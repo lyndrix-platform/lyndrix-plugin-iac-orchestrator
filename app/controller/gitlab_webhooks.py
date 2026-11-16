@@ -148,7 +148,11 @@ def sync_group_webhooks_from_ctx(ctx) -> dict:
     group_id_raw = (ctx.get_secret("iac_gitlab_group_id") or "").strip()
     lyndrix_base_url = (ctx.get_secret("iac_lyndrix_base_url") or "").strip()
     token_key = (ctx.get_secret("iac_gitlab_api_token_key") or "").strip()
-    webhook_token = ctx.get_secret("gitlab_webhook_token")
+    # The secret the hooks send: the dedicated hook token once its slot is set
+    # (audit OS-04) — from then on the receiving route accepts nothing else, so
+    # the next sync writes it into every project hook. Until then the shared
+    # webhook token, as before.
+    webhook_token = ctx.get_secret("gitlab_hook_token") or ctx.get_secret("gitlab_webhook_token")
 
     if not group_id_raw.isdigit():
         raise WebhookConfigError("GitLab Group ID is not set or not numeric.")
@@ -156,7 +160,17 @@ def sync_group_webhooks_from_ctx(ctx) -> dict:
         raise WebhookConfigError("Lyndrix Base URL is not set.")
     if not token_key:
         raise WebhookConfigError("No GitLab API credential (Vault key) selected.")
-    gitlab_token = ctx.get_secret(token_key)
+    # Checked at use time, whoever stored the values: the API token goes to this
+    # URL, and the reference may only resolve to a credential alias — never to
+    # another secret of the plugin (audit OS-02: token/secret exfiltration).
+    from .settings_schema import gitlab_url_error, is_valid_credential_alias, resolve_credential
+
+    url_error = gitlab_url_error(gitlab_url)
+    if url_error:
+        raise WebhookConfigError(f"GitLab Base URL {url_error}.")
+    if not is_valid_credential_alias(token_key):
+        raise WebhookConfigError(f"GitLab API credential '{token_key}' is not a credential alias of this plugin.")
+    gitlab_token = resolve_credential(ctx, token_key)
     if not gitlab_token:
         raise WebhookConfigError(f"Vault key '{token_key}' has no secret value.")
     if not webhook_token:

@@ -1,5 +1,71 @@
 import os
+import re
 from pathlib import Path
+
+# --- Runner images (audit OS-02) ---------------------------------------------------
+# The runner containers get the fleet SSH key and read-write repo mounts, so the image
+# they are started from decides who owns the fleet. Images configured through the
+# settings API/UI must come from this allowlist (registry or repository prefixes).
+# The list is deployment-level on purpose (env only): whoever may change the image
+# setting must not be able to widen the list through the same API.
+RUNNER_IMAGE_ALLOWLIST_ENV = "PLUGIN_IAC_ORCHESTRATOR_RUNNER_IMAGE_ALLOWLIST"
+DEFAULT_RUNNER_IMAGE_ALLOWLIST = (
+    "registry.gitlab.int.fam-feser.de/",
+    "ghcr.io/opentofu/opentofu",
+)
+ANSIBLE_IMAGE_ENV = "PLUGIN_IAC_ORCHESTRATOR_ANSIBLE_IMAGE"
+TERRAFORM_IMAGE_ENV = "PLUGIN_IAC_ORCHESTRATOR_TERRAFORM_IMAGE"
+
+# registry[:port]/repo[/repo...][:tag][@sha256:digest] — an explicit registry is
+# required, and the reference can never start with '-' (docker would read an option).
+_IMAGE_REF_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9.-]*(:\d{1,5})?(/[a-z0-9][a-z0-9._-]*)+"
+    r"(:[A-Za-z0-9_][A-Za-z0-9._-]{0,127})?(@sha256:[a-f0-9]{64})?$"
+)
+
+
+class RunnerImageNotAllowed(RuntimeError):
+    """The configured runner image is malformed or outside the allowlist."""
+
+
+def runner_image_allowlist() -> tuple[str, ...]:
+    raw = os.getenv(RUNNER_IMAGE_ALLOWLIST_ENV)
+    if raw is None:
+        return DEFAULT_RUNNER_IMAGE_ALLOWLIST
+    return tuple(p.strip() for p in raw.split(",") if p.strip())
+
+
+def allowed_registry_hosts() -> set[str]:
+    """Registry hosts (``host[:port]``) of the runner image allowlist."""
+    return {p.split("/", 1)[0].lower() for p in runner_image_allowlist() if p}
+
+
+def registry_host(url: str | None) -> str:
+    """``host[:port]`` of a registry URL as given to ``docker login``."""
+    text = str(url or "").strip().lower()
+    for scheme in ("https://", "http://"):
+        if text.startswith(scheme):
+            text = text[len(scheme):]
+    return text.split("/", 1)[0]
+
+
+def runner_image_error(ref: str | None, *, check_allowlist: bool = True) -> str | None:
+    """Why ``ref`` must not be used as a runner image (``None`` = fine)."""
+    text = str(ref or "")
+    if not _IMAGE_REF_RE.fullmatch(text):
+        return (f"'{text}' is not a valid image reference "
+                "(expected registry/repository[:tag][@sha256:digest])")
+    if not check_allowlist:
+        return None
+    for prefix in runner_image_allowlist():
+        if prefix.endswith("/"):
+            if text.startswith(prefix):
+                return None
+        elif text == prefix or text.startswith((prefix + ":", prefix + "@", prefix + "/")):
+            return None
+    return (f"image '{text}' is not in the runner image allowlist "
+            f"({', '.join(runner_image_allowlist()) or 'empty'}; {RUNNER_IMAGE_ALLOWLIST_ENV})")
+
 
 class IaCConfig:
     def __init__(self, ctx):
@@ -90,6 +156,23 @@ class IaCConfig:
             "ghcr.io/opentofu/opentofu:latest",
         )
 
+    def checked_runner_image(self, kind: str) -> str:
+        """The ``ansible``/``terraform`` runner image, verified right before use.
+
+        Raises :class:`RunnerImageNotAllowed` instead of starting a container from
+        an image outside the allowlist — whatever wrote the setting (API, legacy
+        UI, a value stored before the allowlist existed). An image pinned through
+        the environment is deployment configuration: only its syntax is checked.
+        """
+        if kind == "ansible":
+            image, env_var = self.ansible_docker_image, ANSIBLE_IMAGE_ENV
+        else:
+            image, env_var = self.terraform_docker_image, TERRAFORM_IMAGE_ENV
+        error = runner_image_error(image, check_allowlist=os.getenv(env_var) is None)
+        if error:
+            raise RunnerImageNotAllowed(f"Refusing to start the {kind} runner: {error}")
+        return image
+
     @property
     def terraform_binary(self) -> str:
         return self._get(
@@ -100,6 +183,64 @@ class IaCConfig:
 
     @property
     def auto_apply(self) -> bool: return str(self._get("PLUGIN_IAC_ORCHESTRATOR_AUTO_APPLY", "iac_auto_apply", "false")).lower() == "true"
+
+    @property
+    def ansible_diff_mode(self) -> str:
+        """When ansible-playbook gets ``--diff``: ``never`` | ``dry_run`` (default,
+        only with --check) | ``always``. A diff prints the rendered content of
+        every templated file — stack.env with its secrets included."""
+        mode = str(self._get("PLUGIN_IAC_ORCHESTRATOR_ANSIBLE_DIFF", "iac_ansible_diff_mode", "dry_run")).strip().lower()
+        return mode if mode in ("never", "dry_run", "always") else "dry_run"
+
+    # --- orphan sweep (rD §3) — env > Vault (settings UI) > default ---
+    @property
+    def orphan_sweep_enabled(self) -> bool:
+        return self._get_bool("PLUGIN_IAC_ORCHESTRATOR_ORPHAN_SWEEP_ENABLED", "iac_orphan_sweep_enabled", True)
+
+    @property
+    def orphan_sweep_grace_seconds(self) -> int:
+        """No heartbeat and no log line for this long (and a dead owner) = orphaned."""
+        return self._get_int("PLUGIN_IAC_ORCHESTRATOR_ORPHAN_SWEEP_GRACE_SECONDS",
+                             "iac_orphan_sweep_grace_seconds", 90, minimum=30)
+
+    @property
+    def orphan_sweep_container_grace_seconds(self) -> int:
+        """Grace for a job whose runner containers may still be running."""
+        return self._get_int("PLUGIN_IAC_ORCHESTRATOR_ORPHAN_SWEEP_CONTAINER_GRACE_SECONDS",
+                             "iac_orphan_sweep_container_grace_seconds", 1800, minimum=60)
+
+    @property
+    def runner_readonly_mounts(self) -> bool:
+        """Runner containers get the repositories read-only (audit OS-06 A):
+        Ansible reads ``git_repos``/``services`` and writes only its scratch
+        dir; tofu writes only its run dir, the provider cache is read-only.
+        On by default; off restores the read-write mounts of <= 1.6.1 (for a
+        playbook that turns out to write into the tree)."""
+        return self._get_bool("PLUGIN_IAC_ORCHESTRATOR_RUNNER_READONLY_MOUNTS", "iac_runner_readonly_mounts", True)
+
+    #: Smallest limit that is honoured — anything below would stop ordinary jobs.
+    JOB_MAX_RUNTIME_FLOOR_SECONDS = 600
+
+    @property
+    def job_max_runtime_seconds(self) -> int:
+        """Longest time a job may stay RUNNING before the sweep stops and closes
+        it (review C4); ``0`` = no limit. A value between 1 and the floor is
+        raised to the floor instead of stopping every job after seconds."""
+        value = self._get_int("PLUGIN_IAC_ORCHESTRATOR_JOB_MAX_RUNTIME_SECONDS",
+                              "iac_job_max_runtime_seconds", 21600, minimum=0)
+        return 0 if value <= 0 else max(self.JOB_MAX_RUNTIME_FLOOR_SECONDS, value)
+
+    @property
+    def tf_lock_timeout_seconds(self) -> int:
+        """How long a Terraform run waits for the state lock of its environment
+        before the job fails (another job is running tofu on that state)."""
+        return self._get_int("PLUGIN_IAC_ORCHESTRATOR_TF_LOCK_TIMEOUT_SECONDS", "iac_tf_lock_timeout_seconds",
+                             1800, minimum=0)
+
+    @property
+    def token_infra_apply_enabled(self) -> bool:
+        """May the GitLab-token route trigger a fleet apply? Off unless explicitly enabled."""
+        return self._get_bool("PLUGIN_IAC_ORCHESTRATOR_TOKEN_INFRA_APPLY", "iac_token_infra_apply_enabled", False)
 
     @property
     def sync_interval_minutes(self) -> int:

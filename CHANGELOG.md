@@ -5,6 +5,157 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.0] - 2026-11-15
+Security and cluster audit 2026-11, the findings of the independent review and the owner's decisions on OS-04, OS-05
+and OS-06. The unreleased `feat/service-reconcile-1.7.0` becomes 1.8.0. Minimum core unchanged (core 1.11.1 /
+API 1.13); newer core APIs are used only behind `getattr`. The React bundle must be rebuilt from this tree.
+No credential has to be changed for the upgrade: the existing webhook token keeps working for every purpose.
+
+### Upgrade notes
+- **Runner images** outside `registry.gitlab.int.fam-feser.de/` and `ghcr.io/opentofu/opentofu` are refused at run
+  time for every job. Compare the Ansible and Terraform image settings and the registry host with the allow-list
+  before the rollout, or set `PLUGIN_IAC_ORCHESTRATOR_RUNNER_IMAGE_ALLOWLIST`.
+- **Credential references** that point at a reserved key (`ansible_ssh_key`, `iac_*`) resolve to nothing; check
+  `iac_gitlab_api_token_key` and every `repo_*_config.token_key`. A changed GitLab/base URL must be https and on an
+  allowed host (`ALLOWED_GIT_HOSTS`, `ALLOW_INSECURE_URLS`).
+- **New permissions:** `iac:settings_admin`, `iac:credentials_admin` (admin role), `iac:logs_read` (admin and operator
+  roles). Plain plugin writers and scoped keys lose admin-tier settings, credentials, webhook-token generation,
+  history deletion and job *log content* (status stays visible). Grant the roles first.
+- **Upgrade every instance together and only while no job is RUNNING.** Nothing is resumed after a restart: an
+  interrupted job ends FAILED "Interrupted by a runner restart … re-trigger".
+- **Profile services follow the deploy policy** (traefik, cadvisor, wazuh-agent, …): on `prod` their CI deploys are
+  parked for the window; without a window each deploy emits `maintenance:window_missing` and a maintenance override on
+  every target host. Define prod windows or decide the behaviour for fleet services before the rollout.
+- `POST /api/iac/infra/apply/gitlab` answers 404 unless `token_infra_apply_enabled` is set.
+- Recommendation, the owner decides: treat the credentials that went through the monitoring sync as exposed (see
+  Security, first item). The upgrade stops the exposure but does not invalidate them.
+- **Runner containers get the repositories read-only** (`runner_readonly_mounts`, default on; off restores the mounts
+  of 1.6.1). A playbook or role that writes into the checkout, or expects `.git` there, fails with "Read-only file
+  system" — test on staging before the rollout. Staging confirmed the Ansible paths; the OpenTofu paths (run directory,
+  provider cache) never ran with read-only mounts. **Switch `runner_readonly_mounts` off for the first production
+  OpenTofu job (Check Env / plan / apply) and back on afterwards**, then run the next one with it on and watch it.
+- **The Ansible runner image does not change.** The settings UI showed `…/iac-platform-assets/ansible-ci-image:latest`
+  as default while the code ran `…/aac-template-engine:latest` (ansible-ci-image plus the template engine); the
+  display now shows what runs (staging O-1). Nothing to do.
+- **Branch → target is enforced.** Only the catalog's prod branch of a service deploys to all its hosts; `dev`,
+  `*-dev` and `test` branches deploy to their stage only; any other branch is refused (HTTP 400 / refused job). A CI
+  project whose `PROD_BRANCH` differs from the catalog is refused too.
+- **A pending plan from before the upgrade cannot be approved** (HTTP 409) — run Check Env again.
+- **Jobs have a maximum runtime** of 6 h (`job_max_runtime_seconds`, 0 = off). Raise it before a longer rollout.
+- The NiceGUI page `/iac` needs `api:infra_apply`.
+- New database objects, created idempotently under the bootstrap lock: job columns `claim_token`,
+  `owner_incarnation`, `heartbeat_utc`, `exec_state`, `requested_by`; table `iac_orchestrator_locks`; state row
+  `rules_applied`.
+
+### Security
+- **Outbound data is an allow-listed projection** (monitoring sync, bus events, repo snapshots): no service `config`
+  block, no credentials, `terraform` reduced to placement facts. Before, hypervisor credentials and service secrets
+  went to the monitoring plugin, which showed them to every reader.
+- **Settings are validated per key and authorised per changed field** (tiers operator / settings admin / credentials
+  admin / infra apply). Secrets are written only through `POST /settings/secrets/{key}`. Runner images, registry
+  hosts, git hosts and credential references are checked again when they are used.
+- Generating the webhook token, enabling `auto_apply`, `init_host` and the test-host deploy need `api:infra_apply`
+  (a dry-run does not).
+- Job payloads are validated when queued and again when claimed. `approve`, `force` and `trigger` are honoured only
+  from entitled code paths; a trigger from the bus is untrusted and can never apply. A payload field this version
+  does not know is refused, not dropped.
+- Job output is masked before it is stored or streamed; `ansible --diff` runs only for dry-runs by default (setting
+  `ansible_diff_mode`). Reading job logs needs `iac:logs_read`.
+- Who triggered a job is recorded (`requested_by`); deleting job history needs `iac:settings_admin`.
+- `GET /api/iac/health` returns only `{status, db_connected, runner_online}`; the token check is cached and off the
+  event loop, and rejected calls are counted in the plugin health.
+- Directly mounted public routes are removed on disable/unload.
+- **One token per purpose, backward compatible (OS-04).** New secret slots `gitlab_hook_token`,
+  `gitlab_service_ci_token`, `gitlab_controller_ci_token` (credentials tier). While a slot is empty the shared
+  `gitlab_webhook_token` keeps authorising that purpose (deprecation line once per purpose and hour, hint
+  `webhook_tokens` in the plugin health). With a slot set only that token works for its purpose; the service-CI token
+  forces the prod branch and the hook token can no longer start a deployment with a `pipeline` body. Tokens are
+  compared in constant time on bytes. After 20 rejected calls per source address in 60 s further rejected calls get
+  429 with `Retry-After`; a valid token always passes. How to create and store the tokens:
+  `documentation.md` → "Webhook-Tokens je Zweck".
+- **Branch → target mapping (OS-05).** See the upgrade notes; payload flag `require_prod_branch`.
+- **Approving a pending plan applies the plan that was reviewed, or nothing (OS-12).** The controller commit and a
+  plan digest are stored with the pending plan; if the controller moved or the fresh plan differs, nothing is applied
+  and a new pending plan is created. `GET /infra/pending-plan` gains `controller_sha` and `approvable`.
+- **The generator and the render script no longer see the core's environment, and the bundled renderer runs in a
+  Jinja2 sandbox (OS-06).** The plugin's git calls trust one repository per command and run no hooks, fsmonitor or
+  credential helper; `safe.directory=*` is no longer written to the global git config (an existing entry stays).
+- **Runner containers (OS-06):** Ansible gets `git_repos` and `services` read-only with `.git` masked, tofu gets only
+  its per-job run dir read-write and the provider cache read-only (falls back to a run without the cache when a
+  provider is missing), plus a scratch dir per job at `/data/scratch`.
+- The NiceGUI page, its settings panel and its triggers check permissions; triggers carry the session user's
+  entitlements and name, and the abort button uses the API stop path (OS-17).
+
+### Changed
+- **A dry-run is a property of the job:** Terraform only plans and Ansible runs with `--check`, whatever `approve` or
+  `auto_apply` say.
+- **A trigger for a busy target is no longer dropped.** It becomes a QUEUED follow-up, is merged into an identical job
+  that has not started, or is refused and reported. Trigger responses carry `job_id`, `queued`, `outcome`
+  (`queued | follow_up | coalesced | promoted | duplicate`), `waiting_for`, `duplicate_of`; HTTP stays 200. A run that
+  carries `approve` is never queued behind another job.
+- Claims are atomic and fenced (claim token + incarnation); a job closed elsewhere is never overwritten.
+- Orphaned jobs are closed by a lease-based sweep on the control plane (`runner_lost: …`); nothing is re-run
+  automatically. Settings `orphan_sweep_enabled`, `orphan_sweep_grace_seconds` (90),
+  `orphan_sweep_container_grace_seconds` (1800).
+- A plugin reload or a draining instance detaches running jobs instead of aborting them; the next runner start
+  re-attaches to the containers.
+- Terraform containers are named per job (`iac-tf-j<job>-<task>`), labelled and spawned through the docker CLI; run
+  directories are per job. One lock per Terraform state (`tf:<site>_<stage>`): a second job waits
+  (`tf_lock_timeout_seconds`, 1800), then fails "state in use by job #N". Abort stops tofu with `docker stop -t 30`.
+- The rule stage evaluates everything published since the last completed rule stage; rule actions of a pipeline that
+  failed after publishing are picked up by the next one. A dry-run leaves the changes pending; a failing evaluation is
+  retried at most 3 times, then a "Rule actions skipped" notification lists the files.
+- A due scheduled deploy whose window has closed waits for the next window; a deploy that cannot be parked fails
+  instead of deploying outside the window. With several target hosts the strictest policy decides.
+- A repository sync runs under the state lock; the NiceGUI "Resync Repositories" button queues a `repo_sync` job; a
+  young `index.lock` is waited for, only a stale one (> 60 s) is removed.
+
+### Fixed
+- Runner success comes from the exit code and the Ansible recap, not from output substrings.
+- "Global Adopt" / "Site Adopt" work again.
+- A failed core repo sync writes the core's error text into the job log.
+- Queue timestamps use UTC; the log writer is cancel-safe; a failed runtime-mount resolution is retried.
+- `iac_core` tests run in the same invocation as the plugin tests.
+- **Docker not answering is never "no containers" (review C1).** After a runner restart with an unreachable Docker
+  daemon the adopted jobs stay RUNNING ("Runner restarted — container state unknown (Docker not reachable),
+  retrying", bell entry "IaC runner — Docker not reachable") instead of being closed FAILED with their containers
+  still running and the state lock free. The listing is retried at 5/10/20/40 s, then every 60 s, without an upper
+  bound. Abort and fencing retry a failed container stop for about 30 minutes, then report "containers not stopped";
+  the abort response gains `unstopped_jobs`, and such a job is not reported as aborted until its containers are gone.
+- **A held lock counts as a container (review C2).** A job of a lost runner that holds a `tf:`/`rules` lock is swept
+  only after `orphan_sweep_container_grace_seconds`, and the lock of a job that was closed without its runner is
+  taken over only after the same grace — unless the runner itself confirmed that the containers are gone. A waiting
+  job can therefore show "waiting … (job #N)" for up to 30 minutes.
+- **A finished job's result survives a database blip (review C5).** The terminal write is retried on connection
+  errors (0.5/1/2/4 s) and afterwards about every 20 s for up to 10 minutes; `mark_failed` is bound to the claim
+  token, so a successful job is no longer flipped to FAILED by the recovery check.
+- Teardown removes only the public routes of its own load, so a late teardown on core 1.11.1 cannot delete the routes
+  of a version restored by the core's auto-revert (review R7).
+- **No database, Vault or large-YAML work on the runner's event loop (review C3, OC-08).** Off-loop work runs in
+  the plugin's own 12-thread pool, so hanging calls cannot starve the core's cluster heartbeat; progress writes are
+  coalesced and a terminal write is never overtaken by a late progress write.
+- **A job cannot stay RUNNING for ever (review C4).** After `job_max_runtime_seconds` the job is stopped and closed
+  FAILED `max_runtime: …`; if the runner does not confirm within 120 s the job is closed with a note that containers
+  may still be running and its locks stay held for the container grace. New notification `job_timed_out`.
+- The rule-engine marker is a compare-and-set and only moves forward (review C6).
+- Job-log lines survive a database error (buffer of 20 000 lines, a "[SYSTEM] [WARNING] N log line(s) are missing"
+  marker when it overflowed); log age uses UTC; enqueue retries on 1020/1205/1213 (review C7).
+- The abort endpoint keeps jobs whose containers could not be stopped attended and names them (`unstopped_jobs`, shown
+  in the UI toast); a late teardown stops only its own service.
+- **The test suite can no longer reach the host's Docker daemon (staging O-2).** One test ran the start-up
+  reconciliation unmocked: on a runner host it listed the real runner containers and removed those whose job was not
+  RUNNING in the test database. Tests now fail when they call `docker`, and a stub `docker` is first on `PATH` for
+  the whole session. Never run the suite of an older tree on a runner host.
+- A lease granted while the plugin is shutting down starts no new loop, so a cluster-wide disable no longer runs into
+  the core's teardown timeout (staging O-3).
+- A job closed as "System Restart (Aborted)" at runner start now removes its `.job_snapshots/job_<id>` directory
+  (inventory snapshot and scratch) like every other terminal path (staging O-7).
+- A `docker rm` that fails only because the container is already gone or being removed counts as stopped. Two stop
+  paths racing for the same container no longer log "could not be stopped" and retry (staging O-8).
+- The settings UI and schema show the Ansible runner image the code actually uses by default,
+  `aac-template-engine:latest` (staging O-1). The code default is unchanged from 1.6.1.
+- The suite has 562 tests (124 on 1.6.1) and passes on core 1.11.1 and on core 1.12.0.
+
 ## [1.6.1] - 2026-11-11
 Forward-port of the complete 1.5.x hotfix line (1.5.1–1.5.7, core < 1.11) plus the runner-presence fix from the 2026-11-11 incident. Requires core ≥ 1.11.0 (API 1.13) like 1.6.0; no schema migration (the queue columns are added idempotently by `JobQueue.ensure_schema` as before).
 

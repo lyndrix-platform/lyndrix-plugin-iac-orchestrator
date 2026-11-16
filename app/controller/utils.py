@@ -23,11 +23,14 @@ class JobFileLogBridge(logging.Handler):
     stays for host-side debugging, the database is what every cluster instance
     serves to the UI."""
 
-    def __init__(self, log_path: Path, job_id: int | None = None, sink=None):
+    def __init__(self, log_path: Path, job_id: int | None = None, sink=None, redact=None):
         super().__init__()
         self.log_path = log_path
         self.job_id = job_id
         self.sink = sink
+        # line -> line: masks secret values before the line reaches the file or
+        # the database (audit OS-07).
+        self.redact = redact
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         self.setFormatter(logging.Formatter('%(message)s'))
 
@@ -42,6 +45,11 @@ class JobFileLogBridge(logging.Handler):
         log_entry = self.format(record)
         component = record.name.split(':')[-1]
         line = f"[{component}] {log_entry}"
+        if self.redact is not None:
+            try:
+                line = self.redact(line)
+            except Exception:
+                line = f"[{component}] [log line withheld: redaction failed]"
         try:
             with open(self.log_path, 'a', encoding='utf-8') as f:
                 f.write(line + "\n")

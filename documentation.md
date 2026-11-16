@@ -108,6 +108,55 @@ Docker-Socket), Job-Logs und Working-Trees weg vom lokalen Host des Runners.
 
 Dieser Router wird direkt auf der FastAPI-Applikation eingehängt (nicht über `ctx.register_routes`), damit externe GitLab/CI-Aufrufer ohne Lyndrix-User-Token durchkommen. Jeder Handler validiert den `X-Gitlab-Token` selbst.
 
+Weitere öffentliche Token-Routen: `POST /api/iac/webhook/sync` (Hooks neu registrieren), `POST /api/iac/infra/plan/gitlab` (Check Env aus der Controller-CI), `POST /api/iac/webhook/gitlab/test-host/{host}` und `POST /api/iac/infra/apply/gitlab` (**standardmäßig aus**, Setting `token_infra_apply_enabled`).
+
+### Webhook-Tokens je Zweck (Audit OS-04)
+
+Bisher autorisierte **ein** Token (`gitlab_webhook_token`) jede öffentliche Aktion; es steckt in jedem Projekt-Hook und in zwei CI-Variablen. Jeder Zweck hat jetzt einen eigenen Secret-Slot:
+
+| Zweck | Secret-Slot (Setting-Key) | Routen | Wo das Token auf GitLab-Seite liegt |
+|---|---|---|---|
+| Gruppen-/Projekt-Hooks | `gitlab_hook_token` | `POST /api/iac/webhook/gitlab` | „Secret token“ der Hooks — wird vom Webhook-Sync automatisch in alle Projekt-Hooks der Gruppe geschrieben |
+| Service-CI | `gitlab_service_ci_token` | `POST /api/iac/deploy/service/{svc}/gitlab`, `GET …/gitlab/status` | CI/CD-Variable, aus der die Service-Pipelines den Header `X-Gitlab-Token` befüllen (Gruppe der Service-Repos) |
+| Controller-CI | `gitlab_controller_ci_token` | `POST /api/iac/infra/plan/gitlab`, `POST /api/iac/webhook/sync`, `…/test-host/{host}`, `…/infra/apply/gitlab` | CI/CD-Variable, aus der die Pipeline des Projekts `iac-controller` den Header `X-Gitlab-Token` befüllt |
+
+Regeln:
+
+- **Slot leer** → für diesen Zweck gilt weiter das bestehende `gitlab_webhook_token`, exakt wie bisher. Im Log steht dazu höchstens einmal pro Stunde und Zweck eine `DEPRECATED`-Warnung; die Plugin-Health zeigt unter `webhook_tokens`, welche Zwecke noch auf dem gemeinsamen Token laufen.
+- **Slot gesetzt** → für diesen Zweck wird **nur noch** dieses Token akzeptiert (das gemeinsame nicht mehr), und es gilt für keinen anderen Zweck.
+- Der Code ändert, verschiebt oder löscht das bestehende `gitlab_webhook_token` nie.
+- Mit eigenem **Hook-Token** startet ein `pipeline`-Body auf der Hook-Route kein Deployment mehr (Antwort 200, `triggered: false`). Grundlage: Die vom Plugin registrierten Hooks senden nur Merge-Request-Events (`gitlab_webhooks.py`: `push_events`, `pipeline_events`, `job_events`, `tag_push_events` = `false`); Deployments löst die Service-CI aus. Solange der Slot leer ist, verhält sich die Route wie bisher.
+- Mit eigenem **Service-CI-Token** wird immer der Prod-Branch des Service laut Katalog deployt (siehe unten); der `branch` im Body ist dann keine Wahl des Aufrufers.
+- **Fehlversuche:** Nach 20 abgelehnten Aufrufen von einer Quelladresse innerhalb von 60 s bekommen weitere *abgelehnte* Aufrufe dieser Adresse `429` mit `Retry-After`. Ein gültiges Token wird immer akzeptiert — die Grenze kann die CI nicht aussperren (alle GitLab-Runner teilen sich eine Ausgangsadresse; ein Projekt mit veralteter Variable darf die anderen Pipelines nicht stoppen). Gezählt wird pro Instanz im Speicher (max. 2048 Adressen).
+- **Empfehlung (nicht erzwungen):** `lyndrix_base_url` (Setting) und die Orchestrator-URL in den CI-Variablen auf eine `https://`-Adresse setzen — die Tokens laufen sonst im Klartext durchs Netz.
+
+#### Branch → Ziel (Audit OS-05)
+
+Ein Service-Deploy (`single_service`) richtet sich nach dem Branch: Nur der **Prod-Branch laut Service-Katalog** (`service_catalog.remote_git_management.remote_git_default_branch_prod`, Standard `main`; optional je Service) geht auf alle Hosts des Service (`service_<svc>`). Der Dev-Branch (`dev`, `*-dev`) geht nur auf `stage_dev`, der Test-Branch (`test`) nur auf `stage_test`. Jeder andere Branch wird abgelehnt: HTTP 400 auf den API-/Token-Routen, auf der Hook-Route 200 mit `triggered: false`, und der Runner prüft nach dem Repo-Sync erneut (Job FAILED „Refused: …“).
+
+#### Übergabe an den Betrieb (Hermes): Tokens später umstellen
+
+**Für das Upgrade selbst ist nichts zu tun.** Ohne gesetzte Slots läuft alles mit dem bestehenden Token weiter. Die Umstellung kann später, Zweck für Zweck und in beliebigem Abstand erfolgen. Es werden keine bestehenden Zugangsdaten geändert oder rotiert.
+
+Je Zweck gilt dieselbe Reihenfolge — **erst die Gegenseite vorbereiten, dann den Slot setzen**, weil ab dem Setzen nur noch das neue Token gilt:
+
+1. **Neues Token erzeugen** (zufällig, mindestens 32 Zeichen, z. B. mit einem Passwortgenerator). Nicht in Tickets, Chats oder Repos ablegen.
+2. **Controller-CI** (`gitlab_controller_ci_token`):
+   1. In GitLab im Projekt `iac-controller` unter *Settings → CI/CD → Variables* die Variable, die der Job für `X-Gitlab-Token` nutzt, auf das neue Token setzen (maskiert, geschützt).
+   2. Direkt danach in Lyndrix: *IaC Orchestrator → Settings → GitLab Webhooks → „Token: controller CI“* das Token im Secret-Slot speichern (Recht `iac:credentials_admin`; API: `POST /api/plugins/lyndrix.plugin.iac_orchestrator/settings/secrets/gitlab_controller_ci_token` mit `{"value": "…"}`).
+   3. Prüfen: Controller-Pipeline erneut laufen lassen (Check Env wird ausgelöst, HTTP 200).
+3. **Service-CI** (`gitlab_service_ci_token`):
+   1. Die CI/CD-Variable der Service-Pipelines (Gruppe der Service-Repos) auf das neue Token setzen.
+   2. Direkt danach den Secret-Slot „Token: service CI“ setzen.
+   3. Prüfen: einen Service auf dem Prod-Branch pushen → Trigger 200, Job läuft. Voraussetzung: `PROD_BRANCH` der Pipeline entspricht dem Prod-Branch im Katalog (heute `main`).
+4. **Hooks** (`gitlab_hook_token`):
+   1. Secret-Slot „Token: GitLab group hooks“ setzen.
+   2. Sofort den Webhook-Sync auslösen (Settings → „Webhooks registrieren“ bzw. `POST /api/iac/webhook/sync`); er schreibt das neue Secret in alle Projekt-Hooks der Gruppe. Bis der Sync durch ist, werden Hook-Aufrufe mit dem alten Secret abgelehnt (betrifft nur Merge-Benachrichtigungen, keine Deployments).
+   3. Prüfen: Health → `webhook_tokens.hook = "dedicated"`, in GitLab unter *Webhooks → Recent events* Antwort 200.
+5. Zwischen Schritt *.1 und *.2 eines Zwecks schlagen Aufrufe mit dem jeweils „falschen“ Token mit 401 fehl — die beiden Schritte deshalb unmittelbar nacheinander ausführen, nicht während eines laufenden Rollouts.
+6. **Zurück:** Einen Slot kann man nicht leeren, nur überschreiben. Um zum alten Verhalten zurückzukehren, das Token des Slots wieder auf der Gegenseite eintragen (oder den Vault-Key des Slots durch einen Administrator entfernen lassen).
+7. Wenn alle drei Zwecke `dedicated` melden, wird das gemeinsame `gitlab_webhook_token` von keiner Route mehr akzeptiert. Ob und wann es entfernt wird, entscheidet der Betrieb (Rotationsliste) — das Plugin tut es nicht.
+
 ### SSE-Stream (HMAC-Ticket-Auth)
 
 | Methode | Pfad | Beschreibung |
@@ -316,6 +365,25 @@ Kategorie **Maintenance** (ab 1.6; Env `PLUGIN_IAC_ORCHESTRATOR_MAINTENANCE_*` h
 Der Default-Schalter `maintenance_default.enabled` ist **kein** Setting — er liegt im iac-controller (siehe „Wartungsfenster“).
 
 ---
+
+### Runner-Container: Mounts (Audit OS-06)
+
+Setting `runner_readonly_mounts` (Kategorie *Runner*, Standard **an**; Vault `iac_runner_readonly_mounts`, Env `PLUGIN_IAC_ORCHESTRATOR_RUNNER_READONLY_MOUNTS`):
+
+| Container | Pfad im Container | an (Standard) | aus (wie ≤ 1.6.1) |
+|---|---|---|---|
+| Ansible | `/data/storage/git_repos` | **read-only**, jedes `<repo>/.git` durch ein leeres read-only-tmpfs verdeckt | read-write |
+| Ansible | `/data/storage/services` | **read-only**, jedes `<service>/.git` verdeckt | read-write |
+| Ansible | `/data/scratch` (`IAC_SCRATCH_DIR`) | read-write, pro Job (`git_repos/.job_snapshots/job_<id>/scratch`), wird mit dem Job-Snapshot gelöscht | — |
+| tofu | `/data/storage/git_repos/<Run-Dir des Jobs>` | **nur dieses Verzeichnis**, read-write | ganz `git_repos` read-write |
+| tofu | `/data/storage/terraform-providers` | **read-only** | read-write |
+
+Hintergrund: Die Container führen Inhalte aus Repositories aus (Playbooks, Rollen, Service-Repos, Provider). Mit Schreibrechten auf die Checkouts konnten sie andere Repositories, das generierte Inventar oder `.git/hooks`/`.git/config` verändern — git im Core führt das später aus.
+
+Hinweise für den Betrieb:
+
+- Der Ansible-Container baut weiterhin in seinem eigenen Dateisystem (`/tmp/aac_builds`) und deployt per SSH; der SSH-Key wird aus `services/.iac_keys/` gelesen. Ein Playbook, das **in den Checkout schreiben** muss, scheitert mit „Read-only file system“ → entweder nach `/data/scratch` schreiben oder das Setting ausschalten.
+- Fehlt dem read-only Provider-Cache ein Provider (neue Version), wiederholt der Lauf `tofu init` ohne Cache und installiert in sein Run-Dir (Job-Log: „init with the read-only provider cache failed — retrying without the cache“). Das funktioniert, ist aber langsamer und lädt bei jedem Lauf neu. **Cache gezielt füllen:** das Setting kurz ausschalten, einen Plan (Check Env) laufen lassen, wieder einschalten.
 
 ## React-Routen
 

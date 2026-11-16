@@ -97,7 +97,7 @@ def test_providers_exclude_secrets():
     providers = build_providers(_config(hardware=hw))
     assert set(providers) == {"hydra"}
     p = providers["hydra"]
-    assert p["provider"] == "proxmox" and p["endpoint"] == "10.1.120.5"
+    assert p["provider"] == "proxmox" and p["endpoint"] == "https://10.1.120.5:8006"
     assert "password" not in p and "token" not in p and "ssh_key" not in p
 
 
@@ -171,3 +171,21 @@ if __name__ == "__main__":
             print(f"FAIL  {fn.__name__}: {e}")
     print(f"\n{len(fns) - failed}/{len(fns)} passed")
     sys.exit(1 if failed else 0)
+
+
+def test_provider_endpoint_url_rules():
+    """OC-20: the port is added only when missing; IPv6 literals are bracketed."""
+    cases = {
+        "10.1.120.5": "https://10.1.120.5:8006",
+        "hydra.int.example": "https://hydra.int.example:8006",
+        "hydra.int.example:8006": "https://hydra.int.example:8006",
+        "10.1.120.5:8443": "https://10.1.120.5:8443",
+        "fd00::5": "https://[fd00::5]:8006",
+        "[fd00::5]": "https://[fd00::5]:8006",
+        "[fd00::5]:8443": "https://[fd00::5]:8443",
+        "https://10.1.120.5:8006": "https://10.1.120.5:8006",
+        "http://pve.example": "http://pve.example",
+    }
+    for given, expected in cases.items():
+        hw = {"n": {"terraform": {"is_used": True, "endpoint": given}}}
+        assert build_providers(_config(hardware=hw))["n"]["endpoint"] == expected, given

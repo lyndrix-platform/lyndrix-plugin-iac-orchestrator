@@ -30,13 +30,18 @@ import base64
 import logging
 import os
 import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from .subprocess_env import git_env, git_safety_args
 
 log = logging.getLogger("IaC:Engine")
 
 #: Local ignore rules (``.git/info/exclude``): terraform provider cache only.
-LOCAL_EXCLUDES = (".terraform/",)
+# and the per-job run directories of Terraform runs in flight (<env>__<target>__j<job>,
+# promoted to their stable name once the run finished — only that one is versioned).
+LOCAL_EXCLUDES = (".terraform/", ".terraform_runs/*__j[0-9]*/")
 #: Rules 1.5.3 wrote into ``.git/info/exclude`` that must go again: run
 #: directories (incl. rendered secrets) are versioned in the on-prem GitLab.
 OBSOLETE_EXCLUDES = (".terraform_runs/",)
@@ -70,8 +75,7 @@ class PublishResult:
 
 def credential_env(token: str | None) -> dict:
     """Process env that supplies ``token`` as an HTTP Basic header (core-compatible)."""
-    env = os.environ.copy()
-    env["GIT_TERMINAL_PROMPT"] = "0"
+    env = git_env()
     if token:
         auth = base64.b64encode(f"oauth2:{token}".encode()).decode()
         env["GIT_CONFIG_COUNT"] = "1"
@@ -82,7 +86,7 @@ def credential_env(token: str | None) -> dict:
 
 def _ssh_env(private_key: str, key_path: str) -> dict:
     """Process env for an SSH remote (mirrors the core: pinned known_hosts, batch)."""
-    env = os.environ.copy()
+    env = git_env()
     known_hosts = os.environ.get(
         "GIT_KNOWN_HOSTS_FILE",
         os.path.join(os.environ.get("GIT_STORAGE_DIR", "/data/storage/git_repos"), ".ssh", "known_hosts"))
@@ -96,9 +100,11 @@ def _ssh_env(private_key: str, key_path: str) -> dict:
 
 
 async def _git(repo: Path, *args: str, env: dict | None = None) -> tuple[int, str]:
+    # This repository only, no hooks/helpers from its config, and never the
+    # core's environment (audit OS-06 D).
     proc = await asyncio.create_subprocess_exec(
-        "git", "-c", "safe.directory=*", *args,
-        cwd=str(repo), env=env,
+        "git", *git_safety_args(repo), *args,
+        cwd=str(repo), env=env if env is not None else git_env(),
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
     )
     out, _ = await proc.communicate()
@@ -142,6 +148,50 @@ def _ensure_local_excludes(repo: Path) -> str:
     except OSError as exc:
         return f"could not write .git/info/exclude: {exc}"
     return ""
+
+
+#: An ``index.lock`` older than this belongs to a git process that died (runner
+#: killed mid-command); a younger one may be a git process that is still working.
+INDEX_LOCK_STALE_SECONDS = 60.0
+#: How long a publish waits for a young ``index.lock`` to go away.
+INDEX_LOCK_WAIT_SECONDS = 20.0
+
+
+async def _settle_index_lock(repo: Path) -> str:
+    """Make sure no ``.git/index.lock`` is in the way. Returns an error text, ''
+    when the index is free.
+
+    The lock used to be deleted unconditionally. The caller's state lock only
+    covers this process — the checkout is shared with other instances (a core
+    git sync, a second runner), and deleting the lock of a git process that is
+    still writing corrupts the index (audit OC-14). So: a young lock is waited
+    for; one that outlived :data:`INDEX_LOCK_STALE_SECONDS` is a leftover and
+    removed; a lock that is still young after the wait fails the publish.
+    """
+    lock = repo / ".git" / "index.lock"
+    deadline = time.monotonic() + INDEX_LOCK_WAIT_SECONDS
+    announced = False
+    while True:
+        try:
+            age = time.time() - lock.stat().st_mtime
+        except FileNotFoundError:
+            return ""
+        except OSError as exc:
+            return f"cannot inspect {lock}: {exc}"
+        if age >= INDEX_LOCK_STALE_SECONDS:
+            log.warning("inventory_state: removing stale git index lock (%.0f s old).", age)
+            try:
+                lock.unlink(missing_ok=True)
+            except OSError as exc:
+                return f"cannot remove the stale git index lock: {exc}"
+            return ""
+        if time.monotonic() >= deadline:
+            return (f"the git index is locked by another git process (index.lock, {age:.0f} s old) — "
+                    "it was NOT removed. Re-trigger once that process has finished.")
+        if not announced:
+            announced = True
+            log.info("inventory_state: git index is locked by another process (%.0f s) — waiting.", age)
+        await asyncio.sleep(0.5)
 
 
 async def _current_branch(repo: Path) -> str:
@@ -202,10 +252,10 @@ async def publish_inventory_state(
         res.detail = f"{repo} is not a git checkout"
         return res
 
-    lock = repo / ".git" / "index.lock"
-    if lock.exists():
-        log.warning("inventory_state: removing stale git index lock.")
-        lock.unlink(missing_ok=True)
+    err = await _settle_index_lock(repo)
+    if err:
+        res.detail = err
+        return res
 
     err = _ensure_local_excludes(repo)
     if err:

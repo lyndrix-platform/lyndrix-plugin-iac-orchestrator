@@ -1,5 +1,6 @@
 from typing import Any, Dict
-from jinja2 import Environment, Undefined
+from jinja2 import Undefined
+from jinja2.sandbox import SandboxedEnvironment
 from core.logger import get_logger
 
 log = get_logger("IaC:Generator:Renderer")
@@ -18,7 +19,7 @@ class PermissiveUndefined(Undefined):
         log.debug(f"Undefined variable encountered: {self._undefined_name}")
         return ""
 
-def _render_pass(data: Any, context: Dict[str, Any], env: Environment) -> Any:
+def _render_pass(data: Any, context: Dict[str, Any], env: SandboxedEnvironment) -> Any:
     """Recursively processes data and renders Jinja2 strings."""
     if isinstance(data, dict):
         return {k: _render_pass(v, context, env) for k, v in data.items()}
@@ -57,7 +58,14 @@ def render_templates(config: Dict[str, Any]) -> Dict[str, Any]:
     Renders Jinja2 templates embedded in the configuration dictionary.
     Executes exactly two passes to resolve nested references without infinite loops.
     """
-    env = Environment(undefined=PermissiveUndefined)
+    # Sandboxed (audit OS-05/OS-06): the strings rendered here come from the
+    # iac-controller repository. A plain Environment lets a template walk from any
+    # value to the interpreter (``''.__class__.__mro__ … __subclasses__()``) and
+    # run code in this process. The sandbox refuses underscore attributes and
+    # unsafe callables (SecurityError → the string is left as it is, with a
+    # warning, like any other template that cannot be rendered); ordinary
+    # variables, filters, tests and expressions render exactly as before.
+    env = SandboxedEnvironment(undefined=PermissiveUndefined)
     
     # Pass 1: Resolve primary templates
     context1 = _build_flat_context(config)

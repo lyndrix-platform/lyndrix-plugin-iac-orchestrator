@@ -4,6 +4,7 @@ from core.logger import get_logger
 
 from .base import BaseStage
 from ..utils import StageResult
+from ..app.controller.offloop import off_loop
 
 log = get_logger("IaC:Engine:Ansible")
 
@@ -84,6 +85,24 @@ def host_assigned_services(engine, host_name: str) -> list[str]:
     return assigned
 
 
+def _catalog_service_names(catalog_file) -> list[str]:
+    """Service names of the controller's service catalog (sync YAML parse)."""
+    with open(catalog_file, 'r') as f:
+        catalog_data = yaml.safe_load(f) or {}
+    services = catalog_data.get("service_catalog", {}).get("services", [])
+    return [svc.get("name") for svc in services if svc.get("name")]
+
+
+def _note_progress(engine, job_id, step: str):
+    """Step text of a running job through the engine's coalescing writer; an
+    engine without one (tests, legacy callers) gets a plain off-loop write."""
+    push = getattr(engine, "push_progress", None)
+    if callable(push):
+        push(job_id, progress=None, current_step=step)
+        return None
+    return off_loop(engine.db.update_progress, job_id, progress=None, current_step=step)
+
+
 class AnsiblePlaybookStage(BaseStage):
     def __init__(self, playbook_path: str, inventory_path: str, limit: str = None, name_override: str = None, extra_vars: dict = None, ssh_key_secret: str = "ansible_ssh_key", remote_user: str = "ansible-agent", extra_roles_paths: list = None, check_mode: bool | None = None):
         self.display_name = name_override or f"Ansible: {playbook_path}"
@@ -140,10 +159,7 @@ class AsyncBulkRolloutStage(BaseStage):
             catalog_file = engine.base_git_dir / "iac_controller" / "environments" / "global" / "02_service_catalog.yml"
             if not catalog_file.exists(): return StageResult(False, "Source service_catalog.yml missing.")
             try:
-                with open(catalog_file, 'r') as f:
-                    catalog_data = yaml.safe_load(f) or {}
-                    services = catalog_data.get("service_catalog", {}).get("services", [])
-                    svc_names = [svc.get("name") for svc in services if svc.get("name")]
+                svc_names = await off_loop(_catalog_service_names, catalog_file)
             except Exception as e: return StageResult(False, f"Raw catalog parse failed: {e}")
 
         # Host-scoped rollout (limit is a single host, not "all"): only attempt services
@@ -152,7 +168,8 @@ class AsyncBulkRolloutStage(BaseStage):
         # off-host services and spams "leaves us with no hosts to target".
         host_scope = (self.limit or "").split(":")[0].strip()
         if host_scope and host_scope != "all":
-            assigned = set(host_assigned_services(engine, host_scope))
+            # Parses the generated inventory (~1 s for 635 KB): off the loop.
+            assigned = set(await off_loop(host_assigned_services, engine, host_scope))
             if assigned:
                 before = len(svc_names)
                 svc_names = [s for s in svc_names if s in assigned]
@@ -166,8 +183,20 @@ class AsyncBulkRolloutStage(BaseStage):
         log.info(f"Initiating Async Rollout for {len(svc_names)} services (Limit: {self.limit})...")
         pending_queue = list(svc_names)
         total_services = len(pending_queue)
+        # One writer for the pending list: the deploys below finish concurrently,
+        # and their writes must reach the row in the order they were made — a
+        # stale longer list arriving last would make a completed rollout look
+        # interrupted after a runner restart (recover_job reads it).
+        pending_lock = asyncio.Lock()
+
+        async def store_pending():
+            if not hasattr(engine.db, 'update_pending_tasks'):
+                return
+            async with pending_lock:
+                await off_loop(engine.db.update_pending_tasks, job_id, list(pending_queue))
+
         try:
-            if hasattr(engine.db, 'update_pending_tasks'): engine.db.update_pending_tasks(job_id, pending_queue)
+            await store_pending()
         except Exception: pass
         sem = asyncio.Semaphore(5)
         report = {}
@@ -177,7 +206,7 @@ class AsyncBulkRolloutStage(BaseStage):
                 sanitized_name = str(svc_name).replace("-", "_")
                 svc_group = f"service_{sanitized_name}"
                 eff_limit = f"{self.limit}:&{svc_group}" if self.limit and self.limit != "all" else svc_group
-                pb_path, extra_roles = service_rollout_selector(engine, svc_name)
+                pb_path, extra_roles = await off_loop(service_rollout_selector, engine, svc_name)
                 stage = AnsiblePlaybookStage(name_override=svc_name, playbook_path=pb_path, inventory_path=self.inventory_path, limit=eff_limit, extra_vars={"target_service": svc_name, "target_group": eff_limit, "LOCAL_SERVICES_DIR": str(engine.config.services_dir)}, extra_roles_paths=extra_roles, check_mode=self.check_mode)
                 res = await stage.run(engine, context)
                 report[svc_name] = {"success": res.success, "successful_hosts": res.data.get("successful_hosts", 0), "failed_hosts": res.data.get("failed_hosts", 0)}
@@ -186,9 +215,11 @@ class AsyncBulkRolloutStage(BaseStage):
                     pending_queue.remove(svc_name)
                     try:
                         if hasattr(engine.db, 'update_pending_tasks'):
-                            engine.db.update_pending_tasks(job_id, pending_queue)
                             completed = total_services - len(pending_queue)
-                            engine.db.update_progress(job_id, progress=None, current_step=f"Bulk Deploying ({completed}/{total_services})")
+                            await store_pending()
+                            noted = _note_progress(engine, job_id, f"Bulk Deploying ({completed}/{total_services})")
+                            if noted is not None:
+                                await noted
                     except Exception: pass
         await asyncio.gather(*[bounded_deploy(s) for s in svc_names])
         dry = resolve_check_mode(self.check_mode, context)
@@ -222,7 +253,7 @@ class ServiceDeployStage(BaseStage):
         job_id = context.get("job_id", 0)
 
         # Only deploy services this host is actually assigned to (via inventory service_* groups)
-        assigned_svcs = self._get_host_services(engine, self.host_name)
+        assigned_svcs = await off_loop(self._get_host_services, engine, self.host_name)
         if not assigned_svcs:
             log.info(f"No services assigned to host '{self.host_name}' in inventory.")
             return StageResult(True, "Skipped: No services assigned to this host.")
@@ -232,9 +263,7 @@ class ServiceDeployStage(BaseStage):
         catalog_names: set[str] = set()
         if catalog_file.exists():
             try:
-                with open(catalog_file, 'r') as f:
-                    catalog_data = yaml.safe_load(f) or {}
-                    catalog_names = {svc.get("name") for svc in catalog_data.get("service_catalog", {}).get("services", []) if svc.get("name")}
+                catalog_names = set(await off_loop(_catalog_service_names, catalog_file))
             except Exception as e:
                 log.warning(f"Could not parse service catalog: {e}")
         
@@ -254,7 +283,7 @@ class ServiceDeployStage(BaseStage):
                 sanitized_name = str(svc_name).replace("-", "_")
                 svc_group = f"service_{sanitized_name}"
                 eff_limit = f"{self.host_name}:&{svc_group}"
-                pb_path, extra_roles = service_rollout_selector(engine, svc_name)
+                pb_path, extra_roles = await off_loop(service_rollout_selector, engine, svc_name)
                 stage = AnsiblePlaybookStage(
                     name_override=svc_name,
                     playbook_path=pb_path,
