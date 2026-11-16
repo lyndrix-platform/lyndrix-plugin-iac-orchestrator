@@ -144,6 +144,11 @@ class SettingField:
     # the operator tier and never skipped as "unchanged": turning a gate off must
     # work even when the current value cannot be read (Vault hiccup, stale view).
     safe_value: str | None = None
+    # A stored "" is a deliberate value (e.g. "exclude nothing"), not "unset":
+    # only a missing value (None) falls back to ``default``. Without it a saved
+    # empty value is shown as the default, and saving the default back is
+    # skipped as "unchanged" although the effective value differs.
+    empty_is_value: bool = False
 
     def storage_key(self) -> str:
         return self.vault_key or self.key
@@ -392,6 +397,8 @@ def _build_fields() -> list[SettingField]:
             default="aac-hermes-agent",
             vault_key="iac_service_reconcile_exclude_services",
             env_var="PLUGIN_IAC_ORCHESTRATOR_SERVICE_RECONCILE_EXCLUDE_SERVICES",
+            # IaCConfig reads a stored "" as "exclude nothing" — show and compare it so.
+            empty_is_value=True,
             description="Comma-separated service names the controller-diff reconcile never deploys — no job, "
                         "no approval, no deferred re-queue; they only appear as 'excluded' in the notification. "
                         "Default protects aac-hermes-agent (a single_service deploy tears the agent stack down). "
@@ -688,7 +695,16 @@ class OrchestratorSettings:
             return str(b) if f.bool_format == "python" else ("true" if b else "false")
         if f.kind == "int":
             return str(_safe_int(raw, int(f.default or 0)))
-        return str(raw if raw not in (None, "") else (f.default or "")).strip()
+        value = self._str_value(f, raw)
+        return str("" if value is None else value).strip()
+
+    @staticmethod
+    def _str_value(f: SettingField, raw):
+        """Stored → reported value of a str-like field: the default stands in for a
+        missing value — and for a blank one unless ``f.empty_is_value``."""
+        if raw is None or (raw == "" and not f.empty_is_value):
+            return f.default
+        return raw
 
     # --- public surface ------------------------------------------------------
     def get_schema(self) -> list[dict]:
@@ -729,7 +745,7 @@ class OrchestratorSettings:
             elif f.kind == "int":
                 vals[f.key] = _safe_int(raw, int(f.default or 0))
             else:
-                vals[f.key] = raw if raw not in (None, "") else f.default
+                vals[f.key] = self._str_value(f, raw)
         return vals
 
     def save_values(self, updates: dict, *, allowed_tiers: set[str] | None = None) -> dict:
