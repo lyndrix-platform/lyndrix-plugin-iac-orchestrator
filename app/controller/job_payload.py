@@ -71,6 +71,11 @@ KNOWN_KEYS = frozenset({"pipeline_type", "target_services", "project_path", "pla
                         *_NAME_KEYS, *_BOOL_KEYS, *_LABEL_KEYS, *_INT_KEYS, *_SHA_KEYS})
 
 
+#: Fields only the service-reconcile dispatch sets (1.8).
+_RECONCILE_KEYS = frozenset({"target_hosts", "changed_keys", "approved_by", "stage", "site",
+                             "controller_sha", "inventory_commit", "source_job_id"})
+
+
 class InvalidJobPayload(ValueError):
     """The payload must not become (or be executed as) a job."""
 
@@ -140,6 +145,10 @@ def validate_structure(payload: Any) -> dict:
                 f"unknown field(s) {', '.join(repr(k[:40]) for k in unknown[:5])} — refused rather than dropped: "
                 "a field this plugin version does not know may be what limits the job")
     src = normalize_payload(payload)
+    if legacy_push:
+        # Nothing in a raw GitLab body limits or labels the job: only what is derived
+        # from it (service, branch) is kept.
+        src = {k: v for k, v in src.items() if k not in _RECONCILE_KEYS}
     ptype = str(src.get("pipeline_type") or "")
     if ptype not in PIPELINE_TYPES:
         raise InvalidJobPayload(f"unsupported pipeline_type {ptype[:40]!r}")

@@ -54,9 +54,9 @@ def test_unknown_types_and_keys():
                      "dry_run": True, "trigger": "ui"}
     assert jp.validate_structure(clean) == clean                            # idempotent (claim-time re-check)
     # A field this version does not know is refused — never dropped: it may be what
-    # LIMITS the job. ``target_hosts`` is the host limit of a newer plugin version;
-    # dropping it would deploy to every host of the service.
-    for extra in ({"target_hosts": ["docker-a"]}, {"extra_vars": {"x": 1}}, {"playbook": "evil.yml"},
+    # LIMITS the job (as ``target_hosts`` did before 1.8 knew it); dropping it would
+    # run the job wider than its trigger asked for.
+    for extra in ({"only_tags": ["config"]}, {"extra_vars": {"x": 1}}, {"playbook": "evil.yml"},
                   {"ssh_key_secret": "iac_x", "remote_user": "root"}, {"check": True}):
         with pytest.raises(jp.InvalidJobPayload, match="unknown field"):
             jp.validate_structure({**base, **extra})
@@ -170,15 +170,16 @@ def test_claimed_payload_reaches_the_engine_sanitised(iac_service):
 
 def test_row_with_a_field_this_version_does_not_know_is_never_executed(iac_service):
     """A row written by a newer plugin version on another instance (rolling upgrade,
-    rollback of the runner): ``target_hosts`` limits a deploy to the hosts that
-    changed. Dropping the unknown field would deploy to every host of the service."""
+    rollback of the runner): a field like ``only_tags`` narrows what the deploy does —
+    exactly what ``target_hosts`` (1.8) is to a 1.7.0 runner. Dropping the unknown field
+    would run the job wider than asked."""
     svc = iac_service
     with queue_mod.db_instance.SessionLocal() as s:
         row = IaCJob(pipeline_type="single_service:aac-x", status="QUEUED", logs="[]", pending_tasks="[]",
                      dedupe_key="single_service:aac-x",
                      payload=json.dumps({"pipeline_type": "single_service", "service_name": "aac-x",
                                          "service_branch": "main", "trigger": "controller-diff",
-                                         "target_hosts": ["docker-a"]}))
+                                         "only_tags": ["config"]}))
         s.add(row)
         s.commit()
     seen = []
@@ -191,10 +192,10 @@ def test_row_with_a_field_this_version_does_not_know_is_never_executed(iac_servi
     asyncio.run(svc.run_claimed(payload, job_id))
     assert seen == []                                            # NOT run without its host limit
     row = _rows()[0]
-    assert row.status == "FAILED" and "unknown field" in row.current_step and "target_hosts" in row.current_step
+    assert row.status == "FAILED" and "unknown field" in row.current_step and "only_tags" in row.current_step
     # the same at the front door: this version cannot queue such a job either
-    with pytest.raises(jp.InvalidJobPayload, match="target_hosts"):
-        svc.queue.enqueue({"pipeline_type": "single_service", "service_name": "aac-y", "target_hosts": ["docker-a"]})
+    with pytest.raises(jp.InvalidJobPayload, match="only_tags"):
+        svc.queue.enqueue({"pipeline_type": "single_service", "service_name": "aac-y", "only_tags": ["config"]})
     assert len(_rows()) == 1
 
 
@@ -281,3 +282,53 @@ def test_engine_hand_off_reports_what_really_happened():
     assert "NOT queued" in refused and "job #29" in refused             # never reported as queued
     assert all(r.success for r in results)                              # the provision itself went through
     engine.ctx.emit.assert_not_called()
+
+
+# --- service reconcile (1.8): host limit and provenance fields ---------------------------------
+
+RECONCILE_JOB = {"pipeline_type": "single_service", "service_name": "aac-x", "service_branch": "main",
+                 "target_hosts": ["docker-b", "docker-a", "docker-b"], "stage": "prod", "site": "onprem",
+                 "trigger": "controller-diff", "source": "service_reconcile", "dry_run": False,
+                 "changed_keys": ["config.vars.WAZUH_MANAGER", "+service"], "controller_sha": "a" * 40,
+                 "inventory_commit": None, "source_job_id": 12, "approved_by": "marvin@example.org"}
+
+
+def test_a_service_reconcile_job_is_a_valid_payload():
+    clean = jp.validate_structure(RECONCILE_JOB)
+    assert clean["target_hosts"] == ["docker-a", "docker-b"]              # sorted, de-duplicated
+    assert clean["stage"] == "prod" and clean["site"] == "onprem" and clean["source_job_id"] == 12
+    assert clean["changed_keys"] == ["config.vars.WAZUH_MANAGER", "+service"]
+    assert clean["controller_sha"] == "a" * 40 and "inventory_commit" not in clean
+    assert jp.validate_structure(clean) == clean                           # idempotent (claim-time re-check)
+
+
+@pytest.mark.parametrize("hosts", [
+    ["docker-a:all"], ["all:!docker-a"], ["docker-a,docker-b"], ["&service_x"], ["*"], ["-e", "x=1"],
+    ["../x"], [""], "docker-a", [["docker-a"]], ["docker-a"] * 501,
+])
+def test_target_hosts_can_never_be_an_ansible_pattern(hosts):
+    """``target_hosts`` is joined into ``--limit h1:h2:&service_<name>``: an entry with a
+    pattern character would widen the deploy beyond the hosts that were asked for."""
+    with pytest.raises(jp.InvalidJobPayload):
+        jp.validate_structure({"pipeline_type": "single_service", "service_name": "aac-x", "target_hosts": hosts})
+
+
+def test_target_hosts_only_on_single_service_and_changed_keys_hold_no_values():
+    with pytest.raises(jp.InvalidJobPayload, match="target_hosts"):
+        jp.validate_structure({"pipeline_type": "rollout", "target_hosts": ["docker-a"]})
+    clean = jp.validate_structure({**RECONCILE_JOB, "changed_keys": ["config.vars.A", "pass word=secret!", "x" * 300]})
+    assert clean["changed_keys"] == ["config.vars.A"]                       # anything value-shaped is left out
+    with pytest.raises(jp.InvalidJobPayload):
+        jp.validate_structure({**RECONCILE_JOB, "controller_sha": "not-a-sha"})
+
+
+def test_a_host_limited_job_never_absorbs_a_full_deploy_or_another_host_set():
+    """queue.covers: the provenance fields are informational, the host limit is not."""
+    limited = jp.validate_structure(RECONCILE_JOB)
+    full = jp.validate_structure({"pipeline_type": "single_service", "service_name": "aac-x", "trigger": "gitlab-ci"})
+    other = jp.validate_structure({**RECONCILE_JOB, "target_hosts": ["docker-c"]})
+    same = jp.validate_structure({**RECONCILE_JOB, "changed_keys": ["config.vars.OTHER"], "source_job_id": 99,
+                                  "approved_by": "x"})
+    assert not queue_mod.covers(limited, full) and not queue_mod.covers(full, limited)
+    assert not queue_mod.covers(limited, other)
+    assert queue_mod.covers(limited, same)

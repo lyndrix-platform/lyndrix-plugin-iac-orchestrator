@@ -2,6 +2,8 @@ import os
 import re
 from pathlib import Path
 
+from ...stages.service_diff import DEFAULT_EXCLUDE_SERVICES, normalize_service_names
+
 # --- Runner images (audit OS-02) ---------------------------------------------------
 # The runner containers get the fleet SSH key and read-write repo mounts, so the image
 # they are started from decides who owns the fleet. Images configured through the
@@ -65,7 +67,6 @@ def runner_image_error(ref: str | None, *, check_allowlist: bool = True) -> str 
             return None
     return (f"image '{text}' is not in the runner image allowlist "
             f"({', '.join(runner_image_allowlist()) or 'empty'}; {RUNNER_IMAGE_ALLOWLIST_ENV})")
-from ...stages.service_diff import DEFAULT_EXCLUDE_SERVICES, normalize_service_names
 
 
 class IaCConfig:

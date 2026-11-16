@@ -19,7 +19,19 @@ Service reconcile: an iac-controller change that alters a service's **rendered**
 - Tests: `tests/test_service_diff.py`, `tests/test_reconcile_store.py`, `tests/test_service_reconcile_engine.py`, service-reconcile cases in `tests/test_rules.py` (modes, grouping, branch mapping, thresholds, DuplicateJob → deferred, dispatch error never fails the stage, no values in logs/notifications, rollout pipeline notify-only, bus fallback).
 - Docs: `docs/usage.md` (operating guide incl. reconcile), `ai/INSTRUCTIONS.md` (trigger model + pending approvals). Companion change: rule `Service Reconcile (changed service entries)` in iac-ansible-automation `pipeline_rules.yml`.
 
-@@REBASE_NOTES@@
+### Changed against the unreleased 1.7.0 draft of this feature (rebase onto the audit release 1.7.0)
+- `target_hosts` and the provenance fields of a reconcile job (`stage`, `site`, `changed_keys`, `controller_sha`, `inventory_commit`, `source_job_id`, `approved_by`) are known to the job-payload validation. Every `target_hosts` entry must be a plain host name (no `:`, `&`, `!`, `*`, `,`): the list becomes the `--limit` pattern, so a pattern character could widen the deploy. `changed_keys` keeps key paths only. A raw GitLab push body never carries these fields.
+- A host-limited job never absorbs a full deploy of the same service (or another host set) in the queue; the provenance fields do not make two triggers different.
+- Reconcile jobs enter the queue through the same validation as every other trigger and pass the branch → target check on the runner. A service whose catalog prod branch is not `main` is refused there for stage prod.
+- Reconcile database work runs on the plugin's own thread pool (`off_loop`), like the rest of 1.7.0.
+- `bus` and `controller-diff` are both policy triggers.
+
+### Upgrade notes
+- **Upgrade every instance together.** A 1.7.0 runner refuses a job that carries `target_hosts` ("unknown field", FAILED) instead of deploying to every host — safe, but the deploy does not happen.
+- Default is still **off**; nothing changes until the rule and the setting are both enabled.
+- The suite has 631 tests and passes on core 1.11.1 and 1.12.0. Not run against a real runner, Docker or GitLab.
+
+Based on 1.7.0.
 
 ## [1.7.1] - 2026-11-16
 One fix on top of 1.7.0, found on staging while testing the next release. Python only — the React bundle is unchanged apart from the version number. No setting, schema or API change.
