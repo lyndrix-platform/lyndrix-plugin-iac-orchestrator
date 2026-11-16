@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.1] - 2026-11-16
+One fix on top of 1.7.0, found on staging while testing the next release. Python only — the React bundle is unchanged apart from the version number. No setting, schema or API change.
+
+### Fixed
+- A follow-up job for the same target (same service, same Terraform host, same rollout) could be handed back to the queue and, after three bounces, be **ABORTED** with "Skipped: deployment for X already starting". The job's in-memory dispatch key was released only after the terminal write plus the post-run work (runner sync, log writer, snapshot cleanup, publish); the queue claims the waiting follow-up the moment the row is final and its guard still found the key held. Staging 2026-11-16 on the 1.7.0 code path: 5 of 5 follow-ups succeeded, but 3 of them bounced two or three times (limit 3). The key is now released right before the terminal write (`_execute_dispatched`); until then the RUNNING row keeps the target busy (`claim_next` and the guard's RUNNING-row check), so there is no instant in which neither protects it. Keys are recorded per run, the release is idempotent, and the outer `finally` stays as the safety net (set-up errors, detached jobs) without ever freeing the key the next job reserved meanwhile.
+- Tests: `tests/test_dispatch_key_release.py` (4 cases; the suite has 566 tests and passes on core 1.11.1 and 1.12.0).
+
 ## [1.7.0] - 2026-11-15
 Security and cluster audit 2026-11, the findings of the independent review and the owner's decisions on OS-04, OS-05
 and OS-06. The unreleased `feat/service-reconcile-1.7.0` becomes 1.8.0. Minimum core unchanged (core 1.11.1 /

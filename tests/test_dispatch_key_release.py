@@ -1,8 +1,7 @@
-"""Dispatch keys are released as soon as the job's row is final (1.8.0 staging fix).
+"""Dispatch keys are released as soon as the job's row is final (1.7.1, found on staging).
 
 Staging 2026-11-16: job #45 (single_service aac-stgdummy) wrote its terminal status,
-then drained deferred service-reconcile records, synced runners, closed its log
-writer and cleaned up — and only then did run_pipeline's finally free the in-memory
+then synced runners, closed its log writer and cleaned up — and only then did run_pipeline's finally free the in-memory
 key ``single_service:aac-stgdummy``. The queue claims the follow-up (#49, waiting_for
 #45) the moment #45's row is final; its dispatch guard found the key still held,
 bounced it back to the queue up to _MAX_GUARD_BOUNCES times and then ABORTED it
@@ -86,7 +85,7 @@ def _engine(tmp_path, monkeypatch, rows):
     return eng, db
 
 
-def test_key_is_free_when_the_row_is_final_before_drain_and_cleanup(tmp_path, monkeypatch):
+def test_key_is_free_when_the_row_is_final_before_cleanup(tmp_path, monkeypatch):
     rows = _Rows(45)
     eng, db = _engine(tmp_path, monkeypatch, rows)
     seen = {}
@@ -95,18 +94,17 @@ def test_key_is_free_when_the_row_is_final_before_drain_and_cleanup(tmp_path, mo
         seen["at_close"] = KEY in eng._active_single_service_keys
         return rows.update_job(job_id, status)
 
-    def drain():
-        seen["at_drain"] = KEY in eng._active_single_service_keys
-        return []
+    def cleanup(job_id):
+        seen["at_cleanup"] = KEY in eng._active_single_service_keys
 
     eng.close_job_row = close_job_row
-    eng.drain_deferred_reconcile = drain
+    eng._cleanup_inventory_snapshot = cleanup
     asyncio.run(eng.run_pipeline(dict(PAYLOAD), job_id=45))
 
     assert rows.status[45] == "SUCCESS"
     # Free before the terminal write (the RUNNING row guards the target until then)
-    # and therefore during the post-run drain/cleanup.
-    assert seen == {"at_close": False, "at_drain": False}
+    # and therefore during the post-run cleanup.
+    assert seen == {"at_close": False, "at_cleanup": False}
     assert KEY not in eng._active_single_service_keys
     assert eng.__dict__.get("_dispatch_keys_by_owner") == {}
 
@@ -116,7 +114,6 @@ def test_follow_up_claimed_during_post_run_work_is_not_aborted(tmp_path, monkeyp
     skipped as 'already starting' (without a queue the guard ABORTs at once)."""
     rows = _Rows(45)
     eng, db = _engine(tmp_path, monkeypatch, rows)
-    eng.drain_deferred_reconcile = lambda: []
     real_close_writer = eng._close_log_writer
     follow_up = {}
 
