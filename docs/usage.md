@@ -68,7 +68,7 @@ Double opt-in:
 
 | Mode | Effect |
 |---|---|
-| `off` (default) | detection only, summary in the job log |
+| `off` (default) | detection only; the summary goes to the runner's container log (logger `IaC:Engine:Rules`), not to the job log — no job, no notification |
 | `notify` | bell + Discord (endpoint `service_reconcile`): service, stage, host count, key names, UI path |
 | `dry_run` | one `single_service` job per service and stage with `dry_run: true` (`--check`), limited to the changed hosts |
 | `deploy` | the same jobs as real deploys |
@@ -97,7 +97,10 @@ that is an outage mid-session, so a controller diff only reports it and the oper
 it deliberately via the single-service rollout. The rule itself can add more names
 (`exclude_services: [aac-x, aac-y]` or a comma string on the `service_reconcile` action);
 excluded entries do not count against `max_services`. Save an empty setting to exclude
-nothing. There is no other per-service protection in the deploy chain:
+nothing (the dialog then shows it empty; an unset value shows and applies the default).
+The list is checked when a job would be **dispatched**: a reconcile job that is already
+queued or running when a service is added to the list is not stopped — cancel it in the
+job list if it must not run. There is no other per-service protection in the deploy chain:
 `deployment_strategy.<branch>.enabled` in the service repo (→ `deployment_enabled` gatekeeper
 in `cd_rollout_single_service.yml`) is `true` for aac-hermes-agent on `main`.
 
