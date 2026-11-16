@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import contextvars
 import json
 import sys
 import os
@@ -1226,6 +1227,11 @@ def get_pipeline_strategy(pipeline_type: str) -> PipelineStrategy:
     return PIPELINE_STRATEGIES.get(pipeline_type, _DEFAULT_PIPELINE_STRATEGY)
 
 
+# The dispatch-key owner of the pipeline executing in this context: set by
+# DeploymentEngine.run_pipeline around _execute_dispatched, which releases the
+# keys itself once the job's row is final (see _release_dispatch_keys).
+_dispatch_owner_ctxvar: contextvars.ContextVar = contextvars.ContextVar("iac_dispatch_owner", default=None)
+
 # --- THE ENGINE ---
 
 class DeploymentEngine:
@@ -1992,6 +1998,10 @@ class DeploymentEngine:
                 running_jobs = await off_loop(self.db.get_jobs_by_status, "RUNNING")
             return running_jobs
 
+        # Every key reserved below is recorded under this run's owner token, so it
+        # is released exactly once and only by this run (_release_dispatch_keys).
+        dispatch_owner = object()
+
         # Prevent concurrent bulk rollouts and duplicate single_service runs for the same service.
         async with self._pipeline_dispatch_lock:
             if pipeline_type == "rollout":
@@ -2022,7 +2032,7 @@ class DeploymentEngine:
                     if "rollout:all" in active_rollout_types or "rollout" in active_rollout_types:
                         log.warning(f"ENGINE: Global rollout in progress — host rollout for '{incoming_limit}' blocked.")
                         return await off_loop(self._skip_claimed, job_id, "global rollout in progress", True)
-                self._active_rollout_keys.add(rollout_key)
+                self._reserve_dispatch_key(self._active_rollout_keys, rollout_key, dispatch_owner)
             if pipeline_type == "single_service":
                 service_name = str(payload.get("service_name") or "").strip().lower()
                 if service_name:
@@ -2042,7 +2052,7 @@ class DeploymentEngine:
                         self._notify("Pipeline Ignored", f"A deployment for {service_name} is already running.", "warning")
                         return await off_loop(self._skip_claimed, job_id, f"deployment for {service_name} already running", True)
 
-                    self._active_single_service_keys.add(single_key)
+                    self._reserve_dispatch_key(self._active_single_service_keys, single_key, dispatch_owner)
             if pipeline_type in ("host_provision", "bootstrap_compliance", "init_host", "compliance", "state_check"):
                 host_name = str(
                     payload.get("host_name")
@@ -2069,7 +2079,7 @@ class DeploymentEngine:
                     log.warning(f"ENGINE: Duplicate {pipeline_type} ignored for '{host_name}'.")
                     self._notify("Pipeline Ignored", f"A {pipeline_type} run for {host_name} is already running.", "warning")
                     return await off_loop(self._skip_claimed, job_id, f"{pipeline_type} for {host_name} already running", True)
-                self._active_terraform_host_keys.add(terraform_key)
+                self._reserve_dispatch_key(self._active_terraform_host_keys, terraform_key, dispatch_owner)
             if pipeline_type in ("infra_plan", "infra_apply"):
                 active_infra_jobs = [
                     j for j in await _running()
@@ -2080,23 +2090,37 @@ class DeploymentEngine:
                     self._notify("Pipeline Ignored", "An infrastructure plan/apply is already running.", "warning")
                     return await off_loop(self._skip_claimed, job_id, "an infrastructure plan/apply is already running", True)
 
-        # Every key reserved above is released in this finally — also when the
-        # pipeline set-up raises before its own try/finally is reached (job row,
-        # strategy, log bridge, notify). A leaked key blocks that target on this
-        # instance until the process restarts.
+        # _execute_dispatched releases the keys as soon as the job's row is final
+        # (before its post-run work), so a follow-up claimed in that moment is not
+        # bounced by its predecessor's key (staging 2026-11-16, #45 → #49). This
+        # finally is the safety net — also when the pipeline set-up raises before
+        # its own try/finally is reached (job row, strategy, log bridge, notify) and
+        # for a detached job. A leaked key blocks that target on this instance until
+        # the process restarts. Releasing twice is a no-op.
+        owner_token = _dispatch_owner_ctxvar.set(dispatch_owner)
         try:
             self._guard_bounces.pop(job_id, None)
             await self._execute_dispatched(payload, job_id, pipeline_type)
         finally:
-            if single_key:
-                async with self._pipeline_dispatch_lock:
-                    self._active_single_service_keys.discard(single_key)
-            if terraform_key:
-                async with self._pipeline_dispatch_lock:
-                    self._active_terraform_host_keys.discard(terraform_key)
-            if rollout_key:
-                async with self._pipeline_dispatch_lock:
-                    self._active_rollout_keys.discard(rollout_key)
+            _dispatch_owner_ctxvar.reset(owner_token)
+            await self._release_dispatch_keys(dispatch_owner)
+
+    def _reserve_dispatch_key(self, keys: set, key: str, owner) -> None:
+        """Reserve ``key`` in ``keys`` (one of the ``_active_*_keys`` sets) for the run
+        ``owner``. Call only under ``_pipeline_dispatch_lock``, after the guard found it free."""
+        keys.add(key)
+        self.__dict__.setdefault("_dispatch_keys_by_owner", {}).setdefault(owner, []).append((keys, key))
+
+    async def _release_dispatch_keys(self, owner) -> None:
+        """Release every dispatch key the run ``owner`` reserved. Idempotent: the
+        keys are taken out of the owner's record, so a second call — or a call after
+        the key was reserved again by the next job for the same target — removes
+        nothing that belongs to someone else."""
+        if owner is None:
+            return
+        async with self._pipeline_dispatch_lock:
+            for keys, key in self.__dict__.setdefault("_dispatch_keys_by_owner", {}).pop(owner, ()):
+                keys.discard(key)
 
     async def _execute_dispatched(self, payload: dict, job_id: int | None, pipeline_type: str):
         """Run a pipeline that passed the dispatch guard of :meth:`run_pipeline`
@@ -2373,6 +2397,19 @@ class DeploymentEngine:
             _job_id_ctxvar.reset(_job_ctx_token)
             self.state["running_jobs"] = max(0, self.state.get("running_jobs", 0) - 1)
             self.state["is_running"] = self.state["running_jobs"] > 0
+            if not detached:
+                # Free this job's dispatch keys BEFORE the terminal write: the queue
+                # claims a follow-up for the same target (waiting_for) the moment the
+                # row is final, and its dispatch guard must not find the key still
+                # held while this job drains/cleans up below — it would bounce the
+                # follow-up back up to _MAX_GUARD_BOUNCES times and then ABORT it
+                # (staging #45 → #49). Until the row is final it is RUNNING, and that
+                # alone keeps the target busy: claim_next skips every job whose key a
+                # RUNNING row holds, and the guard's RUNNING-row check rejects it. A
+                # parked job's row is already SCHEDULED (the queue may claim the next
+                # job for the target right away). A detached job keeps its keys until
+                # run_pipeline's finally: its containers are still running.
+                await self._release_dispatch_keys(_dispatch_owner_ctxvar.get())
             if not parked and not detached:
                 # Per-job result (never the shared last_deployment: concurrent pipelines
                 # used to overwrite each other's final status through it). A parked job
