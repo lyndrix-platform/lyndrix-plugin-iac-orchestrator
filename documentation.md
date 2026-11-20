@@ -190,6 +190,10 @@ Alle Routen unter `/api/plugins/lyndrix.plugin.iac_orchestrator/` erfordern eine
 | `DELETE` | `/schedules/{job_id}` | `api:write` | Geparktes Deployment abbrechen (`ABORTED`) |
 | `GET` | `/maintenance-windows?site=&stage=&kind=&q=` | `api:read` | Effektive Fenster je Hypervisor/Host/Service aus dem Snapshot `maintenance_effective`, je Item `state` (`active`, `until`, `source`, `next_start`) über `core.api.maintenance.effective_state` |
 | `GET` | `/maintenance-default` | `api:read` | Nur lesend: `maintenance_default` je Site/Stage (`enabled`, `windows`, `source_file`, `level`) aus dem Controller-Snapshot |
+| `GET` | `/reconcile/pending` | `api:read` | Service-Reconcile (ab 1.8): wartende (`pending`) und zurückgestellte (`deferred`) Erkennungen aus einem Controller-Diff; nur Key-Namen, nie Werte; enthält `mode` und `excluded_services[]` |
+| `POST` | `/reconcile/pending/{id}/approve` | `api:write` | Eintrag freigeben und als host-limitierten `single_service`-Job einreihen; Body `{"dry_run": bool, "force": bool}` (`force` überspringt das Wartungsfenster); ausgeschlossener Service → 409 |
+| `POST` | `/reconcile/pending/approve-all` | `api:write` | Alle `pending`-Einträge freigeben (gleicher Body) |
+| `POST` | `/reconcile/pending/{id}/dismiss` | `api:write` | Eintrag verwerfen, ohne zu deployen |
 
 **Hinweis:** Der Einstellungs-Endpunkt heißt `/settings` (nicht `/prefs`), da `/settings` auf Core-Ebene reserviert ist und zu einem Routing-Konflikt führen würde. Die Pfade `/maintenance/*` sind Plugin-Pflege (Statistik löschen, Repo-Sync) — die Wartungsfenster liegen daher unter `/schedules`, `/maintenance-windows` und `/maintenance-default`.
 
@@ -343,6 +347,7 @@ Webhook-Pfad ignoriert Deploy-Trigger für Commits mit dem reservierten Präfix 
 | `deployment_failed` | aktiv | Pipeline mit Fehlern abgeschlossen |
 | `webhook_verified` | **inaktiv** | Webhook akzeptiert und weitergeleitet (nur bei Bedarf aktivieren) |
 | `drift_detected` | aktiv | Drift-Erkennung hat Abweichungen gefunden |
+| `service_reconcile` | aktiv | Ein iac-controller-Diff hat gerenderte Service-Einträge geändert (ab 1.8): Service, Stage, Hostanzahl, Key-Namen und Ergebnis (eingereiht, zurückgestellt, wartet auf Freigabe, nur Hinweis, ausgeschlossen) |
 
 ---
 
@@ -363,6 +368,31 @@ Kategorie **Maintenance** (ab 1.6; Env `PLUGIN_IAC_ORCHESTRATOR_MAINTENANCE_*` h
 | `maintenance_report_missing_window` | bool | `true` | `maintenance:window_missing` emittieren, wenn ein `window`-Deploy ohne Fenster sofort läuft |
 
 Der Default-Schalter `maintenance_default.enabled` ist **kein** Setting — er liegt im iac-controller (siehe „Wartungsfenster“).
+
+Kategorie **Service Reconcile** (ab 1.8; Env `PLUGIN_IAC_ORCHESTRATOR_SERVICE_RECONCILE_*` hat Vorrang vor Vault; Details und Betrieb: `docs/usage.md`, englisch):
+
+| Key | Typ | Default | Bedeutung |
+|---|---|---|---|
+| `service_reconcile_mode` | Auswahl | `off` | `off` (nur Erkennung, Zusammenfassung im Container-Log des Runners) / `notify` (Bell + Discord) / `dry_run` (Jobs mit `--check`) / `deploy`. Doppeltes Opt-in: zusätzlich Regel `service_reconcile` in `config_engine/pipeline_rules.yml`. Unabhängig von `auto_apply` |
+| `service_reconcile_max_hosts` | int | `10` | Mehr Hosts in einem Job → Eintrag wartet auf Freigabe (`pending`) |
+| `service_reconcile_max_services` | int | `3` | Mehr Services in einer Controller-Änderung → alle warten auf Freigabe |
+| `service_reconcile_exclude_services` | Text | `aac-hermes-agent` | Kommagetrennt, Groß-/Kleinschreibung egal: diese Services werden nie vom Service-Reconcile deployt (auch nicht per Freigabe oder aus der Deferred-Queue); leer speichern = nichts ausgeschlossen |
+
+### Service-Reconcile (ab 1.8)
+
+Ändert ein iac-controller-Push den **gerenderten** Eintrag eines Services (Profil-Variablen, Secrets,
+Host-Overrides), löste das bisher nichts aus. Die Regel-Aktion `service_reconcile`
+(`stages/rules.py`, Diff in `stages/service_diff.py`) vergleicht nach dem Publish-Commit jede geänderte
+`<site>/<stage>/ansible/inventory.yml` Host für Host und meldet je Service und Stage die betroffenen
+Hosts und **Key-Pfade** (nie Werte). In `dry_run`/`deploy` entsteht je (Service, Stage) ein
+`single_service`-Job mit `trigger: controller-diff` und `target_hosts` (→ `--limit h1:h2:&service_<name>`,
+nur die geänderten Hosts). `controller-diff` ist ein Policy-Trigger (`deploy_policy: window` parkt Prod-Jobs).
+Läuft für denselben Service schon ein Job (`DuplicateJob`), bleibt der Eintrag `deferred` und wird beim
+Ende dieses Jobs automatisch erneut eingereiht. Innerhalb einer `rollout`-Pipeline wird nur benachrichtigt.
+Zustand: Zeile `pending_service_reconcile` in `iac_orchestrator_state` (`app/controller/reconcile_store.py`).
+
+**Upgrade:** alle Instanzen gemeinsam aktualisieren — ein 1.7.x-Runner lehnt Jobs mit `target_hosts` ab
+(`unknown field`, FAILED), statt auf alle Hosts zu deployen. Standard bleibt `off`.
 
 ---
 
